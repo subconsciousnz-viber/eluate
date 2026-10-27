@@ -20,11 +20,27 @@ it processes anything, then plans every gain change ahead instead of reacting to
 - **Opt-in vote sharing**: off unless you say yes. Only the vote, the settings and the level
   measurements are sent, never audio, file names or paths. Privacy: jective.nz/eluate/privacy.
 
+## Platforms
+
+| Platform | Status |
+|---|---|
+| Windows 10 / 11 x64 | Tested. Installer attached. |
+| macOS 11+ (Apple Silicon only) | **Untested.** Builds; no render has been run from the packaged app. |
+| Linux x64 (`.deb`, `.AppImage`; Ubuntu 24.04 build) | **Untested.** Builds; package contents not verified. |
+
+macOS and Linux packages, where attached, are provided as is for early testers. Expect
+failures; reports welcome (issues). No Intel Mac build; no `.rpm` for this beta (the
+AppImage runs on Fedora / openSUSE).
+
 ## Known limits
 
-- Windows 10 / 11 x64 only; macOS is not supported yet.
-- The installer is unsigned: Windows SmartScreen shows a warning; choose **More info** →
-  **Run anyway**.
+- Every installer is unsigned.
+  - Windows: SmartScreen warns; choose **More info** → **Run anyway**.
+  - macOS: ad-hoc signed, not notarised. Gatekeeper blocks the first launch; open
+    System Settings → Privacy & Security → **Open Anyway** (on macOS 15, right-click →
+    Open no longer bypasses it).
+- Linux `.deb`: the beta's package version sorts after a later `0.1.0`; uninstall the beta
+  before installing a final release.
 - Memory: a render holds the whole track, about 3 GB for a 6-minute 44.1 kHz track and about
   10 GB for 10 minutes at 96 kHz. The engine drops to one thread, or refuses with a message,
   when the machine does not have that much free.

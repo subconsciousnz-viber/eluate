@@ -2,15 +2,15 @@
 
 **Offline adaptive dynamics solver with infinite lookahead.**
 
-Offline auto-mastering engine and Windows desktop app. Whole-track analysis drives
+Offline auto-mastering engine and desktop app. Whole-track analysis drives
 precomputed gain envelopes and constraint-based processing.
 
-**0.1.0-beta — first public beta.** Windows first; macOS is not yet supported.
+**0.1.0-beta — first public beta.** Windows tested; macOS (Apple Silicon) and Linux builds untested.
 Source development uses Python 3.12.
 
 ## Install
 
-Download the Windows installer from [GitHub Releases](../../releases).
+Download the installer from [GitHub Releases](../../releases) (macOS and Linux packages, where attached, are untested).
 The installer is unsigned: in Windows SmartScreen, select **More info** → **Run anyway**.
 
 ## CLI quickstart

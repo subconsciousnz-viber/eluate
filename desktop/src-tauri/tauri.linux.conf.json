@@ -1,0 +1,29 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "bundle": {
+    "targets": ["deb", "appimage"],
+    "category": "Music",
+    "linux": {
+      "deb": {
+        "section": "sound",
+        "priority": "optional",
+        "depends": [
+          "gstreamer1.0-plugins-base",
+          "gstreamer1.0-plugins-good"
+        ],
+        "recommends": ["xdg-utils"]
+      },
+      "rpm": {
+        "release": "1",
+        "depends": [
+          "gstreamer1-plugins-base",
+          "gstreamer1-plugins-good"
+        ],
+        "recommends": ["xdg-utils"]
+      },
+      "appimage": {
+        "bundleMediaFramework": true
+      }
+    }
+  }
+}

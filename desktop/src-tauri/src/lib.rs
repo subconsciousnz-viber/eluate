@@ -129,7 +129,10 @@ fn engine_threads(limit_cpu: bool, cores: usize, parallel: usize) -> usize {
 }
 
 /// Windows creation flags for an engine child: no console window, and below-normal
-/// priority under "Limit CPU".
+/// priority under "Limit CPU". Only called from the `#[cfg(windows)]` spawn path, but
+/// deliberately not gated: the unit test below covers the flag arithmetic on every
+/// platform. The allow keeps that coverage without a dead-code warning off Windows.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn creation_flags(limit_cpu: bool) -> u32 {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
