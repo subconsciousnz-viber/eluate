@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Main window: core IPC and events. File picking, revealing and engine jobs go through the app's own commands; no fs, shell or http plugin is exposed to the page.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

@@ -1,0 +1,83 @@
+name: tests
+
+on:
+  # Pull requests and manual runs only while the repo is private (Windows minutes count
+  # double). Once public, add:
+  #   push:
+  #     branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 15 * * 0"   # weekly, Sunday 15:00 UTC: the full suite
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python-fast:
+    name: pytest (not slow)
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/lock-*.txt
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install -r requirements/lock-win-x64-py312.txt -r requirements/lock-dev-win-x64-py312.txt
+          python -m pip install -e . --no-deps
+      - name: pytest -m "not slow"
+        run: python -m pytest -m "not slow" -q
+
+  python-full:
+    name: pytest (full suite)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/lock-*.txt
+      - name: Install pinned dependencies
+        run: |
+          python -m pip install -r requirements/lock-win-x64-py312.txt -r requirements/lock-dev-win-x64-py312.txt
+          python -m pip install -e . --no-deps
+      - name: pytest (all)
+        run: python -m pytest -q --durations=25
+
+  rust:
+    name: cargo test (desktop shell)
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+      # tauri::generate_context! embeds build.frontendDist (../dist), and tauri-build copies
+      # every bundle resource at compile time, so both must exist. dist is the staged ui/
+      # (what beforeBuildCommand does); the engine is a PyInstaller build, so an empty
+      # placeholder stands in for it here.
+      - name: Stage the UI and an engine placeholder
+        shell: bash
+        run: |
+          node scripts/stage-ui.mjs
+          mkdir -p dist-engine/eluate-engine
+          echo "CI placeholder for the PyInstaller engine" > dist-engine/eluate-engine/README.txt
+      - name: cargo test
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml

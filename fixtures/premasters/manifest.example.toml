@@ -1,0 +1,12 @@
+# Manifest for the real-material tests (tests/test_feature_real.py). Copy to
+# fixtures/premasters/manifest.toml (gitignored), or point ELUATE_PREMASTERS at a
+# copy elsewhere, and list your own premasters. Each label is a path or a list of
+# paths, the first that exists used; relative paths resolve from this file's folder.
+# The tests skip every label that is missing. Expected tempos stay in the test.
+[tracks]
+A = "track-a.wav"
+B = "track-b.wav"
+C = "track-c.wav"
+D = ["track-d.wav", "/media/premasters/track-d.wav"]
+E = "track-e.wav"
+F = "track-f.wav"

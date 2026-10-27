@@ -1,0 +1,58 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Eluate",
+  "mainBinaryName": "eluate",
+  "version": "0.1.0-beta",
+  "identifier": "io.github.subconsciousnz-viber.eluate",
+  "build": {
+    "frontendDist": "../dist",
+    "beforeBuildCommand": "node scripts/stage-ui.mjs",
+    "beforeDevCommand": "node scripts/stage-ui.mjs"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Eluate",
+        "label": "main",
+        "width": 1440,
+        "height": 980,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true,
+        "center": true,
+        "dragDropEnabled": true,
+        "backgroundColor": "#23303a"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; media-src 'self' asset: http://asset.localhost; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+      "assetProtocol": { "enable": true, "scope": [] },
+      "capabilities": ["main"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": {
+      "../dist-engine/eluate-engine/": "engine/",
+      "../../ui/fonts/OFL.txt": "licenses/Archivo-OFL.txt",
+      "../../LICENSE": "LICENSE.txt",
+      "../../THIRD_PARTY_NOTICES.txt": "THIRD_PARTY_NOTICES.txt"
+    },
+    "licenseFile": "../../LICENSE",
+    "shortDescription": "Offline auto-mastering",
+    "longDescription": "Eluate masters a track offline, with the whole track known before processing.",
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
+      "nsis": { "installMode": "currentUser" }
+    }
+  }
+}

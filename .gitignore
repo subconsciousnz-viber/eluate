@@ -1,0 +1,41 @@
+# Environment
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# Private job audio, renders and analyses of it; never committed
+work/
+
+# EBU loudness test set: "technical testing only", not redistributable
+fixtures/ebu/
+
+# The maintainer's premasters for the real-material tests (tests/test_feature_real.py) and his
+# manifest of their paths; private. Only the example manifest is committed.
+fixtures/premasters/*
+!fixtures/premasters/manifest.example.toml
+
+# Audio of any kind
+*.wav
+*.flac
+*.aif
+*.aiff
+*.mp3
+
+# Scratch
+*.log
+*.tmp
+
+# Tooling state
+.claude/
+
+# Desktop build outputs (desktop/README.md); ui/data.js is numbers from a private render
+desktop/node_modules/
+desktop/dist/
+desktop/dist-engine/
+desktop/build-engine/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+ui/data.js
+trash/

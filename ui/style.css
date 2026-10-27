@@ -1,0 +1,451 @@
+@font-face {
+  font-family: "Archivo";
+  src: url("fonts/Archivo.ttf") format("truetype");
+  font-weight: 100 900;
+  font-stretch: 62% 125%;
+  font-display: block;
+}
+
+/* One graphical language: hairline rules, small-caps names, large tabular values, and
+   colour only where it means something (ice = after, graphite = before, reach = target /
+   reached, amber = short). The ground is the Jective Marks canvas: near-black, teal cast. */
+:root {
+  --steel: #0d1011;      /* page */
+  --panel: #111517;      /* cards */
+  --well: #0a0d0e;       /* insets: segmented groups, fields, transport */
+  --rule: #1f2729;
+  --rule-hi: #2d383b;
+  --graphite: #75899a;
+  --ice: #e3ecef;
+  --reach: #8fd0bf;
+  --amber: #f4b84a;
+  --red: #f0565b;
+  --dim: #8a908f;
+  --mk: #4ecfa8;         /* the mark only */
+  --mk-hi: #8eecc9;
+
+  --f: "Archivo", "Segoe UI", system-ui, sans-serif;
+  --s-1: 0.8125rem;
+  --s0: 0.9375rem;
+  --s1: 1.125rem;
+  --s2: 1.5rem;
+  --gap: 1rem;
+  --r: 4px;
+}
+
+* { box-sizing: border-box; }
+
+html, body { margin: 0; height: 100%; }
+
+body {
+  background: var(--steel);
+  color: var(--ice);
+  font-family: var(--f);
+  font-size: var(--s0);
+  font-variation-settings: "wdth" 100;
+  font-feature-settings: "tnum" 1, "lnum" 1;
+  -webkit-font-smoothing: antialiased;
+}
+
+button, input { font: inherit; color: inherit; }
+
+:focus-visible { outline: 2px solid var(--reach); outline-offset: 2px; border-radius: 3px; }
+
+.app {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto auto auto 1fr;
+  gap: 0.75rem;
+  max-width: 1480px;
+  margin: 0 auto;
+  padding: 0 1.5rem;
+  min-height: 100%;
+}
+
+/* names are semi-condensed, values normal width */
+.name, .seg button, .render, .stage, .stats dt, .macro label, .tl-label, .spec-label {
+  font-variation-settings: "wdth" 82;
+}
+
+[hidden] { display: none !important; }
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+
+/* ---------------------------------------------------------------- bar */
+
+/* app-level controls only; the track's name, status and actions are in the hero card */
+.bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem 1rem; min-height: 5.5rem;
+  margin: 0 -1.5rem; padding: 0 1.5rem; border-bottom: 1px solid var(--rule);
+}
+
+.brand {
+  display: flex; align-items: center; gap: 1rem; flex: none; align-self: stretch;
+  padding-right: 1.5rem; border-right: 1px solid var(--rule);
+}
+.mark { width: 150px; height: 75px; overflow: visible; fill: none; }
+.mark path { vector-effect: non-scaling-stroke; }
+.word {
+  font-size: 1rem; font-weight: 300; letter-spacing: 0.42em; color: var(--ice);
+  font-variation-settings: "wdth" 125;
+}
+
+.bar .ghost { flex: none; }
+/* Open is the way in (maintainer, 2026-10-24: the empty graph's own Open track button is gone):
+   the look that button had, brighter than the ghost buttons beside it */
+.open {
+  flex: none; background: var(--well); border: 1px solid var(--rule-hi); border-radius: var(--r);
+  padding: 0.45rem 1.1rem; color: var(--ice); font-weight: 600; cursor: pointer;
+  font-variation-settings: "wdth" 82;
+}
+.open:hover { border-color: var(--reach); }
+.open:disabled { color: var(--dim); border-color: var(--rule); cursor: default; }
+
+/* Limit CPU and Render sit at the right (Render alone in a browser) */
+.cpu, .cpu[hidden] + .render { margin-left: auto; }
+.cpu { display: inline-flex; align-items: center; gap: 0.5rem; flex: none; color: var(--dim); }
+
+.render {
+  background: var(--ice); border: 1px solid var(--ice); border-radius: var(--r); color: var(--steel);
+  padding: 0.55rem 1.6rem; font-weight: 600; letter-spacing: 0.02em; cursor: pointer;
+}
+.render.changed {
+  background: var(--reach); border-color: var(--reach); color: var(--steel);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--reach) 25%, transparent);
+}
+.render:disabled { background: none; color: var(--dim); border-color: var(--rule); cursor: default; }
+
+.ghost {
+  background: none; border: 1px solid var(--rule); border-radius: var(--r);
+  padding: 0.45rem 0.9rem; cursor: pointer; color: var(--dim);
+}
+.ghost:hover { color: var(--ice); }
+
+.seg {
+  display: inline-flex; gap: 2px; padding: 2px;
+  background: var(--well); border: 1px solid var(--rule); border-radius: var(--r);
+}
+.seg button {
+  background: none; border: 0; border-radius: 3px; padding: 0.3rem 0.85rem; cursor: pointer; color: var(--dim);
+}
+.seg button:hover { color: var(--ice); }
+.seg button[aria-checked="true"] { background: var(--rule); color: var(--ice); box-shadow: inset 0 -2px 0 var(--reach); }
+.seg.small button { padding: 0.2rem 0.65rem; font-size: var(--s-1); }
+.seg.fixed { padding: 0.3rem 0.85rem; color: var(--ice); font-variation-settings: "wdth" 82; }
+
+/* ---------------------------------------------------------------- track list (two or more tracks) */
+
+.app:has(> .list:not([hidden])) { grid-template-rows: auto auto auto auto 1fr; }
+.list { background: var(--panel); border: 1px solid var(--rule); border-radius: var(--r); padding: 0.25rem 0; }
+.rows { max-height: 13.5rem; overflow-y: auto; }
+.trk {
+  display: grid; align-items: baseline; gap: 0 1rem; padding: 0.3rem 1rem;
+  grid-template-columns: minmax(8rem, 1fr) 9rem repeat(5, 5.5rem) 1.5rem;
+}
+.trk.head {
+  color: var(--dim); font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.12em;
+  font-variation-settings: "wdth" 82; border-bottom: 1px solid var(--rule); padding-bottom: 0.4rem;
+}
+.rows .trk { cursor: pointer; border-left: 2px solid transparent; }
+.rows .trk:hover { background: var(--well); }
+.rows .trk[aria-selected="true"] { background: var(--well); border-left-color: var(--reach); }
+.trk .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.trk .st { color: var(--dim); white-space: nowrap; font-variation-settings: "wdth" 82; }
+.trk.st-running .st { color: var(--reach); }
+.trk.st-error .st { color: var(--red); }
+.trk .num { text-align: right; white-space: nowrap; }
+.trk .num.short { color: var(--amber); }
+.trk .num small { color: var(--dim); font-size: var(--s-1); margin-left: 0.35rem; }
+.trk .rm {
+  background: none; border: 0; padding: 0; color: var(--dim); cursor: pointer; visibility: hidden;
+}
+.rows .trk:hover .rm { visibility: visible; }
+.trk .rm:hover { color: var(--ice); }
+.rows:focus-visible { outline-offset: -2px; }
+
+/* ---------------------------------------------------------------- graph card: two views, one footprint */
+
+.stage-card, .controls {
+  background: var(--panel); border: 1px solid var(--rule); border-radius: var(--r);
+}
+.stage-card { padding: 0.75rem 1rem 0.5rem; }
+
+/* the selected track: its full name, the status under it, its actions at the right; the
+   actions wrap under the name before the name is cut */
+.track-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1.5rem;
+  margin: 0 -1rem 0.75rem; padding: 0.1rem 1rem 0.75rem; border-bottom: 1px solid var(--rule);
+}
+.track-info { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 0.15rem; }
+.track-name {
+  margin: 0; font-size: var(--s1); font-weight: 600; letter-spacing: -0.01em; line-height: 1.35;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.track-name.none { color: var(--dim); font-weight: 400; }
+.track-actions { display: flex; flex: none; gap: 0.5rem; margin-left: auto; }
+.track-actions:not(:has(> :not([hidden]))) { display: none; }
+
+.stage { margin: 0; min-height: 1.35em; line-height: 1.35; color: var(--dim); }
+.stage.running { color: var(--ice); }
+.stage-time { color: var(--dim); }
+.stage-time:not(:empty)::before { content: "\00b7"; margin: 0 0.45rem; }
+.cancel { color: var(--ice); border-color: var(--graphite); flex: none; }
+.stage.running::before {
+  content: ""; display: inline-block; width: 0.65rem; height: 0.65rem; margin-right: 0.5rem;
+  border: 1.5px solid var(--rule-hi); border-top-color: var(--reach); border-radius: 50%;
+  vertical-align: -0.05em; animation: stage-spin 900ms linear infinite;
+}
+@keyframes stage-spin { to { transform: rotate(360deg); } }
+.stage.error { color: var(--red); }
+
+.stage-head {
+  display: flex; align-items: center; justify-content: space-between;
+  min-height: 1.9rem; margin-bottom: 0.6rem;
+}
+.views-tabs button { font-size: 0.75rem; letter-spacing: 0.1em; text-transform: uppercase; font-weight: 600; }
+.stage-card[data-view="level"] .stage-tools { visibility: hidden; }
+
+/* both views stay laid out in one cell, so each always draws at full width */
+.views { display: grid; }
+.views > section { grid-area: 1 / 1; min-width: 0; }
+.stage-card[data-view="level"] .spectrum,
+.stage-card[data-view="spectrum"] .timeline { visibility: hidden; pointer-events: none; }
+
+/* one legend row per view: legend left, readout right, the same size, never moving */
+.view-head, .spec-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 1rem;
+  min-height: 1.4rem; margin-bottom: 0.25rem;
+}
+.spec-legend { display: flex; align-items: center; gap: 1.1rem; color: var(--dim); font-size: var(--s-1); white-space: nowrap; }
+.spec-legend > span { display: inline-flex; align-items: center; gap: 0.35rem; }
+.unit-k { padding-right: 0.9rem; border-right: 1px solid var(--rule-hi); }
+.key { display: inline-block; width: 1rem; border-top: 2px solid; }
+.key.before { border-color: var(--graphite); }
+.key.after { border-color: var(--ice); }
+.key.target { border-color: var(--reach); }
+.key.gr { border-top-style: dashed; border-color: var(--ice); }
+.key.fit { border-top-style: dashed; border-color: var(--amber); }
+
+.readout, .sp-readout {
+  display: flex; align-items: baseline; gap: 0.35rem; margin-left: auto;
+  font-size: var(--s-1); white-space: nowrap; min-height: 1.2rem;
+}
+.readout span { color: var(--dim); margin-left: 0.75rem; }
+.readout span:first-child, .readout b:first-child { margin-left: 0; }
+/* holds the last position after the pointer leaves, dimmed; bright while hovering */
+.readout b { font-weight: 500; color: var(--dim); transition: color 120ms; }
+.timeline:hover .readout b { font-weight: 650; color: var(--ice); }
+.timeline:hover .readout b:first-child { color: var(--reach); }
+.sp-readout span { color: var(--dim); }
+.sp-readout b { color: var(--ice); font-weight: 650; }
+
+/* ---------------------------------------------------------------- timeline */
+
+.timeline { position: relative; }
+.tl { width: 100%; height: 318px; }
+.tl:focus-visible { outline: 2px solid var(--reach); outline-offset: 3px; border-radius: 3px; }
+.timeline.drop .tl { outline: 1px dashed var(--reach); outline-offset: 4px; }
+.tl svg, .sp svg { display: block; width: 100%; height: 100%; overflow: visible; }
+
+.tl-label, .spec-label, .tl-axis { fill: var(--dim); font-size: 11px; }
+.sec-name { fill: var(--dim); font-size: 11px; font-variation-settings: "wdth" 82; }
+.sec-val { fill: var(--amber); font-size: 11px; font-weight: 600; }
+.sec-ref { fill: var(--reach); font-size: 12px; }
+
+/* ---------------------------------------------------------------- spectrum */
+
+.spec-tilt { flex: 0 0 auto; font-size: var(--s-1); font-weight: 500; white-space: nowrap; }
+.sp-readout:empty + .spec-tilt { margin-left: auto; }
+.spec-tilt .of { color: var(--dim); font-weight: 400; }
+.spec-tilt.short { color: var(--amber); }
+.sp { height: 308px; }
+/* the crossovers are handles, not data: they sit back until touched */
+.xo { cursor: ew-resize; }
+.xo line { stroke: var(--rule-hi); stroke-dasharray: 3 3; }
+.xo.side line { stroke-dasharray: 1 3; }
+.xo text { fill: var(--dim); font-size: 11px; }
+.xo:hover line, .xo:focus line { stroke: var(--ice); stroke-dasharray: none; }
+.xo:hover text, .xo:focus text { fill: var(--ice); }
+.xo:focus { outline: none; }
+.xo:focus-visible line { stroke: var(--reach); stroke-width: 2; }
+
+/* ---------------------------------------------------------------- controls */
+
+.controls { padding: 0.6rem 1rem; }
+
+.disclosure-h {
+  display: flex; align-items: center; gap: 2rem; margin: 0;
+  font-size: var(--s1); font-weight: 600;
+}
+.disclosure {
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  background: none; border: 0; padding: 0.25rem 0; cursor: pointer; color: var(--dim);
+  font-size: 0.75rem; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase;
+}
+.chev { width: 1rem; height: 1rem; fill: none; stroke: var(--dim); stroke-width: 1.75; transition: transform 140ms ease; }
+.disclosure[aria-expanded="true"] .chev { transform: rotate(90deg); }
+.disclosure:hover, .disclosure:hover .chev { color: var(--ice); stroke: var(--ice); }
+
+/* closed, the heading carries the two reached numbers */
+.summary { display: flex; gap: 2.25rem; font-size: var(--s0); font-weight: 400; }
+.summary .item { display: inline-flex; gap: 0.55rem; align-items: baseline; }
+.summary .k { color: var(--dim); font-size: var(--s-1); text-transform: uppercase; letter-spacing: 0.1em; font-variation-settings: "wdth" 82; }
+.summary .v { font-size: var(--s2); font-weight: 500; letter-spacing: -0.01em; color: var(--reach); }
+.summary .v.short { color: var(--amber); }
+.summary .of { color: var(--dim); font-size: var(--s-1); }
+.disclosure[aria-expanded="true"] + .summary { display: none; }
+
+.controls-body {
+  display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+  gap: 2rem; margin-top: 0.6rem; padding-top: 1rem; border-top: 1px solid var(--rule);
+}
+
+.row {
+  display: grid; grid-template-columns: 7.5rem minmax(0, 1fr) 4.5rem 9.5rem;
+  align-items: center; gap: 1rem; min-height: 2.6rem;
+}
+.name, .macro label { color: var(--dim); font-size: var(--s-1); text-transform: uppercase; letter-spacing: 0.08em; }
+.unit {
+  display: block; margin-top: 0.1rem; color: var(--dim); font-size: var(--s-1); font-weight: 400; line-height: 1.05;
+  text-transform: none; letter-spacing: 0;
+}
+.ctl { display: flex; align-items: center; gap: 0.75rem; min-width: 0; }
+.set { text-align: right; font-size: var(--s1); font-weight: 500; }
+/* reached values: coloured by outcome, kept at the size of their target */
+.got { font-size: var(--s-1); font-weight: 400; line-height: 1.35; color: var(--reach); white-space: normal; }
+.got small { display: block; font-size: var(--s-1); font-weight: 400; color: var(--dim); }
+.got .of { color: var(--dim); font-weight: 400; }
+.got.short { color: var(--amber); }
+.got.short::before {
+  content: ""; display: inline-block; width: 0.4rem; height: 0.4rem; border-radius: 50%;
+  background: var(--amber); margin-right: 0.4rem; vertical-align: 0.12em;
+}
+
+input[type="range"] {
+  -webkit-appearance: none; appearance: none; background: none; width: 100%; height: 1.5rem; cursor: pointer;
+}
+input[type="range"]::-webkit-slider-runnable-track { height: 3px; border-radius: 2px; background: var(--rule-hi); }
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 0.85rem; height: 0.85rem; border-radius: 50%;
+  background: var(--ice); margin-top: -0.32rem; border: 0; box-shadow: 0 0 0 3px var(--panel);
+}
+input[type="range"]::-moz-range-track { height: 3px; border-radius: 2px; background: var(--rule-hi); }
+input[type="range"]::-moz-range-thumb { width: 0.85rem; height: 0.85rem; border-radius: 50%; background: var(--ice); border: 0; }
+
+input[type="number"] {
+  background: var(--well); border: 1px solid var(--rule); border-radius: var(--r); padding: 0.3rem 0.5rem;
+}
+.tempo input { width: 5.5rem; }
+
+.toggle {
+  width: 2.6rem; height: 1.4rem; border-radius: 0.7rem; border: 1px solid var(--rule);
+  background: var(--well); position: relative; cursor: pointer; padding: 0;
+}
+.toggle span {
+  position: absolute; top: 2px; left: 2px; width: 1rem; height: 1rem; border-radius: 50%;
+  background: var(--graphite); transition: transform 120ms ease;
+}
+.toggle[aria-checked="true"] { background: var(--reach); border-color: var(--reach); }
+.toggle[aria-checked="true"] span { transform: translateX(1.2rem); background: var(--steel); }
+
+/* locked while a render runs (the settings it renders with): dimmed, not interactive */
+input:disabled, .toggle:disabled, .seg button:disabled { cursor: default; }
+input[type="range"]:disabled, input[type="number"]:disabled, .toggle:disabled,
+.seg[aria-disabled="true"] { opacity: 0.45; }
+.seg button:disabled:hover { color: var(--dim); }
+.seg button[aria-checked="true"]:disabled:hover { color: var(--ice); }
+.xo.locked { cursor: default; pointer-events: none; opacity: 0.45; }
+
+.character { display: flex; flex-direction: column; gap: 1rem; }
+/* About: version, licence and the source at this version's release tag (AGPL source offer) */
+.about { grid-column: 1 / -1; margin: 0; color: var(--dim); font-size: var(--s-1); }
+.about .url { color: var(--ice); user-select: all; }
+.seg.wide { display: flex; }
+.seg.wide button { flex: 1; }
+.macro {
+  display: grid; grid-template-columns: 6.5rem minmax(0, 1fr) 3rem minmax(7.5rem, auto);
+  align-items: center; gap: 1rem; min-height: 2.6rem;
+}
+.macro output { text-align: right; font-size: var(--s1); font-weight: 500; }
+
+/* ---------------------------------------------------------------- transport */
+
+.transport {
+  position: sticky; bottom: 0; align-self: end; display: flex; align-items: center; gap: 1rem;
+  margin: 0 -1.5rem; padding: 0.6rem 1.5rem 0.7rem;
+  background: var(--well); border-top: 1px solid var(--rule);
+}
+.play {
+  width: 2.5rem; height: 2.5rem; border-radius: 50%; border: 1px solid var(--ice);
+  background: var(--ice); cursor: pointer; display: grid; place-items: center; padding: 0;
+}
+.play svg { width: 0.9rem; height: 0.9rem; fill: var(--steel); }
+.play:disabled { background: var(--panel); border-color: var(--rule); cursor: default; }
+.play:disabled svg { fill: var(--dim); }
+.pos { min-width: 3.5rem; font-size: var(--s1); font-weight: 500; color: var(--ice); }
+/* blind A/B: the switch, the vote (enabled once both sides were heard) and the answer */
+.blind-sw { display: inline-flex; align-items: center; gap: 0.5rem; flex: none; color: var(--dim); }
+.vote { display: inline-flex; align-items: center; gap: 0.4rem; flex: none; }
+.vote .name { color: var(--dim); margin-right: 0.2rem; }
+.vote button { padding: 0.3rem 0.75rem; }
+.vote button:not(:disabled) { color: var(--ice); border-color: var(--rule-hi); }
+.vote button:not(:disabled):hover { border-color: var(--reach); }
+.vote button:disabled { opacity: 0.45; cursor: default; }
+.reveal { color: var(--reach); font-size: var(--s-1); max-width: 22rem; }
+.reveal:empty { display: none; }
+/* the one-time question about sharing votes: over the transport (sticky, so the anchor) */
+.consent {
+  position: absolute; bottom: calc(100% + 0.5rem); left: 1.5rem; z-index: 5; width: min(30rem, calc(100% - 3rem));
+  background: var(--panel); border: 1px solid var(--rule-hi); border-radius: var(--r); padding: 1rem 1.1rem;
+  box-shadow: 0 8px 28px rgb(0 0 0 / 0.5);
+}
+.consent h3 { margin: 0 0 0.5rem; font-size: var(--s1); font-weight: 600; }
+.consent p { margin: 0 0 0.6rem; color: var(--dim); font-size: var(--s-1); line-height: 1.5; }
+.consent .url { color: var(--ice); user-select: all; }
+.consent-buttons { display: flex; gap: 0.6rem; margin-top: 0.8rem; }
+.stats { display: flex; gap: 0; margin: 0 0 0 auto; }
+.stats div { display: flex; flex-direction: column; gap: 0.1rem; padding: 0 1.25rem; border-left: 1px solid var(--rule); }
+.stats dt { color: var(--dim); font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.12em; }
+.stats dd { display: flex; gap: 0.4rem; align-items: baseline; margin: 0; font-size: var(--s1); font-weight: 600; white-space: nowrap; }
+.stats dd.short { color: var(--amber); }
+.stats dd small { color: var(--dim); font-size: var(--s-1); font-weight: 400; }
+
+/* below this the brand and the controls no longer fit one row: the brand gets its own */
+@media (max-width: 1180px) {
+  .bar { min-height: 0; padding-top: 0.5rem; padding-bottom: 0.75rem; }
+  .brand { flex-basis: 100%; border-right: 0; padding-right: 0; }
+  .mark { width: 96px; height: 48px; }
+}
+
+@media (max-width: 1100px) {
+  .stats { min-width: 0; flex-wrap: wrap; gap: 0.5rem 0; }
+  .stats dd { flex-wrap: wrap; }
+  .spec-head { flex-wrap: wrap; }
+  .spec-legend { flex-basis: 100%; }
+}
+
+/* ---------------------------------------------------------------- narrow */
+
+@media (max-width: 900px) {
+  .app { padding: 0 1rem; }
+  .bar, .transport { margin: 0 -1rem; padding-left: 1rem; padding-right: 1rem; }
+  .trk { grid-template-columns: minmax(6rem, 1fr) 6.5rem repeat(3, 3.5rem) 1.5rem; }
+  .trk > :nth-child(5), .trk > :nth-child(6) { display: none; }
+  .controls-body { grid-template-columns: 1fr; gap: 1rem; }
+  .summary { flex-wrap: wrap; gap: 0.25rem 1rem; }
+  .row { grid-template-columns: 6rem minmax(0, 1fr) 3.5rem; }
+  .row { row-gap: 0.2rem; padding-bottom: 0.6rem; }
+  .row .got { grid-column: 2 / 4; }
+  .row .got:empty { display: none; }
+  .stats { flex-wrap: wrap; gap: 0.5rem 0; margin-left: 0; }
+  .transport { flex-wrap: wrap; gap: 0.75rem 1rem; }
+  .seg.wide button { padding: 0.4rem 0.3rem; }
+  .view-head { flex-wrap: wrap; }
+  .readout { margin-left: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}

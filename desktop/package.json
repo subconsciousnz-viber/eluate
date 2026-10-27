@@ -1,0 +1,16 @@
+{
+  "name": "eluate-desktop",
+  "private": true,
+  "version": "0.1.0-beta",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "scripts": {
+    "stage": "node scripts/stage-ui.mjs",
+    "engine": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-engine.ps1",
+    "dev": "tauri dev",
+    "build": "cargo test --manifest-path src-tauri/Cargo.toml && tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
