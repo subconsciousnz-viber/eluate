@@ -1,15 +1,13 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "bundle": {
-    "targets": ["deb", "rpm", "appimage"],
+    "targets": ["deb", "appimage"],
     "category": "Music",
     "linux": {
       "deb": {
         "section": "sound",
         "priority": "optional",
         "depends": [
-          "libwebkit2gtk-4.1-0",
-          "libgtk-3-0",
           "gstreamer1.0-plugins-base",
           "gstreamer1.0-plugins-good"
         ],
@@ -18,8 +16,6 @@
       "rpm": {
         "release": "1",
         "depends": [
-          "webkit2gtk4.1",
-          "gtk3",
           "gstreamer1-plugins-base",
           "gstreamer1-plugins-good"
         ],
