@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "stage": "node scripts/stage-ui.mjs",
-    "engine": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-engine.ps1",
+    "engine": "node scripts/build-engine.mjs",
     "dev": "tauri dev",
     "build": "cargo test --manifest-path src-tauri/Cargo.toml && tauri build"
   },
