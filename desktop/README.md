@@ -26,6 +26,38 @@ what `dist-engine/` holds. `npm run dev` runs the shell against `.venv` directly
 (`python -m eluate.app_engine`, or `ELUATE_PYTHON`), so engine changes need no
 rebuild there.
 
+### Linux
+
+The same three commands, after the system packages. This is the set the beta was built
+with on Ubuntu 24.04, not a minimised one:
+
+```
+sudo apt install build-essential libwebkit2gtk-4.1-dev librsvg2-dev patchelf libtbb12
+```
+
+`libtbb12` is not a Tauri dependency and is only needed for the AppImage. numba ships
+`tbbpool.so`, which links `libtbb.so.12`; numba falls back to another threading layer
+when it is absent and PyInstaller only warns, but linuxdeploy walks every ELF in the
+frozen engine and fails on the first dependency it cannot resolve:
+
+```
+ERROR: Could not find dependency: libtbb.so.12
+ERROR: Failed to deploy dependencies for existing files
+```
+
+`npm run build` writes both of
+
+```
+src-tauri/target/release/bundle/deb/Eluate_<v>_amd64.deb
+src-tauri/target/release/bundle/appimage/Eluate_<v>_amd64.AppImage
+```
+
+The targets are in `src-tauri/tauri.linux.conf.json`, which tauri merges on Linux only,
+so the base config keeps `nsis` and the Windows build is untouched. rpm is configured
+there but kept out of `targets`: tauri puts the version straight into the RPM Version
+field, which does not allow the `-` that every semver prerelease carries. At 0.1.0,
+adding `"rpm"` back to `targets` is the whole change.
+
 ## Pieces
 
 - `src-tauri/src/lib.rs`: commands `start_job` (master, analyse, preview, ui-data, summary; each
