@@ -201,3 +201,26 @@ def test_air_band_8x_limits_foldback(fs):
 def test_drive_capped_at_12_db():
     with pytest.raises(ValueError):
         _plan(drive=[[0, 0], [0, 0], [0, 0], [0, 0], [13.0, 0]], harmonic=[1.0] * NB)
+
+
+def test_two_tone_leakage_below_the_band_at_2_db_drive():
+    """Filter-maths audit F4, pinned (module contract): band 1 (100 Hz lower edge) driven
+    2 dB by 150 + 180 Hz leaks less than -85 dB re the fundamentals below 100 Hz at
+    sym 0 (measured -92) and less than -70 dB at sym 0.3 (measured -76); at 12 dB the
+    leak is -33 dB (documented, not a gate)."""
+    fs, n, margin = 48000.0, 1 << 17, 16384
+    m1, m2 = round(150 * n / fs), round(180 * n / fs)
+    f1, f2 = fs * m1 / n, fs * m2 / n
+    t = np.arange(n + 2 * margin) / fs
+    x = 0.25 * np.sin(2 * np.pi * f1 * t) + 0.25 * np.sin(2 * np.pi * f2 * t)
+
+    def leak_db(sym, drive):
+        y = saturate.saturate_band(x, drive, 1.0, fs, 100.0, symmetry=sym)[margin:margin + n]
+        p = np.abs(np.fft.rfft(y)) ** 2
+        fr = np.fft.rfftfreq(n, 1 / fs)
+        fund = p[m1] + p[m2]
+        return 10 * np.log10(p[(fr > 0.5) & (fr < 100.0)].sum() / fund)
+    l0, l3, l12 = leak_db(0.0, 2.0), leak_db(0.3, 2.0), leak_db(0.0, 12.0)
+    print(f"leak below 100 Hz: 2 dB sym 0 {l0:.1f}, sym 0.3 {l3:.1f}, 12 dB sym 0 {l12:.1f} dB")
+    assert l0 < -85.0 and l3 < -70.0
+    assert -40.0 < l12 < -28.0
