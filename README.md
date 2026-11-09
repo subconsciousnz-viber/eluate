@@ -52,6 +52,9 @@ pytest               # Full suite
 Download the EBU test vectors from `tech.ebu.ch` into `fixtures/ebu/`; they are not
 redistributed. Tests requiring those vectors or private audio skip when it is absent.
 CI runs the fast tier on pull requests and the full suite weekly or on manual dispatch.
+The first bass-pitch analysis in a fresh environment compiles librosa's pYIN with numba
+(about a minute, then roughly 10 s per new process from the cache); the CLI keeps that
+cache under the user cache directory (`NUMBA_CACHE_DIR`, set it to move it).
 
 ## Contributing
 

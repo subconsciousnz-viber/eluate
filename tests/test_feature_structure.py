@@ -104,11 +104,12 @@ def test_one_bar_fill_boundary_lands_on_the_drop():
 
 def test_align_guards_and_uninformative_grid():
     beats = np.arange(16) * 0.5
-    out, shift = structure.align_to_onsets(beats, [1.0], 8.0)  # one onset: unchanged
-    assert np.array_equal(out, beats) and shift == 0.0
+    out, shift, info = structure.align_to_onsets(beats, [1.0], 8.0)  # one onset: unchanged
+    assert np.array_equal(out, beats) and shift == 0.0 and info["coverage"] == 0.0
     r = _run(syn.pink_noise(FS * 6, FS, seed=2) * 0.01)
     assert r["meter"] == "4/4 (assumed)"
-    assert r["grid_informative"] == (r["grid_kind"] != "default")
+    assert not r["grid_informative"] and r["grid_reason"].startswith("weak metrical evidence")
+    assert r["grid_evidence"]["beat_onset_coverage"] < structure.GRID_MIN_COVERAGE
 
 
 def test_snap_from_unrounded_bar():

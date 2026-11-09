@@ -10,19 +10,30 @@ Contract:
   level is more than QUIET_BELOW_DB below the track's loud level (the 95th percentile of
   the frame levels) and not digital silence: intros, gaps, tails and fades, where the music
   does not mask a noise floor. Loud passages are not measured: noise there is masked, and
-  a dense mix leaves no gaps in which a floor can be told from the music. Per third-octave
-  band, the floor is the QUIET_PERCENTILE of the band's weighted power over the quiet
-  frames; the broadband floor is their sum. `quiet` passes another signal's quiet frames
-  (the master is read on the premaster's, so both are measured at the same moments),
-  trimmed to this signal's frame count or padded with False (frames past its end are
-  not quiet).
+  a dense mix leaves no gaps in which a floor can be told from the music. Fallback (audit
+  features F8, 2026-11-10): when fewer than MIN_QUIET_S of frames pass that rule, the
+  quiet frames are the lowest-level QUIET_FALLBACK_PCT of the live frames (at least
+  MIN_QUIET_S of them), and `may_include_music` is True: a hiss at or above the loud level
+  minus 35 dB (white hiss at -50 or -40 dBFS on a peak-normalised track) made no frame
+  "quiet", so the floor read -inf and the louder the hiss the less was reported; on a track
+  that never stops, the fallback frames are music and the figure is an upper bound, which
+  the flag says. Per third-octave band, the floor is the QUIET_PERCENTILE of the band's
+  weighted power over the quiet frames; the broadband floor is their sum. `quiet` passes
+  another signal's quiet frames (the master is read on the premaster's, so both are
+  measured at the same moments), trimmed to this signal's frame count or padded with False
+  (frames past its end are not quiet).
   Returns {"db", "bands_hz", "bands_db", "quiet_s", "quiet_spans": [start, end] seconds of
-  the quiet passages (runs closer than 0.5 s merged), "quiet": frame mask}; db is -inf when
-  there are fewer than MIN_QUIET_S of quiet frames or the sample rate leaves no band in
-  FLOOR_BANDS_HZ (no bands then).
+  the quiet passages (runs closer than 0.5 s merged), "quiet": frame mask, "quiet_rule"
+  ("below loud - 35 dB", "lowest 5 % of frames" or "given"), "may_include_music"}; db is
+  -inf only when the signal has fewer than MIN_QUIET_S of live frames in all or the sample
+  rate leaves no band in FLOOR_BANDS_HZ (no bands then).
+  Calibration note (audit features F24): BS.468 puts white hiss about 9 dB above its
+  unweighted level over 2 to 20 kHz (-60 dBFS white reads -51.1 dB), so the -60 dB flag
+  corresponds to about -69 dBFS of white hiss.
 - `assess(before, after, threshold_db=FLAG_DB) -> dict` (JSON-ready, no mask): status
   "exposed" = below the threshold before and at or above it after (the master made it
-  audible), "present" = at or above it in both, None otherwise (or nothing to measure).
+  audible), "present" = at or above it in both, None otherwise (or nothing to measure);
+  `may_include_music` and `quiet_rule` are the premaster's (the frames both are read on).
 """
 
 from __future__ import annotations
@@ -35,6 +46,7 @@ FRAME_S = 0.046
 QUIET_BELOW_DB = 35.0
 QUIET_PERCENTILE = 20.0
 MIN_QUIET_S = 0.5
+QUIET_FALLBACK_PCT = 5.0      # F8: the lowest-level share of live frames when no frame is quiet
 SILENT_DB = -120.0
 LOUD_PERCENTILE = 95.0
 FLOOR_BANDS_HZ = (2000.0, 20000.0)
@@ -91,18 +103,30 @@ def floor(x: np.ndarray, fs: int, quiet: np.ndarray | None = None) -> dict:
     if centres.size:
         band_p = np.stack([(p[m] * w[m, None]).sum(axis=0) for m in
                            ((f >= c * 2 ** (-1 / 6)) & (f < c * 2 ** (1 / 6)) for c in centres)])
+    hop_s = (n // 2) / fs
+    rule, may_music = "given", False
     if quiet is None:
         level = 10 * np.log10(p.sum(axis=0) + 1e-30)
         live = level > SILENT_DB
         loud = np.percentile(level[live], LOUD_PERCENTILE) if np.any(live) else 0.0
         quiet = live & (level < loud - QUIET_BELOW_DB)
+        rule = f"below loud - {QUIET_BELOW_DB:g} dB"
+        n_min = int(np.ceil(MIN_QUIET_S / hop_s))
+        if quiet.sum() < n_min and live.sum() >= n_min:
+            # F8: nothing is 35 dB under the loud level (a hiss that loud, or music that
+            # never stops): the lowest-level frames, flagged as possibly music
+            k = max(n_min, int(np.ceil(QUIET_FALLBACK_PCT / 100.0 * live.sum())))
+            idx = np.flatnonzero(live)
+            quiet = np.zeros(level.size, dtype=bool)
+            quiet[idx[np.argsort(level[idx], kind="stable")[:k]]] = True
+            rule, may_music = f"lowest {QUIET_FALLBACK_PCT:g} % of frames", True
     # a borrowed mask fits this signal's frames: trimmed, or padded with False (not quiet)
     nf = band_p.shape[1]
     quiet = np.asarray(quiet, dtype=bool)[:nf]
     quiet = np.concatenate([quiet, np.zeros(nf - len(quiet), dtype=bool)])
-    hop_s = (n // 2) / fs
     out = {"bands_hz": centres.tolist(), "quiet_s": float(quiet.sum() * hop_s), "quiet": quiet,
-           "quiet_spans": _spans(quiet, hop_s, n / fs)}
+           "quiet_spans": _spans(quiet, hop_s, n / fs), "quiet_rule": rule,
+           "may_include_music": may_music}
     if quiet.sum() * hop_s < MIN_QUIET_S:
         return {**out, "db": float("-inf"), "bands_db": [float("-inf")] * len(centres)}
     fl = np.percentile(band_p[:, quiet], QUIET_PERCENTILE, axis=1)
@@ -124,4 +148,6 @@ def assess(before: dict, after: dict, threshold_db: float = FLAG_DB) -> dict:
             "weighting": "ITU-R BS.468", "quiet_s": before["quiet_s"],
             "quiet_spans": before["quiet_spans"], "loudest_band_hz": loudest,
             "bands_hz": after["bands_hz"], "before_bands_db": before["bands_db"],
-            "after_bands_db": after["bands_db"]}
+            "after_bands_db": after["bands_db"],
+            "quiet_rule": before.get("quiet_rule"),
+            "may_include_music": bool(before.get("may_include_music", False))}

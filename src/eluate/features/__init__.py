@@ -4,12 +4,16 @@ Contract of `analyse(x, fs, fcs=bands.DEFAULT_CROSSOVERS, hop_s=0.1, bpm=None,
 fcs_from_key=None)`:
 - `fcs_from_key`: a function of the key's tonic name (or None) returning the
   crossovers (planner.key_crossovers). When given, the key (pitch.key: chroma
-  weighted by momentary-loudness power, neither of which reads the band
-  split) is found right after loudness, before any band split, and the
-  crossovers it returns replace `fcs` for the whole analysis;
-  meta["crossover_rule"] is "key" and meta["crossover_tonic"] the tonic, else
-  "fixed" and None. The key the pitch pass reports later is the same one (same
-  chroma, same weights).
+  weighted by momentary-loudness power and the bass pitch-class histogram,
+  none of which reads the band split) is found right after loudness, before
+  any band split, and the crossovers it returns replace `fcs` for the whole
+  analysis; meta["crossover_rule"] is "key" and meta["crossover_tonic"] the
+  tonic, else "fixed" and None. The key the pitch pass reports later is the
+  same one (same chroma, same weights). `meta["key_confidence"]` and
+  `plan_inputs["key_confidence"]` carry pitch.key_confidence (a float in
+  [0, 1], None without chroma; audit features F2); a `fcs_from_key` that
+  takes a `key_confidence` parameter receives it, so the planner can refuse
+  the key lock on a weak key.
 - `bpm`: the user's tempo (spec `--bpm`); when given it overrides tempo
   detection and seeds the beat grid, and structure.metrical reports how far the
   detected pulse was from it (structure.metrical_hypothesis).
@@ -43,7 +47,10 @@ fcs_from_key=None)`:
   (finite, flagged), key (combined edma mode / edmm tonic, with both
   profiles' labels and scores), bass root per beat with confidence and the
   keyeq gate (NSDF agreement), tempo (octave-checked), whether the beat grid is
-  informative, beats, bars and edges.
+  informative with the reason and the evidence behind it (`grid_reason`,
+  `grid_evidence`: onset count, beat-onset coverage, onset contrast, ACF
+  heights; `beat_align`: coverage, shift and any short-clip refit; audit
+  features F1 / F6 / F16), beats, bars and edges.
 - pitch.analyse receives only the kicks scoring >= transients.KICK_MASK_SCORE
   for its bass-root mask; resonance.analyse receives the key and the per-bar
   chords for its chord-invariance check; the side-strip suggestion receives the
@@ -51,6 +58,8 @@ fcs_from_key=None)`:
 """
 
 from __future__ import annotations
+
+import inspect
 
 import numpy as np
 
@@ -78,19 +87,34 @@ def _frame_power(mom: np.ndarray) -> np.ndarray:
     return np.where(np.isfinite(mom), 10.0 ** (mom / 10.0), 0.0)
 
 
+def _call_fcs_from_key(fn, tonic, key_confidence):
+    """fn(tonic, key_confidence=...) when fn takes a `key_confidence` parameter (or a
+    second positional one), else fn(tonic): planner.key_crossovers may gate the lock
+    on the confidence (audit features F2) without every caller having to."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return fn(tonic)
+    if "key_confidence" in params:
+        return fn(tonic, key_confidence=key_confidence)
+    return fn(tonic)
+
+
 def analyse(x: np.ndarray, fs: float, fcs=_bands.DEFAULT_CROSSOVERS, hop_s: float = HOP_S,
             bpm: float | None = None, fcs_from_key=None) -> dict:
     ctx = Context(x, fs, fcs, hop_s)
     g = ctx.grid
     lo = loudness.analyse(ctx.x, ctx.fs, ctx)
     tonic = None
+    key_conf = None
     if fcs_from_key is not None:
-        tonic = pitch.key(ctx, _frame_power(lo["momentary"]))["key"].get("tonic")
-        ctx.fcs = tuple(float(f) for f in fcs_from_key(tonic))
+        k0 = pitch.key(ctx, _frame_power(lo["momentary"]))["key"]
+        tonic, key_conf = k0.get("tonic"), k0.get("confidence")
+        ctx.fcs = tuple(float(f) for f in _call_fcs_from_key(fcs_from_key, tonic, key_conf))
     out = {"meta": {"fs": ctx.fs, "n": ctx.x.shape[0], "duration_s": ctx.x.shape[0] / ctx.fs,
                     "hop_s": g.hop_s, "frames": g.k, "crossovers": ctx.fcs, "views": VIEWS,
                     "crossover_rule": "fixed" if fcs_from_key is None else "key",
-                    "crossover_tonic": tonic},
+                    "crossover_tonic": tonic, "key_confidence": key_conf},
            "t": g.times}
     out["loudness"] = lo
     out["tilt"] = tilt.analyse(ctx.x, ctx.fs, ctx)
@@ -100,7 +124,7 @@ def analyse(x: np.ndarray, fs: float, fcs=_bands.DEFAULT_CROSSOVERS, hop_s: floa
     out["transients"] = tr
     st = structure.analyse(ctx.x, ctx.fs, ctx, onset=(tr["onset_env_t"], tr["onset_env"]),
                            short_term=out["loudness"]["short_term"], onset_rate=tr["onset_rate"],
-                           kick_onsets=tr["kick_onsets"], bpm=bpm)
+                           kick_onsets=tr["kick_onsets"], bpm=bpm, onset_times=tr["onset_times"])
     out["structure"] = st
     mom = out["loudness"]["momentary"]
     out["pitch"] = pitch.analyse(ctx.x, ctx.fs, ctx, beat_times=st["beat_times"],
@@ -139,12 +163,14 @@ def analyse(x: np.ndarray, fs: float, fcs=_bands.DEFAULT_CROSSOVERS, hop_s: floa
                     for r in out["resonance"]["resonances"] if r["flag"] in ("resonance", "musical")],
         "kick_onsets": tr["kick_onsets"], "kick_score": tr["kick_score"],
         "band_flatness": tl["flatness"], "band_flatness_measurable": tl["flatness_measurable"],
-        "key": out["pitch"]["key"],
+        "key": out["pitch"]["key"], "key_confidence": out["pitch"]["key"].get("confidence"),
         "bass_root_midi": br.get("root_midi"), "bass_confidence": br.get("confidence"),
         "keyeq_eligible": out["pitch"].get("keyeq_eligible", False),
         "tempo_bpm": st["tempo_bpm"], "tempo_octave": st["tempo_octave"],
         "metrical": {k: v for k, v in st["metrical"].items()}, "kick_consistency": st["kick_consistency"],
-        "grid_informative": st["grid_informative"], "bass_nsdf_agreement": out["pitch"].get("bass_nsdf_agreement"),
+        "grid_informative": st["grid_informative"], "grid_reason": st["grid_reason"],
+        "grid_evidence": st["grid_evidence"], "beat_align": st["beat_align"],
+        "bass_nsdf_agreement": out["pitch"].get("bass_nsdf_agreement"),
         "beat_times": st["beat_times"], "bar_times": st["bar_times"],
         "edges": out["edges"],
     }
