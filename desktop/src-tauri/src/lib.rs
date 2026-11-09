@@ -386,12 +386,14 @@ fn engine_command(app: &AppHandle) -> Result<Command, String> {
             return Ok(Command::new(p));
         }
     }
+    // development runs only (audit desktop #22): a release build runs its bundled engine
+    // or none, whatever ELUATE_PYTHON says
     let python = std::env::var_os("ELUATE_PYTHON").map(PathBuf::from).or_else(|| {
         // a development run from the repository uses its virtual environment
         let venv = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join(".venv");
         let p = if cfg!(windows) { venv.join("Scripts").join("python.exe") } else { venv.join("bin").join("python") };
-        (cfg!(debug_assertions) && p.is_file()).then_some(p)
-    });
+        p.is_file().then_some(p)
+    }).filter(|_| cfg!(debug_assertions));
     match python {
         Some(py) => {
             let mut c = Command::new(py);
@@ -647,6 +649,10 @@ fn start_job(
     cmd.args(engine_args(&kind, &paths, &args, engine_threads(limit_cpu, cores, parallel), set.as_ref())?);
     if let Ok(cache) = app.path().app_cache_dir() {
         cmd.env("NUMBA_CACHE_DIR", cache.join("numba"));
+        // a known working directory, not the shell's (audit desktop #23)
+        if std::fs::create_dir_all(&cache).is_ok() {
+            cmd.current_dir(&cache);
+        }
     }
     for v in BLAS_THREAD_VARS {
         cmd.env(v, "1");
