@@ -179,13 +179,33 @@ Transparent, Slow, Moderate, Fast, Aggressive. Auto picks by tempo: under
 70 BPM Slow, 70 to 140 Moderate, above 140 Fast. Draft values for the maintainer
 to correct (bands low to high; ms):
 
-| Preset | Multiband attack | Multiband release | MB knee | Glue attack / release | Clipper knee | Limiter attack / release | Band lookahead |
+| Preset | Multiband attack | Multiband release | MB knee | Glue attack (asked / applied) / release | Clipper knee | Limiter attack / release (applied) | Band lookahead |
 |---|---|---|---|---|---|---|---|
-| Transparent | 30 / 25 / 15 / 10 / 5 | 300 / 250 / 200 / 150 / 120 | 10 dB | 30 / 600 | soft, 1.5 dB | 5 / 200 | 20 / 10 / 5 / 2 / 2 |
-| Slow | 30 / 25 / 15 / 10 / 5 | 300 / 250 / 200 / 150 / 120 | 6 dB | 30 / 400 | soft, 1 dB | 3 / 150 | 20 / 8 / 4 / 2 / 2 |
-| Moderate | 20 / 15 / 10 / 5 / 3 | 200 / 150 / 100 / 80 / 60 | 6 dB | 30 / 300 | soft, 1 dB | 2 / 100 | 15 / 6 / 3 / 2 / 2 |
-| Fast | 10 / 8 / 5 / 3 / 1 | 120 / 100 / 60 / 40 / 30 | 3 dB | 10 / 150 | soft, 0.5 dB | 1 / 50 | 10 / 5 / 2 / 2 / 2 |
-| Aggressive | 5 / 4 / 3 / 1 / 0.5 | 80 / 60 / 40 / 30 / 20 | 1 dB (maintainer, 2026-10-18: "1 dB is aggressive enough") | 3 / 80 | soft, 0.5 dB (maintainer, 2026-10-23; was hard) | 0.5 / 30 | 6 / 4 / 2 / 2 / 2 |
+| Transparent | 30 / 25 / 15 / 10 / 5 | 300 / 250 / 200 / 150 / 120 | 10 dB | 0.8 / 3 / 600 | soft, 1.5 dB | 5 / 200 | 20 / 10 / 5 / 2 / 2 |
+| Slow | 30 / 25 / 15 / 10 / 5 | 300 / 250 / 200 / 150 / 120 | 6 dB | 0.8 / 3 / 400 | soft, 1 dB | 3 / 150 | 20 / 8 / 4 / 2 / 2 |
+| Moderate | 20 / 15 / 10 / 5 / 3 | 200 / 150 / 100 / 80 / 60 | 6 dB | 0.4 / 3 / 300 | soft, 1 dB | 2 / 100 | 15 / 6 / 3 / 2 / 2 |
+| Fast | 10 / 8 / 5 / 3 / 1 | 120 / 100 / 60 / 40 / 30 | 3 dB | 0.2 / 3 / 150 | soft, 0.5 dB | 1 / 80 (preset 50) | 10 / 5 / 2 / 2 / 2 |
+| Aggressive | 5 / 4 / 3 / 1 / 0.5 | 80 / 60 / 40 / 30 / 20 | 1 dB (maintainer, 2026-10-18: "1 dB is aggressive enough") | 0.1 / 3 / 80 | soft, 0.5 dB (maintainer, 2026-10-23; was hard) | 0.5 / 80 (preset 30) | 6 / 4 / 2 / 2 / 2 |
+
+Every preset, since 2026-11-10 (§21): limiter hold 25 ms; band ceilings' release
+100 / 80 / 50 / 50 / 50 ms (the frequency-dependent limiter keeps 100 / 80 / 80 / 80 / 80);
+band detector window 25 / 10 / 3 / 2 / 2 ms (one period of the band's lower edge, from the
+plan's crossovers). The live profile's glue attack (20 ms) is above the floor.
+
+Notes on the applied values (the table had gone stale; audio-rate audit F8):
+- Glue attack: the presets ask for 0.8 to 0.1 ms (the FET glue, §18); the envelope is built
+  with the attack floored at 3 ms (`glue.ATTACK_FLOOR_MS`, three control samples, 2026-11-10).
+  Below it the one-pole is a one-sample step that PCHIP turns into a 1 ms full-band fall of up
+  to 4 dB on the sub as well as the transient. `GluePlan.attack_ms` keeps the preset's value,
+  `attack_applied_ms` records 3.
+- Limiter release: clamped to at least 80 ms (`LIMITER_RELEASE_MIN_MS`, D7); fast and
+  aggressive's 50 / 30 ms rippled on sustained sub. Hold 25 ms (`LIMITER_HOLD_MS`, one 40 Hz
+  period) on top of it: the gain stays at each peak's value that long before releasing.
+- Band ceilings: their release was the `MultibandPlan` default 50 ms on every band, never
+  planned; now 100 / 80 / 50 / 50 / 50 ms (`CEILING_RELEASE_MS`).
+- Band detectors: the compressor's and the ceilings' detector (and speclim's) read the peak over
+  the trailing window above instead of two 1 ms segments, so a 40 Hz cycle no longer ripples
+  the reading by 12 dB.
 
 Low-band release never below 25 ms (one 40 Hz cycle) in any preset: faster
 than that, the gain moves inside the bass waveform and distorts.
@@ -862,3 +882,81 @@ clipper's work). A 1 to 2 dB soft clip on a sine is -27 to -21 dB THD where the 
   ceiling by construction; the solver's ceiling render becomes rare. Found by the CLI test
   after the split: with the sub reaching the limiter, the Annex 2 reading sat 0.0003 dB over.
   The two gs8 renders predate this change (their ceiling render handled it).
+
+## 21. Built 2026-11-10: audio-rate hygiene and the minimum-phase lowest crossover
+
+From the 2026-11-10 audits (audio-rate gain, filter maths, planner S4-6). Every change that
+alters the sound is a plan field the planner writes for new plans; a plan without the
+fields renders bit for bit as before (`test_old_style_plan_renders_bit_identically_to_before`,
+against fb082d1), except ms_link plans (item 6, < -70 dB).
+
+1. **Hold in `envelope.box_smooth`** (`hold` control samples): the running minimum reaches
+   `[-(L-1)-hold, L-1]`, then the same two averages. The kernel support stays inside every
+   minimum window, so g <= clip(g_req) still holds by construction; reduction never starts
+   earlier; an isolated dip recovers exactly `hold` samples later; hold 0 is the original.
+2. **Final limiter hold** `LimiterPlan.hold_ms` = `LIMITER_HOLD_MS` 25 ms (one 40 Hz period;
+   12.5 ms left 0.1 dB of ripple at 30 Hz), at 8x and in the base-rate re-limit.
+3. **Limiter aim margin** `LimiterPlan.aim_margin_db` = 0.03 dB. The audit's premise (the 8x
+   output read 0.011 dB over) was a misreading: -0.011 dBTP is 0.29 dB over the -0.3 ceiling.
+   With the margin, hits at the ceiling no longer trigger the re-limit; what still does is
+   meter disagreement on HF-rich peaks (the 8x Kaiser true-peak meter reads up to 0.4 dB over
+   the exact 32x FFT envelope at a few dozen samples of hats at the ceiling), and the
+   re-limit's release hull then stays below unity for ~33 release times. `info["relimit"]`
+   records passes, max dB, the share of samples below unity and the share reduced by more
+   than 0.01 dB. Getting under 1 % needs a 0.4 dB margin (RMS -0.18 dB); not done (sweep below).
+4. **Band detectors and ceilings**: the compressor's, the band ceilings' and speclim's
+   detector reads the peak over the trailing window of one period of the band's lower edge,
+   floored at 2 ms (`multiband.default_detector_window_ms`: 25 / 10 / 3 / 2 / 2 ms on the
+   default crossovers, from the plan's own crossovers when key-locked). This is the audit's F2
+   variant (not the box_smooth hold, F1): the reading is never below the 2-segment one, so the
+   bound holds a fortiori, and its chain cost was the smaller (0 to 0.08 dB against 0 to 0.14).
+   Band ceilings release per band, `CEILING_RELEASE_MS` 100 / 80 / 50 / 50 / 50 ms.
+   `MultibandPlan.detector_window_ms` None (old plans) keeps the 2-segment detector.
+5. **Glue attack floor** `glue.ATTACK_FLOOR_MS` 3 ms (three control samples); `attack_ms`
+   keeps the preset's request, `GluePlan.attack_applied_ms` the applied value.
+6. **ms_link** takes the M / S minimum on the 1 ms grid, then one PCHIP (no C0 kinks).
+7. **Lowest crossover minimum phase** (`--xover-phase {minimum,zero}`, default minimum;
+   `planner.xover_phases`): Linkwitz-Riley at the lowest crossover of the multiband and of
+   speclim, zero phase above; saturate's split stays zero phase; saved plans keep their phase.
+   The neutral band sum is the LR4 allpass: |H| flat to 4e-12 dB, group delay 5.3 / 4.5 /
+   1.3 / 0.05 ms at 50 / 100 / 200 / 1000 Hz, none above. `bands.split_iter` streams it.
+8. **Notch**: overlap and merge on the realised (bilinear-warped) half-cut edges
+   (`notch.notch_edges`); pad from the slowest real or complex pole (no math domain error).
+9. **Subnormal flush** (`iir.py`): blocked zero-phase / causal IIR with state < 1e-150
+   flushed and silent blocks skipped, in bands, inputeq and notch.
+10. **Saturate**: documented only (two-tone leakage below the band, pinned at 2 dB drive).
+
+Measured, before (fb082d1 / the audit) -> after (this branch):
+
+| what | before | after |
+|---|---|---|
+| glue, S2 sub + kicks, aggressive: largest 1 ms gain fall | 4.05 dB | 1.39 dB |
+| glue, S2: onset 1-5 kHz energy (input -34.7) | -13.6 dB | -30.0 dB (net 1.50 dB both) |
+| glue, steady sub aggressive 30 / 40 / 60 Hz: THD | -35.3 / -38.3 / -44.9 dB | -38.8 / -42.6 / -48.5 dB |
+| limiter 3 dB GR, aggressive, 30 / 40 Hz: ripple, H3 | 0.49 / 0.37 dB, -36.5 / -38.8 dB | 0.000 dB, < -190 dB |
+| sub-band compressor aggressive 30 Hz: ripple / THD | 0.22 dB / -44.7 dB | 0.000 dB / -205 dB |
+| band ceiling 6 dB, aggressive 30 Hz: ripple / THD | 0.48 dB / -39.3 dB | 0.000 dB / -207 dB |
+| 100 Hz crossover, kick after silence, sub -6 dB: pre-ring | -14.9 dB re kick peak, 6.3 ms over -40 dB | none (0 before the onset) |
+| ms_link, 2nd-difference spikes > 0.5 dB/ms^2 (test signal) | 15 | 0 (output -100 dB re signal) |
+| notch 12000 / 19695 Hz Q 2 at 44.1 kHz | accepted as disjoint | merged |
+| re-limit on the 30 s loop (share of samples below unity / > 0.01 dB) | 100 % / - (0.44 dB) | 93 % / 24 % (0.39 dB) |
+| 20 s stereo, 5 s silence either end: bands.split / inputeq / notch | 1.06 / 0.24 / 0.38 s | 0.33 / 0.14 / 0.45 s (notch tails do not reach 1e-150 in 5 s) |
+
+Re-limit vs aim margin on the loop's limiter input (hold on; share below unity / > 0.01 dB /
+RMS): 0 dB 98 % / 36 % / -5.775; 0.03 dB 92 % / 23 % / -5.780; 0.1 dB 68 % / 8 % / -5.806;
+0.2 dB 23 % / 3.6 % / -5.857; 0.4 dB 5.9 % / 0.3 % / -5.959.
+
+Full `eluate master` of the synthetic 30 s electronic loop (48 kHz, planner audit
+`common.loop`, defaults, 4 threads):
+
+| | meter RMS | integrated LUFS | crest | LRA | limiter average / outlier GR | glue net | re-limit | renders |
+|---|---|---|---|---|---|---|---|---|
+| fb082d1 | -6.00 | -11.48 | 9.08 | 3.86 | 3.0 / 4.82 | 1.50 | 1 pass, 0.44 dB | 1 |
+| this branch | -5.75 | -11.14 | 8.85 | 3.63 | 3.0 / 3.55 | 1.50 | 1 pass, 0.39 dB | 1 |
+
+Both renders are held by the limiter's average budget (target -4.1 not reached); the branch
+gets 0.4 dB more limiter gain inside the same budget. Cost of each fix at equal gain on the
+branch's realised plan (meter RMS, turning one off): limiter hold 0.15 dB, aim margin
+0.005 dB, minimum-phase lowest crossover 0.05 dB (zero phase reads louder, same envelopes);
+the detector windows 0 to 0.08 dB and the glue floor 0 (budget met) per the audit's chain
+runs. Listening decides the hold's 0.15 dB.
