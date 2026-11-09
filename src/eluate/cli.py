@@ -42,8 +42,9 @@ Contract:
   carry too; a run without a limiter GR estimate removes the previous limiter_gr.npz.
 - `eluate master --stems a.wav b.wav ... [--mix mix.wav] -o out/ [controls]` (stems,
   phase A, sprint 2026-10-21 WP6): reads the stems (stems.read_stems: one rate and
-  length, a silent render tail cut), and with --mix runs the null test (stems.null_test),
-  stopping with the figure unless it passes; writes their sum to out/stems-sum.wav
+  length, a silent render tail cut; distinct file names), and with --mix runs the null
+  test (stems.null_test), stopping with the figure on "mismatch" or "silent" and warning
+  on "processed" (the sum is mastered as given); writes their sum to out/stems-sum.wav
   (sum_stems, which the app's stems-sum runs alone) and masters it as above under the
   stems profile
   (planner.PROFILES["stems"], tighter ranges) and attributes its limits (stems.attribute:
@@ -510,9 +511,13 @@ def _add_controls(p):
 
 def sum_stems(paths, out: Path, mix: Path | None = None, log=print):
     """Reads the stems (stems.read_stems), runs the null test against the mix when there
-    is one (a verdict other than pass stops with its message), and writes their sum to
-    out/STEMS_SUM (32-bit float). Returns (stems, fs, null test or None, the sum's path).
-    The same sum bytes every time, so an analysis cached for it stays valid."""
+    is one, and writes their sum to out/STEMS_SUM (32-bit float). Returns (stems, fs,
+    null test or None, the sum's path). The null test's "mismatch" and "silent" verdicts
+    stop with the message (these stems do not make this mix); "processed" is a warning
+    (stems audit 2026-11-10: a limited or sub-sample-shifted reference is the common
+    delivery, and the stems are what gets mastered): logged, carried in the null test
+    the stems report prints, and the run continues. The same sum bytes every time, so an
+    analysis cached for it stays valid."""
     st, fs = stems.read_stems(paths, log=log)
     total = st.sum(axis=0)
     nt = None
@@ -522,8 +527,11 @@ def sum_stems(paths, out: Path, mix: Path | None = None, log=print):
             raise ValueError(f"the mix is {mfs} Hz, the stems {fs} Hz")
         nt = stems.null_test(m, total, fs)
         log(stems.null_message(nt))
-        if nt["verdict"] != "pass":
+        if nt["verdict"] in ("mismatch", "silent"):
             raise ValueError(stems.null_message(nt))
+        if nt["verdict"] == "processed":
+            log("warning: the mix was processed after these stems were printed; the sum "
+                "is mastered as given")
     out.mkdir(parents=True, exist_ok=True)
     sum_path = out / STEMS_SUM
     io.write(sum_path, total, fs, "FLOAT")
@@ -573,6 +581,20 @@ def _score_pass(index: int, work: Path, att: dict, fixes: list, lines: list) -> 
     sc = stems.pass_score(rep, att["attribution"])
     return {"index": index, "dir": "." if index == 0 else work.name, **sc,
             "fixes": list(fixes), "fix_lines": list(lines)}
+
+
+def _pass_line(p: dict) -> str:
+    """The log line for a scored pass: its score, what dominates it and why the master
+    is short, so the loop's reason for acting is on record (stems audit 2026-11-10)."""
+    s = f"stems pass {p['index']}: score {p['score']:.2f}, {len(p['limits'])} limit(s)"
+    if p.get("rms_shortfall_db"):
+        s += f"; RMS {p['rms_shortfall_db']:.2f} dB short"
+        if p.get("shortfall_cause"):
+            s += f" ({p['shortfall_cause']})"
+    dom = p.get("dominant")
+    if dom:
+        s += "; the " + ("shortfall" if dom == "rms_shortfall" else "limits") + " dominate the score"
+    return s
 
 
 def _name_passes(out: Path, names, passes: list, best: int) -> None:
@@ -647,8 +669,21 @@ def do_master_stems(paths, out: Path, controls: planner.Controls, mix: Path | No
     """
     step = progress or (lambda *a, **k: None)
     t0 = time.perf_counter()
+    if controls.profile not in (None, "stems"):
+        log(f"profile {controls.profile} set aside: a stem set is mastered under the stems profile")
     controls = dataclasses.replace(controls, profile="stems")
     names = [Path(p).stem for p in paths]
+    # fixes are matched to stems by name: two files with one basename would get one set
+    dups = sorted({n for n in names if names.count(n) > 1})
+    if dups:
+        raise ValueError("stems must have distinct file names: " + ", ".join(
+            f"{d} ({', '.join(str(p) for p in paths if Path(p).stem == d)})" for d in dups))
+    # the memory guard, stem-aware, before any audio is read: the set is held through
+    # every pass on top of the sum's master (memory.stems_extra_mb)
+    frames = max(sf.info(str(p)).frames for p in paths)
+    threads, _ = memory.guard(frames, controls.threads, log,
+                              extra_mb=memory.stems_extra_mb(frames, len(paths)))
+    controls = dataclasses.replace(controls, threads=threads)
     total = 1 + STEM_PASSES_MAX
     st, fs, nt, sum_path = sum_stems(paths, out, mix, log)
     step("pass", index=0, passes_max=total)
@@ -657,7 +692,7 @@ def do_master_stems(paths, out: Path, controls: planner.Controls, mix: Path | No
     (out / "run.json").unlink(missing_ok=True)     # done only once the loop is (written last)
     atts = [stems.attribute(out, st, names, fs)]
     passes = [_score_pass(0, out, atts[0], [], [])]
-    log(f"stems pass 0: score {passes[0]['score']:.2f}, {len(passes[0]['limits'])} limit(s)")
+    log(_pass_line(passes[0]))
     best, fixes, why = 0, [], None
     pass_bpm = bpm if bpm is not None else _detected_bpm(out)
     for k in range(1, STEM_PASSES_MAX + 1):
@@ -695,7 +730,7 @@ def do_master_stems(paths, out: Path, controls: planner.Controls, mix: Path | No
             why = "pass_failed"
             break
         p, prev = passes[-1], passes[-2]
-        log(f"stems pass {k}: score {p['score']:.2f}, {len(p['limits'])} limit(s)")
+        log(_pass_line(p))
         if p["score"] <= passes[best]["score"] - STEM_IMPROVE:
             best = k
         if p["score"] > prev["score"] - STEM_IMPROVE:
