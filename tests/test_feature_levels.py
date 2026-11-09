@@ -214,6 +214,36 @@ def test_kick_evidence_is_rate_independent():
     assert borrowed.refine_env(44100) == 64 and borrowed.refine_env(96000) == 139
 
 
+def test_hard_panned_band_with_bleed_is_not_measurable():
+    """Audit features F10: correlation is scale-invariant, so R = L at -60 dB read 1.0
+    ("mono", decoherence 0, full high-side makeup) where R = 0 read "not measurable";
+    now both are not measurable with the documented neutral decoherence (1.0)."""
+    n = 6 * FS
+    a = syn.pink_noise(n, FS, seed=1, channels=1)[:, 0]
+    b = syn.pink_noise(n, FS, seed=2, channels=1)[:, 0]
+    for r in (0.0 * a, 0.001 * a, 0.003 * a + 0.001 * b):
+        st = stereo.analyse(np.stack([a, r], 1), FS)
+        assert not st["decoherence_measurable"].any()
+        assert np.all(st["decoherence"] == stereo.DECOHERENCE_DEFAULT)
+    st = stereo.analyse(np.stack([a, 0.0316 * a], 1), FS)       # -30 dB: still a (narrow) image
+    assert st["decoherence_measurable"].all() and np.allclose(st["decoherence"], 0.0, atol=1e-6)
+    assert np.allclose(st["balance_db"], -30.0, atol=0.1)
+
+
+def test_crest_edge_only_band_matches_band_crest():
+    """Audit features F14: a band whose only gated frames are at the edges read NaN here and
+    a crest in stages.multiband.band_crest (what the solver measures); features/crest.py
+    now uses band_crest's fallback, so both name the same bands measured, same values."""
+    from eluate.stages import multiband as mb
+    y = np.zeros((3 * FS, 2))
+    y[: int(0.6 * FS)] = syn.groove_track(FS, 0.6, seed=4)[0]
+    y[:, 1] *= 0.8
+    a = crest.analyse(y, FS, Context(y, FS))["p95_db"]
+    b = mb.band_crest(y, FS)["p95_db"]
+    assert np.array_equal(np.isnan(a), np.isnan(b)) and np.isfinite(a).sum() >= 10
+    assert np.nanmax(np.abs(a - b)) < 0.01
+
+
 def test_onsets_rate_and_mask():
     x = syn.impulse_train(FS * 6, FS, 0.25, 0.5, offset_s=0.1) + syn.pink_noise(FS * 6, FS, rms_dbfs=-60)
     r = transients.analyse(x, FS)
