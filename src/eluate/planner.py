@@ -315,11 +315,13 @@ SUB_CENTRE_HZ = 50.0            # representative sub frequency (30 to 90 Hz shel
 
 EQ_FIT_RANGE_HZ = (30.0, 18000.0)   # 1/3-octave LTAS nodes the input EQ is fitted on
 EQ_GATE_DB = 60.0                   # nodes this far below the loudest are left out
-# the fit's inputs (LTAS nodes, residuals, sub shelf, noise floor; the slope) are rounded
+# the fit's inputs (LTAS nodes, residuals, sub shelf, noise floor; the slope; the top
+# band's decoherence) are rounded
 # to these before the fit (inputeq_design), so independent float32 roundings of one
 # premaster (about 1e-6 dB apart) give the identical EQ (S4-5)
 EQ_INPUT_QUANT_DB = 0.01
 EQ_INPUT_QUANT_SLOPE = 0.001        # dB/oct
+EQ_INPUT_QUANT_DECOHERENCE = 0.001  # the top band's decoherence (the M/S top-end switch)
 EQ_HPF_Q_BUTTERWORTH = 0.707
 EQ_HPF_Q_SPAN_DB = 6.0              # sub excess (deficit) beyond SUB_SHELF_MAX_DB at which
                                     # Q hits 0.5 (1.0)
@@ -741,12 +743,13 @@ def _check_floors(floors, crossovers_hz) -> None:
 
 # ---------------------------------------------------------------- input and crossovers
 
-def input_gain(x: np.ndarray, fs: float) -> tuple[float, float]:
+def input_gain(x: np.ndarray, fs: float) -> tuple[float, float | None]:
     """(gain dB, measured loudest-section 1 s RMS dBFS): the gain that brings the
-    premaster's loudest-section 1 s RMS to R_REF_DBFS; 0 dB when it is not finite
-    (input shorter than 1 s, or silent)."""
+    premaster's loudest-section 1 s RMS to R_REF_DBFS; 0 dB and a measured value of None
+    (not NaN, so InputPlan validates; audit 2026-11-10 S3-1) when there is no gated 1 s
+    window (input shorter than 1 s, or silent)."""
     m = float(meter.rms_1s(x, fs)["loud_section_dbfs"])
-    return (R_REF_DBFS - m if math.isfinite(m) else 0.0), m
+    return (R_REF_DBFS - m, m) if math.isfinite(m) else (0.0, None)
 
 
 def tonic_partial_hz(tonic) -> float | None:
@@ -862,7 +865,7 @@ def analyse(x: np.ndarray, fs: float, crossovers=None, bpm: float | None = None)
     else:
         a = features.analyse(xn, fs, fcs=tuple(float(f) for f in crossovers), **kw)
     a["meta"]["input"] = {"gain_db": float(g), "r_ref_dbfs": R_REF_DBFS,
-                          "measured_dbfs": float(m) if math.isfinite(m) else None}
+                          "measured_dbfs": m}
     from eluate import noise
     fl = noise.floor(xn, fs)["db"]
     a["plan_inputs"]["noise_floor_db"] = float(fl) if math.isfinite(fl) else None
@@ -1283,7 +1286,8 @@ def inputeq_design(analysis: dict, controls: Controls) -> dict:
                                  else float(_quant(fl, EQ_INPUT_QUANT_DB))),
                     "gain_db": quiet_gain_db(controls)}
     dec = pi.get("band_decoherence")
-    out["top_decoherence"] = float(dec[-1]) if dec is not None and len(dec) else None
+    out["top_decoherence"] = (float(_quant(dec[-1], EQ_INPUT_QUANT_DECOHERENCE))
+                              if dec is not None and len(dec) else None)
     if controls.prof["eq_bounds"] is not None:
         out["bounds"] = dict(controls.prof["eq_bounds"])
     if controls.prof["eq_hpf"] is not None:

@@ -574,9 +574,13 @@ def test_inputeq_air_boost_stays_under_the_noise_headroom():
     assert gain == pytest.approx(-4.1 + 18.0 - 3.0103 + 2.5 + 1.5 + 1.0 + 3.0)
     a["plan_inputs"]["noise_floor_db"] = noise.FLAG_DB - gain - 1.0       # 1 dB of headroom
     eq, rec = planner.plan_inputeq(a, planner.Controls(), FS)
-    assert rec["top_caps"]["noise_headroom_db"] == pytest.approx(1.0, abs=1e-6)
+    # the fit reads the floor rounded to EQ_INPUT_QUANT_DB (audit 2026-11-10 S4-5)
+    room = noise.FLAG_DB - gain - planner._quant(noise.FLAG_DB - gain - 1.0,
+                                                 planner.EQ_INPUT_QUANT_DB)
+    assert room == pytest.approx(1.0, abs=planner.EQ_INPUT_QUANT_DB / 2)
+    assert rec["top_caps"]["noise_headroom_db"] == pytest.approx(room, abs=1e-6)
     boost = sum(max(0.0, s.gain_db) for s in (eq.high_shelf, eq.air_shelf) if s is not None)
-    assert boost <= 1.0 + 1e-9
+    assert boost <= room + 1e-9
     assert rec["top_caps"]["air"]["reason"] == "noise headroom"
     # the side's pair is held to the same headroom (audit 13 #1)
     c = np.asarray(a["plan_inputs"]["ltas_centres_hz"])
@@ -585,7 +589,7 @@ def test_inputeq_air_boost_stays_under_the_noise_headroom():
     es, _ = planner.plan_inputeq(a, planner.Controls(), FS)
     assert es.ms_top
     assert sum(max(0.0, s.gain_db) for s in (es.high_shelf_side, es.air_shelf_side)
-               if s is not None) <= 1.0 + 1e-9
+               if s is not None) <= room + 1e-9
     del a["plan_inputs"]["ltas_side_db"]
     # a quiet-passage level already past the flag (music in the breakdowns) sets no cap
     a["plan_inputs"]["noise_floor_db"] = noise.FLAG_DB - gain + 3.0

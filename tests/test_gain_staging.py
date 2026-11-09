@@ -205,7 +205,7 @@ def test_input_gain():
     assert g == pytest.approx(planner.R_REF_DBFS - m)
     assert planner.R_REF_DBFS == -18.0
     g0, m0 = planner.input_gain(np.zeros((FS * 3, 2)), FS)       # silence: no gain
-    assert g0 == 0.0 and math.isnan(m0)
+    assert g0 == 0.0 and m0 is None                              # None, not NaN (S3-1)
 
 
 def test_analysis_runs_on_the_normalised_premaster(pana):
@@ -303,7 +303,9 @@ def test_written_files_at_two_levels_get_the_same_plan(tmp_path):
     the reference are independent roundings (their LTAS differ by about 5e-8 dB); the
     input EQ fit's inputs are quantised to 0.01 dB, so the EQ is identical, and the rest of
     the plan differs by the files' rounding noise alone (measured 7e-7 dB on the unrealised
-    thresholds; the earlier 10 Hz corner flip and -82 dBFS master difference are gone)."""
+    thresholds; the earlier 10 Hz corner flip and 658-step master difference are gone: the
+    audit's 30 s loop now masters to within one 24-bit step on 5 % of the samples,
+    docs/gain-staging.md 11)."""
     from fixtures.e_signals import short_track
     x, _ = short_track(FS, 2)
     plans, analyses = {}, {}
@@ -321,6 +323,7 @@ def test_written_files_at_two_levels_get_the_same_plan(tmp_path):
                              - np.asarray(a0["plan_inputs"]["ltas_stereo_db"]))) < 1e-5
         assert planner.inputeq_sections(p.inputeq) == planner.inputeq_sections(p0.inputeq)
         assert p.inputeq.design["residual_db"] == p0.inputeq.design["residual_db"]
+        assert p.inputeq.design["top_decoherence"] == p0.inputeq.design["top_decoherence"]
         assert np.max(np.abs(np.asarray(p.multiband.threshold_db)
                              - np.asarray(p0.multiband.threshold_db))) < 1e-5
         assert p.limiter.input_gain_db == pytest.approx(p0.limiter.input_gain_db, abs=1e-5)

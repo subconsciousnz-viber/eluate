@@ -273,7 +273,8 @@ class _Loop:
         monkeypatch.setattr(cli.stems, "attribute", fake_attribute)
         monkeypatch.setattr(cli, "_stemfix", lambda: Fix)
         monkeypatch.setattr(cli, "do_report",
-                            lambda out, ref=None, log=print, process_log=True: loop.reports.append(out))
+                            lambda out, ref=None, log=print, process_log=True, check_run=True:
+                            loop.reports.append(out))
         monkeypatch.setattr(cli, "_process_log", lambda out, log: None)
 
     def run(self, bpm=None):

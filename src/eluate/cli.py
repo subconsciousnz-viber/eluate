@@ -838,6 +838,12 @@ def do_master_stems(paths, out: Path, controls: planner.Controls, mix: Path | No
     controls = dataclasses.replace(controls, profile="stems")
     names = [Path(p).stem for p in paths]
     total = 1 + STEM_PASSES_MAX
+    # no stem (or mix) may be a file this flow writes in out (hygiene F3): the sum, or
+    # anything a master there writes or removes; checked before the sum is written
+    for f in list(paths) + ([] if mix is None else [mix]):
+        if run_writes(f, out) or Path(f).resolve() == (Path(out) / STEMS_SUM).resolve():
+            raise ValueError(f"{f} is a file this run writes or removes in the output folder "
+                             f"{out}; copy it elsewhere or choose another output folder")
     st, fs, nt, sum_path = sum_stems(paths, out, mix, log)
     step("pass", index=0, passes_max=total)
     runs = [do_master(sum_path, out, controls, max_renders=max_renders, log=log, bpm=bpm,

@@ -170,10 +170,12 @@ def test_multiband_threshold_never_sinks_below_the_band_level_floor():
     bb = bands.split(bands.to_ms(xs), FS, [100.0, 400.0, 1600.0, 6400.0])
     for k in (2, 4):
         v = bb[k, :, 0]
-        lvl = meter.rms_1s(v, FS)["loud_section_dbfs"]
+        body = mb.body_level_db(v, FS)
+        # the body is the median, at most a little under the loudest section here
+        assert 0.0 <= meter.rms_1s(v, FS)["loud_section_dbfs"] - body < 1.0
         sol = mb.threshold_for_peak_gr(v, FS, 2.5, 2.0, 10.0, 100.0, 6.0, 1000.0, hits)
         assert sol["bound"] == "level floor"
-        assert sol["threshold_db"] == pytest.approx(lvl - mb.BRACKET_BELOW_LEVEL_DB, abs=1e-6)
+        assert sol["threshold_db"] == pytest.approx(body - mb.BRACKET_BELOW_LEVEL_DB, abs=1e-6)
         assert sol["floor_db"] == pytest.approx(sol["threshold_db"], abs=1e-9)
         assert 1.5 < sol["peak_gr_db"] < 2.5 - mb.UNREACHABLE_TOL_DB
         # the old step-down went 48 dB down into the leakage floor (-70 to -76 dBFS)
@@ -198,8 +200,8 @@ def test_design_budget_reports_an_unreachable_band_as_such():
     for k in unreachable:
         r = rows[k][0]
         assert r["bound"] == "level floor" and r["threshold_floor_db"] is not None
-        assert r["threshold_db"] == pytest.approx(r["level_db"] - mb.BRACKET_BELOW_LEVEL_DB,
-                                                  abs=1e-6)
+        assert r["threshold_db"] == pytest.approx(r["threshold_floor_db"], abs=1e-6)
+        assert r["threshold_floor_db"] < r["level_db"] - mb.BRACKET_BELOW_LEVEL_DB + 1.0
     kinds = {(w["band"], w["channel"]): w["kind"] for w in rep["warnings"]
              if w["stage"] == "multiband"}
     assert all(kinds.get((k, "M")) == "unreachable" for k in unreachable)
@@ -337,6 +339,11 @@ def test_input_is_checked_before_the_previous_run_is_touched(tmp_path, monkeypat
         cli.check_input(work / "pass-1" / cli.CORRECTED_SUM, work)
     sf.write(work / "premaster.wav", np.ones((2 * FS, 2)) * 0.1, FS)
     assert not cli.run_writes(work / "premaster.wav", work)
+    # the stems flow: no stem may be the sum it writes, or a file a master there writes
+    for stem in (work / cli.STEMS_SUM, work / "master.wav"):
+        with pytest.raises(ValueError, match="writes or removes"):
+            cli.do_master_stems([stem, inp], work, planner.Controls(), log=lambda m: None)
+    assert (work / "master.wav").exists() and (work / "run.json").exists()
     assert cli.check_input(inp, work) == (2 * FS, FS)
     with pytest.raises(ValueError, match="too short"):
         cli.check_input(_short(tmp_path), work)
@@ -697,6 +704,20 @@ def test_notch_stage_cuts_the_side_alone():
     assert np.max(np.abs(ob[mid, 1])) / np.max(np.abs(ms[mid, 1])) == pytest.approx(gain, abs=0.01)
     z = notch_stage.apply(x, FS, NotchPlan([Notch(1000.0, 8.0, Envelope.constant(0.0), "S")]))
     assert np.array_equal(z, x)
+    # the kick mask holds the side notch too: around an onset S passes uncut
+    km = notch_stage.kick_mask([1.0], n / FS)
+    yk = notch_stage.apply(x, FS, NotchPlan([Notch(1000.0, 8.0, Envelope.constant(-6.0), "S")],
+                                            km))
+    ok = bands.to_ms(yk)
+    hold = slice(FS - int(0.004 * FS), FS + int(0.004 * FS))
+    assert np.max(np.abs(ok[hold, 1] - ms[hold, 1])) < 0.02 * np.max(np.abs(ms[:, 1]))
+    assert np.max(np.abs(ok[hold, 0] - ms[hold, 0])) < 1e-9
+    assert np.max(np.abs(ok[mid.start:FS // 2 + FS // 4, 1])) == pytest.approx(
+        np.max(np.abs(out[mid.start:FS // 2 + FS // 4, 1])), abs=1e-6)
+    # the cap holds on S: a deeper request is clipped to -6 dB
+    y12 = notch_stage.apply(x, FS, NotchPlan([Notch(1000.0, 8.0, Envelope.constant(-12.0),
+                                                    "S")]))
+    assert np.max(np.abs(y12 - y)) < 1e-12
     # overlapping notches must merge within a channel, and never across channels
     pair = [Notch(1000.0, 6.0, Envelope.constant(-6.0), "S"),
             Notch(1024.0, 6.0, Envelope.constant(-6.0), "S")]
@@ -749,6 +770,24 @@ def test_composite_clamp_bound_holds_with_smooth_envelopes():
                                     [notch_stage.notch_sos(nt, FS) for nt in p.notches],
                                     [1000.0, 1450.0], FS)
     assert s.min() < 1.0 and s.max() == 1.0 and np.all(np.diff(s[nc // 4: 3 * nc // 4]) <= 1e-12)
+    # the rounded rows leave no staircase in s: under 0.1 dB per 1 ms control step (it
+    # was 0.66 dB on overlapping ramps before the erosion and average)
+    t = np.linspace(0.0, 1.0, nc)
+    r1 = -6.0 * np.clip(1.3 * np.sin(np.pi * t), 0.0, 1.0)
+    r2 = -6.0 * np.clip(1.2 * np.sin(0.8 * np.pi * t), 0.0, 1.0)
+    nts = [Notch(1000.0, 3.0, Envelope(r1)), Notch(1450.0, 3.0, Envelope(r2))]
+    d2 = np.stack([1.0 - 10.0 ** (r / 20.0) for r in (r1, r2)], axis=1)
+    s2 = notch_stage.composite_scale(d2, None, [notch_stage.notch_sos(nt, FS) for nt in nts],
+                                     [1000.0, 1450.0], FS)
+    assert s2.min() < 0.9 and np.max(np.abs(np.diff(20 * np.log10(s2)))) < 0.1
+    h2 = notch_stage.apply(x, FS, NotchPlan(nts))[:, 0]
+    for c in (nc // 3, nc // 2, 2 * nc // 3):              # the cap holds where both cut
+        xi = np.zeros((n, 1))
+        xi[c * FS // 1000] = 1.0
+        hi = notch_stage.apply(xi, FS, NotchPlan(nts))[:, 0]
+        Hi = np.fft.rfft(np.roll(hi, -(c * FS // 1000)))
+        assert 20 * np.log10(np.abs(Hi)).min() >= -6.0 - 1e-3
+    assert np.all(np.isfinite(h2))
 
 
 # ------------------------------------------------------------ S2-4, S4-6: budget_report

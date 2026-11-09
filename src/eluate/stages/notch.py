@@ -13,9 +13,12 @@ Contract: `apply(x, fs, plan) -> y`, pure, (n, ch) in, float64 (n, ch) out.
   notch's cut and of (1 - m_kick) at the two end points (PCHIP stays between
   them); its maximum over frequency is found on a 1/96-octave grid holding
   every f0, with the three largest local maxima refined by bounded scalar
-  search. s at a control point is the minimum over its two segments and is
-  PCHIP-interpolated, so the bound holds between control points too. s = 1
-  exactly wherever fewer than two notches are active.
+  search. s at a control point is the minimum over its two segments, then
+  eroded and averaged over S_SMOOTH_CTRL control points either side (a moving
+  minimum followed by a moving average of the same width never exceeds the
+  input), and is PCHIP-interpolated, so the bound holds between control points
+  too. s = 1 exactly wherever fewer than two notches are active within
+  2 S_SMOOTH_CTRL ms.
 - BP_i: RBJ constant-0-dB-peak biquad bandpass run forward and backward
   (sosfiltfilt) from rest with zero padding (the track embedded in silence, as
   bands.split): zero phase, unity gain at f0, magnitude B = |H|^2.
@@ -45,8 +48,9 @@ Contract: `apply(x, fs, plan) -> y`, pure, (n, ch) in, float64 (n, ch) out.
   The M/S conversion happens only when a side notch cuts somewhere, so the identity
   properties above hold bit for bit.
 - Composite clamp cost: the bound is evaluated per distinct row of cut depths after
-  rounding them up to BOUND_STEPS steps of the cap (conservative), so the planner's
-  envelopes need no quantisation of their own (the 0.5 dB steps raised the notch's
+  rounding them up to BOUND_STEPS steps of the cap (conservative; the steps this
+  leaves in s are smoothed as above), so the planner's envelopes need no quantisation
+  of their own (the 0.5 dB steps raised the notch's
   modulation sidebands from -64 to -47 dB; audio-rate audit 2026-11-10).
 """
 
@@ -57,6 +61,7 @@ import math
 import numpy as np
 from scipy import signal
 from scipy.interpolate import PchipInterpolator
+from scipy.ndimage import minimum_filter1d, uniform_filter1d
 from scipy.optimize import brentq, minimize_scalar
 
 from eluate import bands
@@ -67,6 +72,7 @@ D_MAX = 1.0 - 10.0 ** (-NOTCH_MAX_CUT_DB / 20.0)
 GRID_PER_OCTAVE = 96
 REFINE_PEAKS = 3
 BOUND_STEPS = 12       # composite_scale rounds the cut depths up to this many steps of the cap
+S_SMOOTH_CTRL = 10     # s is eroded then box-averaged over this many control points each side
 
 
 def _g_ref(nt: Notch) -> float:
@@ -254,6 +260,13 @@ def composite_scale(depths_ctrl: np.ndarray, keep_ctrl, soss, f0s, fs: float) ->
     seg[multi] = np.minimum(1.0, D_MAX / np.maximum(peaks[inv.reshape(-1)], 1e-300))
     s[:-1] = np.minimum(s[:-1], seg)
     s[1:] = np.minimum(s[1:], seg)
+    # the rounded rows make s a staircase where the clamp binds (0.66 dB in one 1 ms step
+    # on two overlapping ramps): a moving minimum then a moving average of the same width
+    # smooths it and stays at or under the bound at every point
+    w = 2 * S_SMOOTH_CTRL + 1
+    if S_SMOOTH_CTRL > 0 and np.any(s < 1.0):
+        s = np.minimum(uniform_filter1d(minimum_filter1d(s, w, mode="nearest"), w,
+                                        mode="nearest"), s)
     return s
 
 

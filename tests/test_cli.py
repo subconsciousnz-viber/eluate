@@ -279,7 +279,8 @@ def test_a_failed_master_is_not_done(tmp_path, monkeypatch):
     (work / "report.json").write_text(json.dumps(rep), encoding="utf-8")
     (work / "source.json").write_text(json.dumps({"path": str(inp)}), encoding="utf-8")
     for f in cli.CLEARED_AT_START:
-        (work / f).write_text("{}", encoding="utf-8")
+        if f != "report.json":                 # report.json is cleared too (S4-9)
+            (work / f).write_text("{}", encoding="utf-8")
     assert uidata.summary(inp)["state"] == "done"
     with pytest.raises(ValueError, match="no such file"):
         cli.do_master(tmp_path / "typo.wav", work, cli.planner.Controls(), log=lambda m: None)

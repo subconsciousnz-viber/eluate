@@ -88,7 +88,8 @@ def test_multiband_ceiling_hits_peak_gr(target):
 
 def test_silent_band_threshold():
     assert mb.threshold_for_peak_gr(np.zeros(FS), FS, 2.5, 2.0, 10, 100) == \
-        {"threshold_db": 0.0, "peak_gr_db": 0.0, "outlier_gr_db": 0.0}
+        {"threshold_db": 0.0, "peak_gr_db": 0.0, "outlier_gr_db": 0.0, "floor_db": None,
+         "bound": None}
     # the per-sample clamp (6 dB since D5, sprint 2026-10-21); the outlier cap is 4.5 on
     # the meter reading
     assert mb.MULTIBAND_MAX_GR_DB == 6.0 and mb.MULTIBAND_OUTLIER_CAP_DB == 4.5
