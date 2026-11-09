@@ -39,14 +39,15 @@ Contract:
   planner's "tempo" warning when a --bpm disagrees with the detected grid by more than
   planner.TEMPO_DISAGREE_PCT; the same line goes to the log).
   Before anything is touched the input is checked (`check_input`: it exists and reads,
-  it is at least MIN_INPUT_S long, and it is not inside the output folder, where the
-  run writes master.wav and the A/B files; hygiene F3 / F4), then the memory guard
+  it is at least MIN_INPUT_S long, and it is not a file the run writes or removes in
+  the output folder, `run_writes`; hygiene F3 / F4), then the memory guard
   runs, then the output folder is probed (`probe_output`: writable, no product locked
   or read-only; hygiene F5). Only then is the previous run cleared: run.json, the
   completion marker (report 3.1), and the process log first, then every other product
-  (`clear_run`: RUN_PRODUCTS, the ab/ and passes/ dirs and the pass dirs; S4-9), the
-  analysis cache staying. An input with no 1 s window above meter.RMS_GATE_DBFS
-  (silence, near silence) is refused once read (`check_audio`, before the analysis).
+  (`clear_run`: CLEARED_AT_START, which holds RUN_PRODUCTS, then the ab/ and passes/ dirs
+  and the pass dirs; S4-9), the analysis cache staying. An input with no 1 s window
+  above meter.RMS_GATE_DBFS (silence, near silence) is refused once read
+  (`check_audio`, before the analysis).
   run.json is written after the master
   and the report, and it carries the run id (uuid4 hex) that plan.json / plan.npz
   carry too; a run without a limiter GR estimate removes the previous limiter_gr.npz.
@@ -174,7 +175,8 @@ ANALYSIS_VERSION = 2
 def _source_record(path: Path, fs: int, n: int, analysis: dict, crossovers=None,
                    bpm=None) -> dict:
     """What the cached analysis was made from: path, size, mtime, the audio file's
-    SHA-256, fs, length, the crossovers used and requested, bpm, R_ref, the input
+    SHA-256, fs, length, the crossovers used and requested, bpm (and bpm_source "user"
+    when given), R_ref, the input
     gain (audit 07 A17, F15) and ANALYSIS_VERSION (audit 13)."""
     st = path.stat()
     meta = analysis["meta"]
@@ -185,6 +187,9 @@ def _source_record(path: Path, fs: int, n: int, analysis: dict, crossovers=None,
             "crossovers_hz": [float(f) for f in meta["crossovers"]],
             "crossovers_requested": _requested(crossovers),
             "crossover_rule": meta.get("crossover_rule"), "bpm": bpm,
+            # a --bpm given here is the user's tempo (features F21): `plan` reads it as such
+            # (planner.plan_tempo, from the analysis's metrical rule "user")
+            "bpm_source": None if bpm is None else "user",
             "r_ref_dbfs": inp.get("r_ref_dbfs"), "input_gain_db": inp.get("gain_db")}
 
 
@@ -208,8 +213,16 @@ def do_analyse(inp: Path, work: Path, xover=None, log=print, bpm: float | None =
 
 ANALYSIS_FILE = "features.npz"
 STEMS_SUM = "stems-sum.wav"         # a stem set's sum, in its work dir (uidata.work_dir keeps it there)
-# removed at the start of `master`: run.json is the completion marker, written last
-CLEARED_AT_START = ("run.json", "process-log.md", "process-log.html")
+# every per-run product except the analysis cache (features.npz, analysis.json,
+# source.json); S4-9: a failed run otherwise left the previous master next to this run's
+# plan, and `report` rebuilt from the mix
+RUN_PRODUCTS = ("plan.json", "plan.npz", "targets.json", "plan_record.json", "solve.json",
+                "master.wav", "limiter.json", "limiter_gr.npz", "report.json", "report.md",
+                "ltas.png", "loudness.png", "gr.png", "stems-report.md", "stems-report.json")
+RUN_PRODUCT_DIRS = ("ab", "passes")       # with the stems flow's pass-N dirs (clear_run)
+# removed at the start of `master`, in this order: run.json, the completion marker written
+# last, and the process log first, then every other product of the previous run
+CLEARED_AT_START = ("run.json", "process-log.md", "process-log.html") + RUN_PRODUCTS
 _TREE, _ND, _TUPLE = "__tree__", "__nd__", "__tuple__"
 
 
@@ -371,36 +384,40 @@ def source_hashes() -> dict:
 
 
 MIN_INPUT_S = meter.RMS_WINDOW_S     # the shortest input: one gated 1 s RMS window
-# the audio files a run writes, never an input (hygiene F3); the stem sums are the stems
-# flow's own inputs in the work dir and are allowed
+# the audio files a run writes, never an input (hygiene F3; `run_writes`)
 WRITTEN_AUDIO = ("master.wav", "ab/original_matched.wav", "ab/master_matched.wav",
                  "ab/difference.wav")
-OWN_INPUTS = (STEMS_SUM, "corrected-sum.wav")
-# every other product of a run, removed right after the completion marker (S4-9: a failed
-# run otherwise left the previous master next to this run's plan, and `report` rebuilt
-# from the mix); the analysis cache (features.npz, analysis.json, source.json) stays
-RUN_PRODUCTS = ("plan.json", "plan.npz", "targets.json", "plan_record.json", "solve.json",
-                "master.wav", "limiter.json", "limiter_gr.npz", "report.json", "report.md",
-                "ltas.png", "loudness.png", "gr.png", "stems-report.md", "stems-report.json")
-RUN_PRODUCT_DIRS = ("ab", "passes")
+ANALYSIS_CACHE = (ANALYSIS_FILE, "analysis.json", "source.json")
+
+
+def run_writes(inp: Path, out: Path) -> bool:
+    """inp resolves to a file a `master` into out writes or removes (hygiene F3): a run
+    product (CLEARED_AT_START, WRITTEN_AUDIO), the analysis cache, or anything under the
+    ab/ and passes/ dirs or a stems pass dir. Other files in out (the stems flow's own
+    sums among them) are not."""
+    r, o = Path(inp).resolve(), Path(out).resolve()
+    if o not in r.parents:
+        return False
+    rel = r.relative_to(o)
+    if len(rel.parts) > 1:
+        top = rel.parts[0]
+        return top in RUN_PRODUCT_DIRS or Path(top).match(STEM_PASS_DIR.format("*"))
+    return rel.name in CLEARED_AT_START + WRITTEN_AUDIO + ANALYSIS_CACHE
 
 
 def check_input(inp: Path, out: Path | None = None) -> tuple[int, int]:
     """(frames, fs) of a master's input, checked before anything is touched (hygiene F3,
     F4): the file exists and soundfile reads its header, it is at least MIN_INPUT_S long
     (one gated 1 s RMS window: the input normalisation and the loud section need it) and,
-    with `out`, it is not inside the output folder (where the run writes master.wav and
-    the A/B files; the stems flow's own sums, OWN_INPUTS, are the exception). Raises
-    ValueError with one plain line."""
+    with `out`, it is not a file the run writes or removes there (`run_writes`:
+    `eluate master out/master.wav -o out/` overwrote its own input). Raises ValueError
+    with one plain line."""
     inp = Path(inp)
     if not inp.is_file():
         raise ValueError(f"{inp}: no such file")
-    if out is not None:
-        r, o = inp.resolve(), Path(out).resolve()
-        inside = r == o or o in r.parents
-        if inside and not (r.parent == o and r.name in OWN_INPUTS):
-            raise ValueError(f"{inp.name} is inside the output folder {out}: the run writes "
-                             f"{', '.join(WRITTEN_AUDIO)} there; choose another output folder")
+    if out is not None and run_writes(inp, out):
+        raise ValueError(f"{inp} is a file this run writes or removes in the output folder "
+                         f"{out}; copy it elsewhere or choose another output folder")
     try:
         info = sf.info(str(inp))
     except (sf.SoundFileError, RuntimeError) as e:
@@ -436,7 +453,7 @@ def probe_output(out: Path) -> None:
         probe.unlink()
     except OSError as e:
         raise ValueError(f"cannot write to the output folder {out}: {e}") from e
-    for name in CLEARED_AT_START + RUN_PRODUCTS + WRITTEN_AUDIO:
+    for name in CLEARED_AT_START + WRITTEN_AUDIO:
         p = out / name
         if not p.is_file():
             continue
@@ -451,11 +468,11 @@ def probe_output(out: Path) -> None:
 
 
 def clear_run(out: Path) -> None:
-    """Remove the previous run's completion marker and process log first (report 3.1),
-    then every other product (RUN_PRODUCTS, RUN_PRODUCT_DIRS, pass dirs), keeping the
-    analysis cache."""
+    """Remove the previous run's products (CLEARED_AT_START: the completion marker and
+    process log first, report 3.1; then RUN_PRODUCTS), the RUN_PRODUCT_DIRS and the pass
+    dirs, keeping the analysis cache."""
     out = Path(out)
-    for name in CLEARED_AT_START + RUN_PRODUCTS:
+    for name in CLEARED_AT_START:
         (out / name).unlink(missing_ok=True)
     for name in RUN_PRODUCT_DIRS:
         shutil.rmtree(out / name, ignore_errors=True)

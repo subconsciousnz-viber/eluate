@@ -18,7 +18,8 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from fixtures.e_signals import short_planner_analysis, short_track
+from fixtures.e_signals import (features_with_key_confidence, short_planner_analysis,
+                                short_track)
 from eluate import bands, cli, envelope, meter, planner, solver
 from eluate.plan import Envelope, InputPlan, LimiterPlan, Notch, NotchPlan, Plan
 from eluate.stages import multiband as mb
@@ -292,7 +293,9 @@ def test_engine_refuses_a_silent_input_with_one_error_line(tmp_path, capsys):
 def _fake_done(work: Path, inp: Path, run_id="abc"):
     """A finished run's work dir: every product present, run.json last."""
     work.mkdir(parents=True, exist_ok=True)
-    for name in cli.RUN_PRODUCTS + cli.CLEARED_AT_START:
+    assert set(cli.RUN_PRODUCTS) <= set(cli.CLEARED_AT_START)
+    assert cli.CLEARED_AT_START[0] == "run.json"
+    for name in cli.CLEARED_AT_START:
         (work / name).write_text("{}", encoding="utf-8")
     (work / "ab").mkdir(exist_ok=True)
     (work / "ab" / "difference.wav").write_bytes(b"")
@@ -312,16 +315,28 @@ def test_input_is_checked_before_the_previous_run_is_touched(tmp_path, monkeypat
     with pytest.raises(ValueError, match="no such file"):
         cli.do_master(tmp_path / "typo.wav", work, planner.Controls(), log=lambda m: None)
     assert all((work / f).exists() for f in cli.CLEARED_AT_START + cli.RUN_PRODUCTS)
-    # the previous master as the input of a new run in the same folder
-    with pytest.raises(ValueError, match="inside the output folder"):
+    # the previous master as the input of a new run in the same folder (`eluate master
+    # out/master.wav -o out/` overwrote its own input and exited 0)
+    sf.write(work / "master.wav", 0.1 * np.random.default_rng(1).standard_normal((2 * FS, 2)),
+             FS)
+    with pytest.raises(ValueError, match="a file this run writes or removes"):
         cli.do_master(work / "master.wav", work, planner.Controls(), log=lambda m: None)
-    with pytest.raises(ValueError, match="inside the output folder"):
-        cli.check_input(work / "ab" / "difference.wav", work)
+    assert cli.main(["master", str(work / "master.wav"), "-o", str(work)]) == 2
+    for rel in ("ab/difference.wav", "passes/x 1 - plain sum.wav", "pass-1/master.wav",
+                "report.json", "features.npz"):
+        assert cli.run_writes(work / rel, work), rel
     assert all((work / f).exists() for f in cli.CLEARED_AT_START)
-    # the stems flow's own sums in the work dir are allowed
+    # other files in the folder are not the run's: the stems flow's own sums, a premaster
     sum_path = work / cli.STEMS_SUM
     sf.write(sum_path, 0.1 * np.random.default_rng(0).standard_normal((2 * FS, 2)), FS)
     assert cli.check_input(sum_path, work) == (2 * FS, FS)
+    (work / "pass-1").mkdir()
+    sf.write(work / "pass-1" / cli.CORRECTED_SUM, np.ones((2 * FS, 2)) * 0.1, FS)
+    assert cli.check_input(work / "pass-1" / cli.CORRECTED_SUM, work / "pass-1") == (2 * FS, FS)
+    with pytest.raises(ValueError, match="writes or removes"):
+        cli.check_input(work / "pass-1" / cli.CORRECTED_SUM, work)
+    sf.write(work / "premaster.wav", np.ones((2 * FS, 2)) * 0.1, FS)
+    assert not cli.run_writes(work / "premaster.wav", work)
     assert cli.check_input(inp, work) == (2 * FS, FS)
     with pytest.raises(ValueError, match="too short"):
         cli.check_input(_short(tmp_path), work)
@@ -479,6 +494,26 @@ def test_a_tempo_given_at_analyse_stays_the_users_at_plan():
     assert planner.character_settings(b, planner.Controls(), nb=5)["preset"] == "moderate"
 
 
+def test_a_bpm_given_at_analyse_is_the_users(tmp_path):
+    """Features F21 end to end: `eluate analyse --bpm 65` records the tempo as the user's
+    (source.json bpm_source, the analysis's metrical rule) and `plan` (no --bpm) reads it
+    so: slow, the user's grid, and the tempo record says "user"."""
+    x, _ = short_track(FS, 1)
+    wav = tmp_path / "in.wav"
+    sf.write(wav, x[: 6 * FS], FS)
+    work = tmp_path / "w"
+    cli.do_analyse(wav, work, None, log=lambda m: None, bpm=65.0)
+    src = json.loads((work / "source.json").read_text(encoding="utf-8"))
+    assert src["bpm"] == 65.0 and src["bpm_source"] == "user"
+    a = cli._load_analysis(work)
+    assert planner.plan_tempo(a, planner.Controls()) == (65.0, "user")
+    rec = planner.plan_record(a, planner.Controls())
+    assert rec["character"]["bpm_source"] == "user" and rec["character"]["preset"] == "slow"
+    assert rec["tempo"]["source"] == "user" and rec["tempo"]["detected_bpm"] is not None
+    cli.do_analyse(wav, work, None, log=lambda m: None)
+    assert json.loads((work / "source.json").read_text(encoding="utf-8"))["bpm_source"] is None
+
+
 def test_tempo_record_flags_a_user_tempo_that_disagrees_with_the_grid():
     rec = planner.tempo_record(_tempo_analysis(user_bpm=256.0, detected=128.0),
                                planner.Controls())
@@ -536,54 +571,73 @@ def test_process_log_states_the_tempo_disagreement():
 # ------------------------------------------------------------ S4-8 / features F2: key gate
 
 def test_key_gate_and_confidence():
-    assert planner.key_confidence(None) is None and planner.key_confidence({}) is None
-    assert planner.key_confidence({"tonic": "A", "score": 0.63}) == pytest.approx(0.63)
-    assert planner.key_confidence({"tonic": "A", "key_confidence": 0.2, "score": 0.9}) == 0.2
-    assert planner.key_confidence({"tonic": "A", "score": math.nan}) is None
-    g = planner.key_gate({"tonic": "C", "label": "Cm", "score": 0.29})
+    assert planner.analysis_key_confidence({"plan_inputs": {}, "meta": {}}) is None
+    assert planner.analysis_key_confidence({"plan_inputs": {"key_confidence": 0.63}}) == 0.63
+    assert planner.analysis_key_confidence({"plan_inputs": {"key_confidence": math.nan}}) is None
+    assert planner.analysis_key_confidence({"plan_inputs": {}, "meta": {"key_confidence": 1.4}}) == 1.0
+    # the record's raw profile score is not a confidence: absent means unknown
+    assert planner.analysis_key_confidence(
+        {"plan_inputs": {"key": {"tonic": "A", "score": 0.9}}}) is None
+    g = planner.key_gate("C", 0.29)
     assert not g["passed"] and g["min"] == planner.KEY_CONFIDENCE_MIN == 0.5
-    assert g["reason"] == "key Cm confidence 0.29 < 0.5"
-    assert planner.key_gate({"tonic": "A", "label": "Am", "score": 0.63})["passed"]
-    assert planner.key_gate({"tonic": "A"})["reason"] == "key confidence unknown"
-    assert planner.key_gate({"tonic": None, "score": math.nan})["reason"] == "no key found"
+    assert g["reason"] == "key C confidence 0.29 < 0.5"
+    assert planner.key_gate("A", 0.63)["passed"]
+    assert planner.key_gate("A", None)["reason"] == "key confidence unknown"
+    assert planner.key_gate(None, 0.9)["reason"] == "no key found"
 
 
-def test_an_unconfident_key_leaves_the_default_crossovers(monkeypatch):
-    """Pink noise read Cm at 0.29 and moved every band split; below the gate the analysis
-    keeps bands.DEFAULT_CROSSOVERS and records why (features audit F2)."""
+@pytest.mark.parametrize("conf", [0.29, None])
+def test_an_unconfident_or_unknown_key_leaves_the_default_crossovers(monkeypatch, conf):
+    """Pink noise read Cm and moved every band split; below the gate, or with no confidence
+    at all (an analysis without key_confidence), the analysis keeps
+    bands.DEFAULT_CROSSOVERS and records why (features audit F2)."""
     from eluate.features import pitch
     real = pitch.key
 
-    def weak(ctx, frame_power=None):
+    def c_minor(ctx, frame_power=None):
         out = real(ctx, frame_power)
-        out["key"] = {**out["key"], "tonic": "C", "label": "Cm", "score": 0.29}
+        out["key"] = {**out["key"], "tonic": "C", "label": "Cm"}
         return out
-    monkeypatch.setattr(pitch, "key", weak)
+    monkeypatch.setattr(pitch, "key", c_minor)
+    if conf is not None:
+        features_with_key_confidence(monkeypatch, conf)
     x, _ = short_track(FS, 1)
     a = planner.analyse(x[: 2 * FS], FS)
+    assert planner.key_crossovers("C") != bands.DEFAULT_CROSSOVERS
     assert tuple(a["meta"]["crossovers"]) == bands.DEFAULT_CROSSOVERS
     gate = a["meta"]["crossover_gate"]
-    assert gate["passed"] is False and gate["applied"] and gate["confidence"] == pytest.approx(0.29)
+    assert gate["passed"] is False and gate["applied"] and gate["confidence"] == conf
     assert a["meta"]["crossover_rule"] == "key" and a["meta"]["crossover_tonic"] == "C"
     rec = planner.crossover_choice(a, planner.Controls())
-    assert rec["key_gate"] == gate and rec["reason"].startswith("key not locked (key Cm "
-                                                                  "confidence 0.29 < 0.5)")
+    want = "key C confidence 0.29 < 0.5" if conf else "key confidence unknown"
+    assert rec["key_gate"] == gate and rec["reason"].startswith(f"key not locked ({want})")
     assert rec["hz"] == list(bands.DEFAULT_CROSSOVERS)
 
 
-def test_a_confident_key_still_locks_the_crossovers(pana):
-    _, a = pana
+def test_a_confident_key_still_locks_the_crossovers(monkeypatch):
+    from eluate.features import pitch
+    real = pitch.key
+
+    def c_sharp(ctx, frame_power=None):
+        out = real(ctx, frame_power)
+        out["key"] = {**out["key"], "tonic": "C#", "label": "C#m"}
+        return out
+    monkeypatch.setattr(pitch, "key", c_sharp)
+    features_with_key_confidence(monkeypatch, 0.8)
+    x, _ = short_track(FS, 1)
+    a = planner.analyse(x[: 2 * FS], FS)
     gate = a["meta"]["crossover_gate"]
-    assert gate["passed"] and gate["confidence"] >= planner.KEY_CONFIDENCE_MIN
-    assert tuple(a["meta"]["crossovers"]) == planner.key_crossovers(a["meta"]["crossover_tonic"])
+    assert gate["passed"] and gate["confidence"] == 0.8
+    assert tuple(a["meta"]["crossovers"]) == planner.key_crossovers("C#") !=         bands.DEFAULT_CROSSOVERS
     rec = planner.crossover_choice(a, planner.Controls())
     assert rec["key_gate"]["passed"] and rec["reason"].startswith("key-locked")
     # an analysis from before the gate reads it for the record only (applied False)
     b = copy.deepcopy(a)
     del b["meta"]["crossover_gate"]
-    b["plan_inputs"]["key"] = {"tonic": "A", "label": "Am", "score": 0.1}
+    b["plan_inputs"]["key_confidence"] = 0.1
     rec = planner.crossover_choice(b, planner.Controls())
-    assert rec["key_gate"]["applied"] is False and rec["reason"].startswith("key-locked")
+    assert rec["key_gate"]["applied"] is False and rec["key_gate"]["confidence"] == 0.1
+    assert rec["reason"].startswith("key-locked")
 
 
 # ------------------------------------------------------------ features F7: side-only notches
