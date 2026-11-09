@@ -33,12 +33,26 @@ Contract:
      the flux of total band energy (a sidechained bass ducks as the kick lands,
      so total sub + low energy rises by only about 5 dB on kick_sub while the
      per-bin flux peaks near 25 dB). A candidate is a local maximum of d within
-     +-50 ms with d > 10 dB and band energy within 40 dB of the maximum within
-     +-4 s (a local gate, not the whole track's), at least 100 ms after the
-     previous one; the signal is preceded by silence so an onset at t = 0
-     counts. Each candidate is moved to the steepest rise of a 1.45 ms moving
-     energy (64 samples at 44.1 kHz, scaled with fs) of the low band within
-     +-15 ms: on the low band, so a hat 10 ms away cannot take the refinement.
+     +-50 ms with band energy within 40 dB of the maximum within +-4 s (a local
+     gate, not the whole track's) and d above an adaptive gate (audit features
+     F5, 2026-11-10): KICK_FLUX_REL x the KICK_FLUX_PERCENTILE of the flux at
+     its 3-point local maxima inside the energy gate (every rise; the +-50 ms
+     winners are a fifth kicks and would set the gate on the kicks
+     themselves), clipped to KICK_FLUX_MIN_DB .. KICK_FLUX_MAX_DB
+     (`flux_gate_db` in the debug dict); the cap is the former fixed gate, as on
+     sparse material (kicks and a hat) the local maxima are mostly the kicks and
+     their own p90 x 1.5 gated every kick out. A fixed 10 dB gate lost 23 of 43 kicks under a sustained
+     (unducked) bass and pad: bins holding a sustained tone show no rise and
+     dilute the mean, so the kicks peaked at 8 to 10 dB while the track's
+     local-maximum flux had its p90 at 3.5 dB (kickless material: 3.2 to 4.7,
+     maximum 5.4). The score below, not the gate, rejects non-kicks: kickless
+     basslines still give 0 kicks. Candidates are at least 100 ms apart, the
+     stronger flux winning (first-come let a noise rise in an empty low band
+     pre-empt the kick 60 to 100 ms after it); the signal is preceded by
+     silence so an onset at t = 0 counts. Each candidate
+     is moved to the steepest rise of a 1.45 ms moving energy (64 samples at
+     44.1 kHz, scaled with fs) of the low band within +-15 ms: on the low band,
+     so a hat 10 ms away cannot take the refinement.
   2. Evidence, each in [0, 1]: low share s = borrowed.attack_low_share in its
      power mode (fractional bins, power share below 150 Hz; 46 ms Hann windows
      starting 5 ms before the attack, the C++ starts them at the onset where
@@ -105,7 +119,10 @@ KICK_WIN_S = 0.020
 KICK_STEP_S = 0.002
 KICK_LAG_S = 0.010
 KICK_FLOOR_DB = 80.0
-KICK_FLUX_DB = 10.0
+KICK_FLUX_MIN_DB = 6.0        # the candidate gate's floor (audit features F5; was a fixed 10 dB)
+KICK_FLUX_PERCENTILE = 90.0   # ... and its reference: this percentile of the local-maximum flux ...
+KICK_FLUX_REL = 1.5           # ... times this (kicks under bass + pad peak 8 to 10 dB; the p90 reads 3.2 to 4.7)
+KICK_FLUX_MAX_DB = 10.0       # ... capped at the former fixed gate
 KICK_OFFSET_S = 0.0
 KICK_RANGE_DB = 40.0
 KICK_NEIGHBOUR_S = 0.050
@@ -148,15 +165,30 @@ def kick_onsets(ctx: Context) -> tuple[np.ndarray, dict]:
     inside = (t >= -KICK_WIN_S / 2.0) & (t <= dur - KICK_WIN_S / 2.0)
     # energy gate relative to the local (+-4 s) maximum, not the whole track's
     e_loc = maximum_filter1d(e, size=2 * int(round(KICK_LOCAL_S / KICK_STEP_S)) + 1, mode="nearest")
-    cand = np.nonzero(inside & local_max & (d > KICK_FLUX_DB) & (e > e_loc - KICK_RANGE_DB))[0]
-    out = []
-    last = -np.inf
+    live = inside & local_max & (e > e_loc - KICK_RANGE_DB)
+    # adaptive flux gate (audit features F5): KICK_FLUX_REL x the KICK_FLUX_PERCENTILE of
+    # the flux at its 3-point local maxima (every rise, not the +-50 ms winners, of which
+    # kicks are a fifth), floored at KICK_FLUX_MIN_DB; a fixed 10 dB lost 23 of 43 kicks
+    # under a sustained bass and pad, whose bins show no rise and dilute the mean
+    rises = np.zeros(d.size, dtype=bool)
+    rises[1:-1] = (d[1:-1] >= d[:-2]) & (d[1:-1] >= d[2:]) & (d[1:-1] > 0)
+    rises &= inside & (e > e_loc - KICK_RANGE_DB)
+    # capped at the former fixed gate: on sparse material (kicks and a hat, little else)
+    # the local maxima are mostly the kicks, whose own p90 would gate them all out
+    gate = float(np.clip(KICK_FLUX_REL * float(np.percentile(d[rises], KICK_FLUX_PERCENTILE)),
+                         KICK_FLUX_MIN_DB, KICK_FLUX_MAX_DB)) if np.any(rises) else KICK_FLUX_MIN_DB
+    cand = np.nonzero(live & (d > gate))[0]
+    # candidates closer than KICK_MIN_GAP_S: the stronger flux wins (first-come let a
+    # 6 dB noise rise in an empty low band 60 to 100 ms before a 30 dB kick take its place)
+    out: list[tuple[float, float]] = []
     for i in cand:
         ti = t[i] - KICK_OFFSET_S
-        if ti - last >= KICK_MIN_GAP_S:
-            out.append(ti)
-            last = ti
-    cand_t = np.maximum(np.array(out, dtype=np.float64), 0.0)
+        if out and ti - out[-1][0] < KICK_MIN_GAP_S:
+            if d[i] > out[-1][1]:
+                out[-1] = (ti, d[i])
+            continue
+        out.append((ti, d[i]))
+    cand_t = np.maximum(np.array([o[0] for o in out], dtype=np.float64), 0.0)
     mono = 0.5 * (ctx.x[:, 0] + ctx.x[:, 1])
     low = ctx.low_band_m
     cand_s = _refine(low, ctx.fs, cand_t)  # on the low band: a hat 10 ms away cannot win
@@ -168,7 +200,7 @@ def kick_onsets(ctx: Context) -> tuple[np.ndarray, dict]:
     keep = score >= KICK_SCORE_MIN
     return cand_t[keep], {"t": t, "energy_db": e, "flux_db": d, "candidates": cand_t,
                           "low_share": share, "sweep": sweep, "click": click, "score": score,
-                          "kept": keep}
+                          "kept": keep, "flux_gate_db": float(gate)}
 
 
 def _high(ctx: Context) -> np.ndarray:

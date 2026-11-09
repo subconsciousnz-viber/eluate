@@ -13,7 +13,13 @@ report's flags, the process log and the app's footer). The estimator differs fro
 proposal below: minimum statistics on the whole track read dense mixes' own pads and
 reverb as "floor" (all four VA tracks read -33 to -41 dB before the master). It now reads
 only the **quiet passages** (frames more than 35 dB below the track's loud level: intros,
-gaps, tails, fades), where noise is not masked and is what the master exposes; the 20th
+gaps, tails, fades; when fewer than 0.5 s of frames pass that rule, a **noise plateau**:
+runs of at least 0.5 s within 3 dB of the lowest level, 15 dB or more under the loud level,
+whose 2 to 16 kHz spectrum is noise-flat, flagged `may_include_music`. A hiss at -50 or
+-40 dBFS left no frame "quiet" and read -inf, so the louder the hiss the less was reported;
+it now reads 10 dB per 10 dB on a track with a quiet intro, while music that never stops
+still reads nothing; audit features F8, 2026-11-10),
+where noise is not masked and is what the master exposes; the 20th
 percentile of the BS.468-weighted power per third-octave band from **2 kHz up**, summed;
 the master read at the premaster's quiet moments. Threshold **-60 dB** (`noise.FLAG_DB`).
 On the VA: Track G -86.6 to -58.0 (exposed), Track A -67.5 to -51.9 (exposed), Track F -70.8

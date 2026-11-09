@@ -10,11 +10,12 @@ from eluate.features._common import Context
 FS = 44100
 
 
-def _run(x):
+def _run(x, bpm=None):
     ctx = Context(x, FS)
     tr = transients.analyse(x, FS, ctx)
     return structure.analyse(x, FS, ctx, onset=(tr["onset_env_t"], tr["onset_env"]),
-                             onset_rate=tr["onset_rate"], kick_onsets=tr["kick_onsets"])
+                             onset_rate=tr["onset_rate"], kick_onsets=tr["kick_onsets"],
+                             onset_times=tr["onset_times"], bpm=bpm)
 
 
 @pytest.mark.parametrize("bpm,levels", [(128.0, (-12.0, 0.0, -6.0, 0.0, -9.0)),
@@ -104,11 +105,12 @@ def test_one_bar_fill_boundary_lands_on_the_drop():
 
 def test_align_guards_and_uninformative_grid():
     beats = np.arange(16) * 0.5
-    out, shift = structure.align_to_onsets(beats, [1.0], 8.0)  # one onset: unchanged
-    assert np.array_equal(out, beats) and shift == 0.0
+    out, shift, info = structure.align_to_onsets(beats, [1.0], 8.0)  # one onset: unchanged
+    assert np.array_equal(out, beats) and shift == 0.0 and info["coverage"] == 0.0
     r = _run(syn.pink_noise(FS * 6, FS, seed=2) * 0.01)
     assert r["meter"] == "4/4 (assumed)"
-    assert r["grid_informative"] == (r["grid_kind"] != "default")
+    assert not r["grid_informative"] and r["grid_reason"].startswith("weak metrical evidence")
+    assert r["grid_evidence"]["beat_onset_coverage"] < structure.GRID_MIN_COVERAGE
 
 
 def test_snap_from_unrounded_bar():
@@ -310,3 +312,61 @@ def test_kick_consistency():
     assert c["consistent"] and c["matches"] == "tempo half"
     c = structure.kick_consistency(np.cumsum(np.full(30, 0.83)), 120.0, 95.0)
     assert not c["consistent"]
+
+
+@pytest.mark.parametrize("pattern", ["four", "nokick"])
+def test_grid_informative_on_drum_loops(pattern):
+    """Audit features F1: four-on-the-floor and a drum loop without kicks carry metrical
+    evidence (an onset at nearly every beat, strong onsets on the beats)."""
+    x, _ = syn.drum_loop(FS, 120.0, pattern, 16.0)
+    st = _run(x)
+    ev = st["grid_evidence"]
+    assert st["grid_informative"], st["grid_reason"]
+    assert ev["beat_onset_coverage"] >= 0.95 and ev["onset_contrast"] > 5.0
+    assert {"acf_upper", "acf_kick", "tracked_ibi_cv", "onsets_per_beat", "metrical_relation",
+            "kick_consistent", "constant_fit", "beats"} <= set(ev)
+
+
+@pytest.mark.parametrize("name", ["pad", "pink", "chord"])
+def test_grid_uninformative_without_metrical_evidence(name):
+    """Audit features F1: librosa returned beats on a pad (135 BPM), pink noise (113.5) and
+    a held chord (125), "tracked" and trusted; the evidence now says no, with the reason.
+    A user tempo stays informative."""
+    x = {"pad": lambda: syn.ambient_pad(FS, 15.0), "pink": lambda: syn.pink_noise(15 * FS, FS),
+         "chord": lambda: syn.sustained_chord(FS, 15.0)}[name]()
+    st = _run(x)
+    assert not st["grid_informative"] and st["grid_reason"].startswith("weak metrical evidence")
+    assert st["grid_evidence"]["beat_onset_coverage"] < 0.1
+    assert st["grid_evidence"]["onset_contrast"] < structure.GRID_MIN_CONTRAST
+    if name == "pad":
+        u = _run(x, bpm=120.0)
+        assert u["grid_informative"] and u["grid_reason"] == "user bpm"
+
+
+@pytest.mark.parametrize("bpm,pattern", [(128.0, "four"), (174.0, "dnb"), (90.0, "hiphop"),
+                                         (120.0, "nokick")])
+def test_grid_lands_on_the_attacks(bpm, pattern):
+    """Audit features F6: aligned to the kicks only, the grid trailed the attacks by 17 to
+    22 ms when kicks were on a quarter of the beats; aligned to every onset (and the
+    constant grid refitted to them) it is within 5 ms of the true beats."""
+    x, meta = syn.drum_loop(FS, bpm, pattern, 24.0)
+    st = _run(x)
+    b, truth = st["beat_times"], meta["beat_times"]
+    per = 60.0 / bpm
+    d = ((b - truth[0] + per / 2) % per) - per / 2
+    assert abs(st["tempo_bpm"] - bpm) < 0.05
+    assert np.percentile(np.abs(d), 90) < 0.005, (np.median(d), np.percentile(np.abs(d), 90))
+
+
+@pytest.mark.parametrize("seconds", [5.0, 10.0, 20.0])
+def test_short_clip_tempo(seconds):
+    """Audit features F16: a 128 BPM clip read 131.3 (5 s), 128.14 (10 s) and 128.27 (20 s,
+    20 ms of drift at the ends); the onset refit reads all three within 0.15 BPM. A 2 s
+    clip (4 beats) is too short to inform a plan."""
+    x, _ = syn.groove_track(FS, seconds)
+    st = _run(x)
+    assert abs(st["tempo_bpm"] - 128.0) < 0.15 and st["grid_informative"]
+    assert st["beat_align"]["refit_bpm"] is not None
+    if seconds == 5.0:
+        s2 = _run(syn.groove_track(FS, 2.0)[0])
+        assert not s2["grid_informative"] and "beats (<" in s2["grid_reason"]

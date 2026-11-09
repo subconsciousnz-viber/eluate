@@ -10,19 +10,37 @@ Contract:
   level is more than QUIET_BELOW_DB below the track's loud level (the 95th percentile of
   the frame levels) and not digital silence: intros, gaps, tails and fades, where the music
   does not mask a noise floor. Loud passages are not measured: noise there is masked, and
-  a dense mix leaves no gaps in which a floor can be told from the music. Per third-octave
-  band, the floor is the QUIET_PERCENTILE of the band's weighted power over the quiet
-  frames; the broadband floor is their sum. `quiet` passes another signal's quiet frames
-  (the master is read on the premaster's, so both are measured at the same moments),
-  trimmed to this signal's frame count or padded with False (frames past its end are
-  not quiet).
+  a dense mix leaves no gaps in which a floor can be told from the music. Fallback (audit
+  features F8, 2026-11-10): a hiss at or above the loud level minus 35 dB (white hiss at
+  -50 or -40 dBFS on a peak-normalised track) made no frame "quiet", so the floor read
+  -inf and the louder the hiss the less was reported. When fewer than MIN_QUIET_S of
+  frames pass the 35 dB rule, the quiet frames are a noise plateau, if there is one:
+  the live frames within PLATEAU_SPREAD_DB of the lowest live level (its 1st percentile)
+  and at least PLATEAU_BELOW_DB below the loud level, in runs of at least MIN_QUIET_S,
+  whose mean spectrum over FLOOR_BANDS_HZ (to 16 kHz) is noise-like (spectral flatness
+  at least PLATEAU_FLATNESS: white and pink hiss read 0.85 to 1, a held chord's
+  partials far less). A track that never stops has no such run (its quietest frames
+  are scattered between hits, or no quieter than its loud level) and still reads -inf;
+  a stationary, noise-like quiet passage that is music (a reverb tail, a noise riser)
+  would read as floor, so `may_include_music` is True whenever the plateau rule set the
+  frames.
+  Per third-octave band, the floor is the QUIET_PERCENTILE of the band's
+  weighted power over the quiet frames; the broadband floor is their sum. `quiet` passes
+  another signal's quiet frames (the master is read on the premaster's, so both are
+  measured at the same moments), trimmed to this signal's frame count or padded with False
+  (frames past its end are not quiet).
   Returns {"db", "bands_hz", "bands_db", "quiet_s", "quiet_spans": [start, end] seconds of
-  the quiet passages (runs closer than 0.5 s merged), "quiet": frame mask}; db is -inf when
-  there are fewer than MIN_QUIET_S of quiet frames or the sample rate leaves no band in
-  FLOOR_BANDS_HZ (no bands then).
+  the quiet passages (runs closer than 0.5 s merged), "quiet": frame mask, "quiet_rule"
+  ("below loud - 35 dB", "noise plateau" or "given"), "may_include_music"}; db is -inf
+  when there are fewer than MIN_QUIET_S of quiet frames by either rule or the sample rate
+  leaves no band in FLOOR_BANDS_HZ (no bands then).
+  Calibration note (audit features F24): BS.468 puts white hiss about 9 dB above its
+  unweighted level over 2 to 20 kHz (-60 dBFS white reads -51.1 dB), so the -60 dB flag
+  corresponds to about -69 dBFS of white hiss.
 - `assess(before, after, threshold_db=FLAG_DB) -> dict` (JSON-ready, no mask): status
   "exposed" = below the threshold before and at or above it after (the master made it
-  audible), "present" = at or above it in both, None otherwise (or nothing to measure).
+  audible), "present" = at or above it in both, None otherwise (or nothing to measure);
+  `may_include_music` and `quiet_rule` are the premaster's (the frames both are read on).
 """
 
 from __future__ import annotations
@@ -35,6 +53,10 @@ FRAME_S = 0.046
 QUIET_BELOW_DB = 35.0
 QUIET_PERCENTILE = 20.0
 MIN_QUIET_S = 0.5
+PLATEAU_SPREAD_DB = 3.0       # F8 fallback: frames within this of the lowest live level ...
+PLATEAU_BELOW_DB = 15.0       # ... at least this far below the loud level ...
+PLATEAU_FLATNESS = 0.5        # ... whose mean 2 to 16 kHz spectrum is this flat (hiss 0.85 to 1)
+PLATEAU_HI_HZ = 16000.0
 SILENT_DB = -120.0
 LOUD_PERCENTILE = 95.0
 FLOOR_BANDS_HZ = (2000.0, 20000.0)
@@ -74,6 +96,33 @@ def _spans(mask, hop_s, frame_s, gap_s=0.5) -> list:
     return spans
 
 
+def _runs(mask: np.ndarray, n_min: int) -> np.ndarray:
+    """mask with only its runs of at least n_min consecutive True frames kept."""
+    out = np.zeros(mask.size, dtype=bool)
+    idx = np.flatnonzero(np.diff(np.concatenate([[0], mask.astype(np.int8), [0]])))
+    for a, b in zip(idx[::2], idx[1::2]):
+        if b - a >= n_min:
+            out[a:b] = True
+    return out
+
+
+def _plateau(level, live, loud, p, f, n_min):
+    """The F8 fallback's quiet frames (module contract), or None: live frames within
+    PLATEAU_SPREAD_DB of the lowest live level and PLATEAU_BELOW_DB under the loud
+    level, in runs of n_min frames or more, whose mean spectrum over FLOOR_BANDS_HZ[0]
+    to PLATEAU_HI_HZ has a spectral flatness of at least PLATEAU_FLATNESS."""
+    lo = float(np.percentile(level[live], 1.0))
+    cand = _runs(live & (level <= lo + PLATEAU_SPREAD_DB) & (level < loud - PLATEAU_BELOW_DB), n_min)
+    sel = (f >= FLOOR_BANDS_HZ[0]) & (f <= min(PLATEAU_HI_HZ, 0.9 * f[-1]))  # f[-1] = fs / 2
+    if cand.sum() < n_min or np.count_nonzero(sel) < 8:
+        return None
+    psd = p[sel][:, cand].mean(axis=1)
+    if not np.all(psd > 0):
+        return None
+    flat = float(np.exp(np.mean(np.log(psd))) / np.mean(psd))
+    return cand if flat >= PLATEAU_FLATNESS else None
+
+
 def floor(x: np.ndarray, fs: int, quiet: np.ndarray | None = None) -> dict:
     x = np.asarray(x, dtype=np.float64)
     if x.ndim == 1:
@@ -91,18 +140,26 @@ def floor(x: np.ndarray, fs: int, quiet: np.ndarray | None = None) -> dict:
     if centres.size:
         band_p = np.stack([(p[m] * w[m, None]).sum(axis=0) for m in
                            ((f >= c * 2 ** (-1 / 6)) & (f < c * 2 ** (1 / 6)) for c in centres)])
+    hop_s = (n // 2) / fs
+    rule, may_music = "given", False
     if quiet is None:
         level = 10 * np.log10(p.sum(axis=0) + 1e-30)
         live = level > SILENT_DB
         loud = np.percentile(level[live], LOUD_PERCENTILE) if np.any(live) else 0.0
         quiet = live & (level < loud - QUIET_BELOW_DB)
+        rule = f"below loud - {QUIET_BELOW_DB:g} dB"
+        n_min = int(np.ceil(MIN_QUIET_S / hop_s))
+        if quiet.sum() < n_min and live.sum() >= n_min:
+            plateau = _plateau(level, live, loud, p, f, n_min)
+            if plateau is not None:
+                quiet, rule, may_music = plateau, "noise plateau", True
     # a borrowed mask fits this signal's frames: trimmed, or padded with False (not quiet)
     nf = band_p.shape[1]
     quiet = np.asarray(quiet, dtype=bool)[:nf]
     quiet = np.concatenate([quiet, np.zeros(nf - len(quiet), dtype=bool)])
-    hop_s = (n // 2) / fs
     out = {"bands_hz": centres.tolist(), "quiet_s": float(quiet.sum() * hop_s), "quiet": quiet,
-           "quiet_spans": _spans(quiet, hop_s, n / fs)}
+           "quiet_spans": _spans(quiet, hop_s, n / fs), "quiet_rule": rule,
+           "may_include_music": may_music}
     if quiet.sum() * hop_s < MIN_QUIET_S:
         return {**out, "db": float("-inf"), "bands_db": [float("-inf")] * len(centres)}
     fl = np.percentile(band_p[:, quiet], QUIET_PERCENTILE, axis=1)
@@ -124,4 +181,6 @@ def assess(before: dict, after: dict, threshold_db: float = FLAG_DB) -> dict:
             "weighting": "ITU-R BS.468", "quiet_s": before["quiet_s"],
             "quiet_spans": before["quiet_spans"], "loudest_band_hz": loudest,
             "bands_hz": after["bands_hz"], "before_bands_db": before["bands_db"],
-            "after_bands_db": after["bands_db"]}
+            "after_bands_db": after["bands_db"],
+            "quiet_rule": before.get("quiet_rule"),
+            "may_include_music": bool(before.get("may_include_music", False))}

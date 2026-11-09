@@ -22,6 +22,13 @@ the ground truth a test needs (onset times, roots, ring extent). No file I/O.
   per bar over a bass root, for key and chord tests.
 - `bassline`: short-attack bass notes (off-beat, eighths or on the beat) with
   or without a kick on every beat: bass attacks that must not read as kicks.
+- `drum_loop`: four-on-the-floor, DnB / hip-hop (kicks on a quarter of the
+  beats) or kickless (snare + hats) drum patterns over a steady sub.
+- `groove_track`: kick, off-beat hats, an unducked bass root and pad triads
+  per bar (the kick + bass + pad material that hid kicks, audit features F5).
+- `ambient_pad`, `sustained_chord`: beatless material (no metrical evidence).
+- `dense_loop`: the groove plus a detuned supersaw pad and a 16th arpeggio,
+  with no resonance (notch false positives, audit features F12).
 """
 
 from __future__ import annotations
@@ -339,3 +346,182 @@ def bassline(fs: float, bpm: float = 128.0, pattern: str = "offbeat", bars: int 
         y[i0:i0 + m] += kk[:m]
     return np.stack([y, y], axis=1), {"beat_times": np.arange(n_beats) * beat, "kick_onsets": kicks,
                                       "note_onsets": notes, "roots_per_beat": roots, "bpm": bpm}
+
+
+def _snare(fs: float, rng, level: float = 0.4, lowpass_hz: float | None = None) -> np.ndarray:
+    """Noise burst (40 ms decay) plus a 200 Hz body; `lowpass_hz` band-limits the
+    noise (and holds its PSD per Hz constant across rates, for rate checks)."""
+    m = int(round(0.15 * fs))
+    t = np.arange(m) / fs
+    w = rng.standard_normal(m)
+    if lowpass_hz is not None:
+        w = signal.sosfilt(signal.butter(4, lowpass_hz, "lowpass", fs=fs, output="sos"), w)
+        w *= np.sqrt(fs / 48000.0)
+    return level * (w * np.exp(-t / 0.04) + np.sin(2 * np.pi * 200 * t) * np.exp(-t / 0.03))
+
+
+def drum_loop(fs: float, bpm: float = 128.0, pattern: str = "four", seconds: float = 32.0,
+              sub_hz: float | None = 55.0, seed: int | None = 0):
+    """Drum patterns for beat-grid tests (audit features F1 / F6). `pattern`:
+    "four" (kick on every beat, off-beat hat), "dnb" / "hiphop" (kick on 1 and
+    the "and" of 3, snare on 2 and 4, 8th hats: kicks on a quarter of the beats),
+    "nokick" (snare on 2 and 4, 8th hats, no kick). A steady sine at `sub_hz`
+    (None: none) sits under it. Peak 0.5. Returns (x, meta) with meta =
+    {"beat_times", "kick_onsets", "bpm"}."""
+    rng = _rng(seed)
+    n = int(round(seconds * fs))
+    beat = 60.0 / bpm
+    x = np.zeros(n)
+    kk = kick(fs)
+
+    def put(sig, t0):
+        i0 = int(round(t0 * fs))
+        m = min(sig.size, n - i0)
+        if m > 0:
+            x[i0:i0 + m] += sig[:m]
+    beats = np.arange(int(seconds / beat)) * beat
+    kicks = []
+    for b, t0 in enumerate(beats):
+        if pattern == "four":
+            put(kk, t0)
+            kicks.append(t0)
+            put(_hat(fs, rng), t0 + beat / 2)
+            continue
+        if pattern in ("dnb", "hiphop"):
+            if b % 4 == 0:
+                put(kk, t0)
+                kicks.append(t0)
+            if b % 4 == 2:
+                put(kk, t0 + beat / 2)
+                kicks.append(t0 + beat / 2)
+        elif pattern != "nokick":
+            raise ValueError(pattern)
+        if b % 2 == 1:
+            put(_snare(fs, rng), t0)
+        put(_hat(fs, rng), t0)
+        put(_hat(fs, rng, level=0.08 if pattern == "dnb" else 0.1), t0 + beat / 2)
+    if sub_hz is not None:
+        x += 0.15 * np.sin(2 * np.pi * sub_hz * np.arange(n) / fs)
+    x *= 0.5 / np.max(np.abs(x))
+    return np.stack([x, x], axis=1), {"beat_times": beats, "kick_onsets": np.array(kicks), "bpm": bpm}
+
+
+def groove_track(fs: float, seconds: float = 20.0, bpm: float = 128.0, chords=("Am", "F", "C", "G"),
+                 kick_on: bool = True, hats: bool = True, bass: bool = True, pad: bool = True,
+                 level: float = 0.5, seed: int | None = 0):
+    """Kick on every beat, off-beat hats, a sustained (not sidechained) bass root
+    per bar (sine plus 2nd harmonic, 65 to 123 Hz) and pad triads per bar, over
+    a -55 dBFS stereo pink bed: the kick + bass + pad material of audit features
+    F5, where the unducked bass and pad hide the kicks' flux. Returns (x, meta)
+    with meta = {"beat_times", "bar_times", "chords" (per bar), "bpm"}."""
+    rng = _rng(seed)
+    n = int(round(seconds * fs))
+    t = np.arange(n) / fs
+    beat = 60.0 / bpm
+    beats = np.arange(int(np.ceil(seconds / beat))) * beat
+    beats = beats[beats < seconds]
+    bars = beats[::4]
+    x = np.zeros(n)
+    kk = kick(fs)
+    for b in beats:
+        i0 = int(round(b * fs))
+        if kick_on:
+            m = min(kk.size, n - i0)
+            x[i0:i0 + m] += kk[:m]
+        if hats:
+            h = _hat(fs, rng)
+            j0 = int(round((b + beat / 2) * fs))
+            m = min(h.size, n - j0)
+            if m > 0:
+                x[j0:j0 + m] += h[:m]
+    per_bar = []
+    for i, b0 in enumerate(bars):
+        c = chords[i % len(chords)]
+        per_bar.append(c)
+        minor = c.endswith("m")
+        root = _NOTE[c[:-1] if minor else c]
+        i0, i1 = int(round(b0 * fs)), min(n, int(round((b0 + 4 * beat) * fs)))
+        tt = t[i0:i1] - b0
+        env = np.minimum(1.0, np.minimum(tt, tt[-1] - tt) / 0.02)
+        if pad:
+            for iv in ((0, 3, 7) if minor else (0, 4, 7)):
+                f = 440.0 * 2 ** ((60 + (root + iv) % 12 - 69) / 12.0)
+                for k in (1, 2, 3, 4):
+                    x[i0:i1] += 0.03 / k * env * np.sin(2 * np.pi * k * f * tt + k)
+        if bass:
+            fb = 440.0 * 2 ** ((36 + root - 69) / 12.0)
+            x[i0:i1] += 0.25 * env * (np.sin(2 * np.pi * fb * tt) + 0.2 * np.sin(4 * np.pi * fb * tt))
+    x *= level / max(1e-12, np.max(np.abs(x)))
+    x = np.stack([x, x], axis=1) + pink_noise(n, fs, rms_dbfs=-55.0, seed=None if seed is None else seed + 7)
+    return x, {"beat_times": beats, "bar_times": bars, "chords": per_bar, "bpm": bpm}
+
+
+def ambient_pad(fs: float, seconds: float = 30.0, seed: int | None = 0) -> np.ndarray:
+    """Beatless pad: four slowly swelling (0.05 Hz) notes with a slight vibrato over
+    -40 dBFS pink air (audit features F1: no metrical evidence)."""
+    n = int(round(seconds * fs))
+    t = np.arange(n) / fs
+    x = np.zeros(n)
+    for midi, ph in ((57, 0.0), (60, 1.0), (64, 2.0), (69, 0.5)):
+        f = 440.0 * 2 ** ((midi - 69) / 12.0)
+        lfo = 0.5 + 0.5 * np.sin(2 * np.pi * 0.05 * t + ph)
+        for k in (1, 2, 3):
+            x += 0.05 / k * lfo * np.sin(2 * np.pi * k * f * (1 + 0.001 * np.sin(2 * np.pi * 0.2 * t)) * t)
+    return np.stack([x, x * 0.95], axis=1) + pink_noise(n, fs, rms_dbfs=-40.0, seed=seed)
+
+
+def sustained_chord(fs: float, seconds: float = 30.0, seed: int | None = 3) -> np.ndarray:
+    """One A minor chord (A2 A3 C4 E4, 4 partials each) held throughout over a
+    -45 dBFS pink bed: no onsets after the first."""
+    n = int(round(seconds * fs))
+    t = np.arange(n) / fs
+    x = np.zeros(n)
+    for midi in (45, 57, 60, 64):
+        f = 440.0 * 2 ** ((midi - 69) / 12.0)
+        for k in (1, 2, 3, 4):
+            x += 0.08 / k * np.sin(2 * np.pi * k * f * t + k)
+    return np.stack([x, x * 0.97], axis=1) + pink_noise(n, fs, rms_dbfs=-45.0, seed=seed)
+
+
+def dense_loop(fs: float, seconds: float = 48.0, seed: int | None = 0):
+    """groove_track at 126 BPM (Am F C G) plus a detuned supersaw pad (three saws per
+    chord tone at -12, 0, +12 cents, panned) and a 16th-note pluck arpeggio an
+    octave up: dense material with no resonance (audit features F12, whose notch
+    detector rendered three false cuts on it). Peak 0.5. Returns (x, meta) as
+    groove_track."""
+    x, m = groove_track(fs, seconds, bpm=126.0, seed=seed)
+    n = x.shape[0]
+    t = np.arange(n) / fs
+    bars = m["bar_times"]
+    y = np.zeros((n, 2))
+
+    def saw(f, tt, nh):
+        return sum(np.sin(2 * np.pi * k * f * tt) / k for k in range(1, nh + 1) if k * f < 18000.0)
+    for i, b0 in enumerate(bars):
+        b1 = bars[i + 1] if i + 1 < bars.size else seconds
+        c = m["chords"][i]
+        minor = c.endswith("m")
+        root = _NOTE[c[:-1] if minor else c]
+        ivs = (0, 3, 7) if minor else (0, 4, 7)
+        i0, i1 = int(b0 * fs), min(n, int(b1 * fs))
+        tt = t[i0:i1] - b0
+        env = np.minimum(1, np.minimum(tt, tt[-1] - tt) / 0.05)
+        for iv in ivs:
+            f = 440.0 * 2 ** ((60 + (root + iv) % 12 - 69) / 12.0)
+            for cents, pan in ((-12, 0.3), (0, 0.5), (12, 0.7)):
+                v = saw(f * 2 ** (cents / 1200), tt + 0.0003 * np.sin(2 * np.pi * 5 * tt), 30) * env * 0.012
+                y[i0:i1, 0] += v * (1 - pan)
+                y[i0:i1, 1] += v * pan
+        for s in range(16):
+            ts = b0 + s * (b1 - b0) / 16
+            j0 = int(ts * fs)
+            mm = min(int(0.2 * fs), n - j0)
+            if mm <= 0:
+                continue
+            tp = np.arange(mm) / fs
+            f = 440.0 * 2 ** ((72 + (root + (ivs + (12,))[s % 4]) % 12 - 69) / 12.0)
+            v = 0.05 * np.exp(-tp / 0.06) * saw(f, tp, 12)
+            y[j0:j0 + mm, 0] += v * (0.4 + 0.2 * (s % 2))
+            y[j0:j0 + mm, 1] += v * (0.6 - 0.2 * (s % 2))
+    x = x + y * (np.max(np.abs(x)) / max(1e-9, np.max(np.abs(y)))) * 0.6
+    return x * (0.5 / np.max(np.abs(x))), m

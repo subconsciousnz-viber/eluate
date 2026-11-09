@@ -1,13 +1,15 @@
-# Portions copied from TRANSMUTATION (audio morph workstation) and from
-# drumbusmaximus / SKIN, both by the same author.
-# Copyright (C) 2026 subconsciousnz-viber
-# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 the Eluate contributors
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Provenance: the maintainer's own code, carried over from their TRANSMUTATION and
+# drumbusmaximus / SKIN projects (no third-party code; relicensed with the rest of Eluate,
+# audit features F22).
 """Detector code borrowed from the maintainer's sibling repositories (docs/reuse-survey.md).
 
 Origins (copied, not imported; the maintainer holds the copyright):
 - `detect_onsets`, `superflux`: TRANSMUTATION engine/transients.py `detect_onsets`
   (rebuilt 2026-08-18): log-compressed SuperFlux, multiplicative local-median
-  threshold plus a global salience gate, 64-sample attack refinement, 50 ms gap.
+  threshold plus a global salience gate, 64-sample attack refinement (64 at
+  44.1 kHz, the same 1.45 ms at other rates: `refine_env`, audit features F17), 50 ms gap.
   Logic unchanged. The per-frame rfft loop is vectorised in blocks and the flux
   computation is split out as `superflux` so the envelope can be reported as
   onset strength; `detect_onsets(x, sr)` returns the same sample indices as the
@@ -44,8 +46,10 @@ Origins (copied, not imported; the maintainer holds the copyright):
   keyeq gate (audit 04 F2).
 - `attack_low_share`, `KICK_LOW_SHARE`: drumbusmaximus analysis/src/Onsets.cpp
   `measureOnsetTimbre` (attack = sqrt of the per-band power rise, Hann window of
-  about 46 ms after the onset against the same window before it, the after
-  window stopping at the next onset, 24 log bands from 30 Hz to 16 kHz) and
+  ATTACK_WINDOW_S = 46.4 ms after the onset against the same window before it
+  (a duration at every rate, zero-padded to a power of two for the FFT; the
+  C++'s 2048 samples are 46.4 ms at 44.1 kHz, audit features F17 / spec A10),
+  the after window stopping at the next onset, 24 log bands from 30 Hz to 16 kHz) and
   analysis/src/DrumIdentity.cpp (a drum with >= 0.3 of its unit-sum attack shape
   in the bands below 150 Hz is low, i.e. a kick). DrumIdentity applies the rule
   to NMF-separated drum shapes; here it is applied to each onset's own attack,
@@ -97,6 +101,16 @@ def superflux(audio, sr, hop: int = 512, n_fft: int = 2048):
     return flux, n_frames
 
 
+REFINE_ENV_S = 64 / 44100  # the C++'s 64-sample refinement envelope, as a duration
+
+
+def refine_env(sr: float) -> int:
+    """The onset refinement's moving-energy length in samples: TRANSMUTATION's 64 at
+    44.1 kHz (so the port stays bit-identical there), the same 1.45 ms at other rates
+    (audit features F17: a fixed 64 samples was 0.67 ms at 96 kHz)."""
+    return max(2, int(round(REFINE_ENV_S * float(sr))))
+
+
 def detect_onsets(audio, sr, hop: int = 512, n_fft: int = 2048):
     """Salience-gated SuperFlux onsets (TRANSMUTATION). Sorted sample indices."""
     x = np.asarray(audio, dtype=np.float64)
@@ -122,7 +136,7 @@ def detect_onsets(audio, sr, hop: int = 512, n_fft: int = 2048):
     if not cand:
         return np.array([], dtype=int)
 
-    env_w = 64
+    env_w = refine_env(sr)  # 64 samples at 44.1 kHz, the same 1.45 ms at every rate (F17)
     kernel = np.ones(env_w) / env_w
     onsets = []
     for i in cand:
@@ -165,7 +179,7 @@ def log_filterbank(n_fft: int, sr: float, bands_per_octave: int = 12, f_lo: floa
 
 
 def detect_onsets_fb(audio, sr, hop: int = 512, n_fft: int = 2048, bands_per_octave: int = 12,
-                     local_s: float = 4.0, env_w: int = 64):
+                     local_s: float = 4.0, env_w: int | None = None):
     """SuperFlux as in the literature (Boeck and Widmer 2013): the TRANSMUTATION
     detector with two changes (spec 3.3 draft 0.4, audit 04 A11): the magnitude
     spectrum goes through a log-frequency triangular filterbank before log
@@ -173,7 +187,10 @@ def detect_onsets_fb(audio, sr, hop: int = 512, n_fft: int = 2048, bands_per_oct
     much per octave as a hat's many high ones; and the threshold floor is
     0.07 x the maximum flux within +-local_s instead of the whole track's, so
     a quiet intro keeps its onsets. Refinement, gap and the local-median term
-    are unchanged. `env_w` is the refinement envelope length in samples."""
+    are unchanged. `env_w` is the refinement envelope length in samples
+    (None: refine_env(sr), 64 at 44.1 kHz)."""
+    if env_w is None:
+        env_w = refine_env(sr)
     x = np.asarray(audio, dtype=np.float64)
     if x.size < 2 * hop or not np.any(np.abs(x) > 1e-9):
         return np.array([], dtype=int)
@@ -392,6 +409,7 @@ def ladder_fraction(freqs: np.ndarray, power: np.ndarray, widths: np.ndarray, f0
 # ------------------------------------------------------------- kick rule
 
 KICK_LOW_SHARE = 0.3       # DrumIdentity kKickLow
+ATTACK_WINDOW_S = 0.0464   # Onsets.cpp's 2048 samples at 44.1 kHz, as a duration (F17)
 ATTACK_BANDS = 24          # Onsets.h kAttackBands
 ATTACK_LO_HZ, ATTACK_HI_HZ = 30.0, 16000.0
 ATTACK_LOW_BANDS = 6       # DrumIdentity kLowBands: the bands below 150 Hz
@@ -408,9 +426,13 @@ def attack_low_share(mono: np.ndarray, sr: float, onsets: np.ndarray, lead_s: fl
     bands hold no bin) and the share of the per-band sqrt magnitudes."""
     x = np.asarray(mono, dtype=np.float64)
     ns = x.size
-    n = int(2 ** round(np.log2(0.0464 * sr)))  # about 46 ms (2048 at 44.1 / 48 kHz)
+    # a fixed 46.4 ms window (2046 samples at 44.1 kHz, the C++'s 2048) zero-padded to a
+    # power of two for the FFT: the sample-count form 2^round(log2(0.0464 sr)) gave 42.7 ms
+    # at 48 and 96 kHz, a different measure per rate (audit features F17, spec A10)
+    n = int(round(ATTACK_WINDOW_S * sr))
+    nfft = 1 << int(np.ceil(np.log2(n)))
     win = np.hanning(n + 1)[:-1]
-    freqs = np.fft.rfftfreq(n, 1.0 / sr)
+    freqs = np.fft.rfftfreq(nfft, 1.0 / sr)
     edges = ATTACK_LO_HZ * (ATTACK_HI_HZ / ATTACK_LO_HZ) ** (np.arange(ATTACK_BANDS + 1) / ATTACK_BANDS)
     band = np.searchsorted(edges, freqs, side="right") - 1
     band[(freqs < ATTACK_LO_HZ) | (freqs >= ATTACK_HI_HZ)] = -1
@@ -433,8 +455,8 @@ def attack_low_share(mono: np.ndarray, sr: float, onsets: np.ndarray, lead_s: fl
         pre = np.zeros(n)
         b0 = max(0, s - n)
         pre[n - (s - b0):] = x[b0:s]
-        mp = np.abs(np.fft.rfft(post * win)) ** 2
-        mq = np.abs(np.fft.rfft(pre * win)) ** 2
+        mp = np.abs(np.fft.rfft(post * win, n=nfft)) ** 2
+        mq = np.abs(np.fft.rfft(pre * win, n=nfft)) ** 2
         r = np.maximum(0.0, mp - mq)
         if mode == "power":
             rise = ov @ r

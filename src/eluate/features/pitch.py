@@ -15,9 +15,49 @@ Contract:
   Combined key (spec 3.3 draft 0.4, audit 04 F1 / A7): the mode comes from
   edma; when edma says minor (the modes agree) the tonic comes from edmm,
   otherwise from edma. `key` holds tonic, mode, label, score (of the profile
-  that set the tonic), `rule` ("edmm tonic, modes agree" or "edma, major") and
-  both profiles' own results; `key_edmm` / `key_edma` hold those in full
-  (tonic, mode, score, the 24 scores).
+  that set the tonic), `rule` ("edmm tonic, modes agree", "edma, major" or
+  "edmm tonic, relative minor by the bass root") and both profiles' own
+  results; `key_edmm` / `key_edma` hold those in full (tonic, mode, score, the
+  24 scores).
+  Relative-key tie-break (audit features F3, 2026-11-10): i-VI-III-VII loops
+  (Em C G D, C#m A E B) read as the relative major (G, E; A on a dense mix).
+  When edma says major and edmm's minor tonic Tm is in play (edma's own score
+  for Tm minor, and for Tm's relative major, each within KEY_REL_MARGIN of
+  edma's best), the bass decides between Tm and its relative major M: the
+  duration-weighted pitch-class histogram of the bass (`bass_profile`: the SHS
+  root on the 250 Hz low-passed M at a 10 ms hop, frames voting with their
+  calibrated confidence when the raw SHS confidence is >= BASS_HIST_MIN_CONF;
+  over beats this is the per-beat root histogram weighted by beat length, and
+  it needs no beat grid, so it exists before the band split that the
+  key-locked crossovers precede) picks the one it holds KEY_BASS_MODE_RATIO x
+  more than the other; when it holds them about equally (each chord one bar,
+  the common loop), the first stable bass root (the first run of one pitch
+  class lasting BASS_FIRST_RUN_S, gaps under BASS_RUN_GAP_S bridged) does: a
+  loop starts on its tonic: i-VI-III-VII on i, I-V-vi-IV and I-vi-IV-V on
+  I. Otherwise edma's major stands. Measured on the
+  12 fixture progressions and the audit's dense track (32 s each): 10/12 ->
+  12/12 and 9/12 -> 11/12; the clean I-IV-V(-I) and i-iv-V loops, C G Am F and
+  G Em C D still read major; Am F C G (i-VI-III-VII in A minor, formerly C)
+  now reads Am; the dense Dm Gm A Dm still reads D (a parallel-mode error the
+  bass cannot settle). `key["relative"]` records the evidence (both scores,
+  the histogram weights, the first root, the decision).
+  `confidence` (`key_confidence`, audit features F2) is
+  the product of four factors in [0, 1], reported in `confidence_factors`:
+  edma's best score through the ramp KEY_SCORE_LO .. KEY_SCORE_HI; its margin
+  over the best key with another tonic (both modes; the parallel mode always
+  scores close, Am 0.93 against A 0.88, so it is not a competitor) over
+  KEY_MARGIN_FULL; KEY_TONIC_DISAGREE when edmm's tonic is not edma's (the
+  profiles disagree on the tonic only in the relative-key ambiguities: Em / G,
+  Am / C, C#m / E); and the chroma mean's max / mean through KEY_CONTRAST_LO ..
+  KEY_CONTRAST_HI (noise and drums leave a flat chroma that still correlates
+  0.2 to 0.3 with some profile). 0 when no frame carried power (silence; DC
+  under the K-weighted loudness weights features.analyse passes); None when
+  there is no chroma. Measured: I-IV-V(-I) and i-iv-V loops 0.79 to 1.0 (clean
+  and dense), the relative-key ambiguities 0.03 to 0.37, pink noise, drums
+  only and DC 0.0; the planner keeps the fixed crossovers below about 0.5.
+  Without loudness weights `key(ctx)` weighs frames by the power of the
+  DC-removed mono signal, so DC alone gives no weight and confidence 0 there
+  too (it read as a tonal drone, chroma max / mean 3.4, confidence 0.8).
 - Chord chroma per bar: mean frame chroma over the grid frames whose centre is
   in each bar (bars from `bar_times`), plus the best major / minor triad
   template by cosine similarity, its label (e.g. "Am") and score.
@@ -125,6 +165,16 @@ SALIENCE = "shs"  # "shs" (subharmonic summation) or "hs" (borrowed harmonic sal
 CHUNK_FRAMES = 2048
 PYIN_BLOCK_S = 30.0
 PYIN_OVERLAP_S = 2.0
+KEY_SCORE_LO, KEY_SCORE_HI = 0.3, 0.8  # edma best score -> 0 .. 1 (F2; pink noise 0.29, drums 0.25, dense loops >= 0.69)
+KEY_MARGIN_FULL = 0.15     # edma margin over the best other tonic for full confidence (dense I-IV-V: 0.14 to 0.25)
+KEY_TONIC_DISAGREE = 0.4   # factor when edmm's tonic is not edma's (only the relative-key ambiguities disagree)
+KEY_CONTRAST_LO, KEY_CONTRAST_HI = 1.3, 2.0  # chroma mean max / mean -> 0 .. 1 (noise 1.1, drums 1.5, tonal >= 2.1)
+KEY_REL_MARGIN = 0.3       # relative-key tie-break (F3): edma's Tm and its relative major within this of the best
+                           # (ambiguous loops 0.02 to 0.26 below; clean major loops' relative minor 0.5 to 0.64)
+KEY_BASS_MODE_RATIO = 1.1  # the bass histogram decides when one root has this x the other's weight
+BASS_FIRST_RUN_S = 0.5     # the first stable bass root: one pitch class this long ...
+BASS_RUN_GAP_S = 0.1       # ... unvoiced gaps shorter than this bridged
+BASS_HIST_MIN_CONF = 0.6   # raw SHS confidence a frame needs to vote (calibrated P >= 0.97)
 
 
 def _pearson(a, b):
@@ -150,18 +200,158 @@ def key_from_chroma(chroma_mean: np.ndarray, profile: str = "edmm") -> dict:
             "score": float(scores[i]), "scores": scores, "profile": profile}
 
 
-def combined_key(edmm: dict, edma: dict) -> dict:
-    """Mode from edma; tonic from edmm when edma also says minor."""
+def _bass_mode(hist) -> str | None:
+    """The histogram's pitch class when it is a unique mode (KEY_BASS_MODE_RATIO x
+    the runner-up), else None."""
+    if hist is None:
+        return None
+    h = np.asarray(hist, dtype=np.float64)
+    if h.size != 12 or not np.any(h > 0):
+        return None
+    o = np.argsort(-h)
+    return NOTE_NAMES[int(o[0])] if h[o[0]] >= KEY_BASS_MODE_RATIO * h[o[1]] else None
+
+
+def combined_key(edmm: dict, edma: dict, bass_hist=None, first_root: str | None = None) -> dict:
+    """Mode from edma; tonic from edmm when edma also says minor. With `bass_hist`
+    (12 pitch-class weights) and `first_root` (`bass_profile`), the relative-key
+    tie-break of the module docstring (audit features F3) may report edmm's minor."""
+    bass_mode = _bass_mode(bass_hist)
     if edma.get("mode") is None:
         return {"tonic": None, "mode": None, "label": None, "score": np.nan, "rule": "no chroma",
-                "edmm": _brief(edmm), "edma": _brief(edma)}
-    if edma["mode"] == "minor" and edmm.get("tonic") is not None:
+                "edmm": _brief(edmm), "edma": _brief(edma), "bass_root_mode": bass_mode,
+                "relative": None}
+    mode = edma["mode"]
+    relative = None
+    if mode == "minor" and edmm.get("tonic") is not None:
         src, rule = edmm, "edmm tonic, modes agree"
     else:
         src, rule = edma, "edma, major"
-    return {"tonic": src["tonic"], "mode": edma["mode"],
-            "label": src["tonic"] + ("m" if edma["mode"] == "minor" else ""),
-            "score": src["score"], "rule": rule, "edmm": _brief(edmm), "edma": _brief(edma)}
+        if edmm.get("tonic") is not None and edma.get("tonic") is not None:
+            relative = _relative_tiebreak(edmm, edma, bass_hist, first_root)
+            if relative["decided"] == "minor":
+                src, mode = edmm, "minor"
+                rule = f"edmm tonic, relative minor by the {relative['by']}"
+    return {"tonic": src["tonic"], "mode": mode,
+            "label": src["tonic"] + ("m" if mode == "minor" else ""),
+            "score": src["score"], "rule": rule, "edmm": _brief(edmm), "edma": _brief(edma),
+            "bass_root_mode": bass_mode, "relative": relative}
+
+
+def _relative_tiebreak(edmm: dict, edma: dict, bass_hist, first_root) -> dict:
+    """The F3 evidence and decision (module docstring) for edmm's minor tonic Tm
+    against its relative major M when edma said major: "decided" is "minor",
+    "major" or None (not in play, or no bass evidence), "by" names the evidence."""
+    tm = NOTE_NAMES.index(edmm["tonic"])
+    rel_major = (tm + 3) % 12
+    sc = np.asarray(edma["scores"], dtype=np.float64)
+    best = float(np.nanmax(sc))
+    s_min, s_maj = float(sc[12 + tm]), float(sc[rel_major])
+    in_play = bool(np.isfinite(s_min) and np.isfinite(s_maj) and best - s_min <= KEY_REL_MARGIN
+                   and best - s_maj <= KEY_REL_MARGIN)
+    h = np.asarray(bass_hist if bass_hist is not None else np.zeros(12), dtype=np.float64)
+    h = h if h.size == 12 else np.zeros(12)
+    out = {"minor": edmm["tonic"] + "m", "major": NOTE_NAMES[rel_major],
+           "edma_minor_score": s_min, "edma_major_score": s_maj, "edma_best": best,
+           "in_play": in_play, "bass_minor": float(h[tm]), "bass_major": float(h[rel_major]),
+           "first_root": first_root, "decided": None, "by": None}
+    if not in_play:
+        return out
+    if h[tm] > 0 and h[tm] >= KEY_BASS_MODE_RATIO * h[rel_major]:
+        out.update(decided="minor", by="bass root histogram")
+    elif h[rel_major] > 0 and h[rel_major] >= KEY_BASS_MODE_RATIO * h[tm]:
+        out.update(decided="major", by="bass root histogram")
+    elif first_root == edmm["tonic"]:
+        out.update(decided="minor", by="first bass root")
+    elif first_root == NOTE_NAMES[rel_major]:
+        out.update(decided="major", by="first bass root")
+    return out
+
+
+def chroma_contrast(chroma_mean) -> float:
+    """max / mean of the chroma mean: 1 for a flat chroma (noise), 12 for a single
+    pitch class; 0 when the chroma is empty."""
+    c = np.maximum(np.asarray(chroma_mean, dtype=np.float64), 0.0)
+    m = c.mean() if c.size else 0.0
+    return float(c.max() / m) if np.isfinite(m) and m > 0 else 0.0
+
+
+def _ramp(v: float, lo: float, hi: float) -> float:
+    return float(np.clip((v - lo) / (hi - lo), 0.0, 1.0))
+
+
+def key_confidence(edma: dict, chroma_mean, edmm: dict | None = None, weighted: bool = True) -> dict:
+    """Confidence in [0, 1] of the key (module docstring, audit features F2), the
+    product of four factors, each in [0, 1]: `score` = edma's best Pearson score
+    through the ramp KEY_SCORE_LO -> 0, KEY_SCORE_HI -> 1; `margin` = that score
+    minus the best score among keys with another tonic (both modes; the parallel
+    mode shares the tonic and always scores close), over KEY_MARGIN_FULL;
+    `agreement` = 1 when edmm names the same tonic as edma (or has none), else
+    KEY_TONIC_DISAGREE (the two profiles disagree on the tonic only when a key and
+    its relative are close); `contrast` = the chroma mean's max / mean through
+    KEY_CONTRAST_LO -> 0, KEY_CONTRAST_HI -> 1 (noise and drums give a flat chroma
+    that still correlates 0.2 to 0.3 with some profile). `weighted` False (no frame
+    carried any power: silence, or DC under the K-weighted loudness) gives 0.
+    Returns {"value", "score", "margin", "agreement", "contrast"}; value None
+    without chroma scores. Measured (fixture loops / the audit's dense track):
+    I-IV-V and i-iv-V progressions 0.79 to 1.0, the relative-key ambiguities
+    0.03 to 0.37, pink noise, drums only and DC 0.0."""
+    scores = np.asarray(edma.get("scores", []), dtype=np.float64)
+    out = {"value": None, "score": 0.0, "margin": 0.0, "agreement": 1.0, "contrast": 0.0}
+    if scores.size != 24 or not np.any(np.isfinite(scores)):
+        return out
+    i = int(np.nanargmax(scores))
+    s1 = float(scores[i])
+    others = [scores[j] for j in range(24) if j % 12 != i % 12 and np.isfinite(scores[j])]
+    margin = s1 - max(others) if others else s1
+    out["score"] = _ramp(s1, KEY_SCORE_LO, KEY_SCORE_HI)
+    out["margin"] = _ramp(margin, 0.0, KEY_MARGIN_FULL)
+    if edmm is not None and edmm.get("tonic") is not None and edmm["tonic"] != edma.get("tonic"):
+        out["agreement"] = KEY_TONIC_DISAGREE
+    out["contrast"] = _ramp(chroma_contrast(chroma_mean), KEY_CONTRAST_LO, KEY_CONTRAST_HI)
+    v = out["score"] * out["margin"] * out["agreement"] * out["contrast"] if weighted else 0.0
+    out["value"] = float(v) if np.isfinite(v) else 0.0
+    return out
+
+
+def bass_profile(x: np.ndarray, fs: float) -> dict:
+    """The bass evidence of the relative-key tie-break (module docstring, F3):
+    {"hist": normalised 12-bin pitch-class histogram (all zeros when no frame
+    qualifies), "first_root": the first stable root's name or None}. The SHS
+    estimate on the 250 Hz low-passed M at a 10 ms hop; a frame votes with its
+    calibrated confidence when its raw SHS confidence is at least
+    BASS_HIST_MIN_CONF. Beat-free, so it is available before the band split."""
+    ms = _bands.to_ms(x)
+    sos = signal.butter(BASS_LPF_ORDER, BASS_LPF_HZ, btype="lowpass", fs=fs, output="sos")
+    pad = int(np.ceil(20 * fs / (2 * np.pi * BASS_LPF_HZ)))
+    yp = np.pad(ms[:, 0], (pad, pad))
+    lo = signal.sosfiltfilt(sos, yp, padtype=None)[pad:pad + x.shape[0]]
+    y = resample(lo, fs, BASS_FS)
+    n_frames = 1 + y.shape[0] // BASS_HOP
+    midi, conf = _shs(y, n_frames)
+    w = np.where(conf >= BASS_HIST_MIN_CONF, _calibrate(conf, CALIB_SHS), 0.0) * np.isfinite(midi)
+    hist = np.zeros(12)
+    ok = w > 0
+    first = None
+    if np.any(ok):
+        idx = np.flatnonzero(ok)
+        pc = np.round(midi[idx]).astype(np.int64) % 12
+        np.add.at(hist, pc, w[idx])
+        hist /= hist.sum()
+        hop_s = BASS_HOP / BASS_FS
+        start = 0
+        for k in range(1, idx.size + 1):
+            if k == idx.size or pc[k] != pc[start] or (idx[k] - idx[k - 1]) * hop_s > BASS_RUN_GAP_S:
+                if (idx[k - 1] - idx[start] + 1) * hop_s >= BASS_FIRST_RUN_S:
+                    first = NOTE_NAMES[int(pc[start])]
+                    break
+                start = k
+    return {"hist": hist, "first_root": first}
+
+
+def bass_pitch_classes(x: np.ndarray, fs: float) -> np.ndarray:
+    """`bass_profile(x, fs)["hist"]`."""
+    return bass_profile(x, fs)["hist"]
 
 
 def _brief(k: dict) -> dict:
@@ -422,21 +612,29 @@ def keyeq_gate(br: dict) -> tuple[bool, float]:
 
 def key(ctx: Context, frame_power=None) -> dict:
     """The key part of `analyse` (chroma, power-weighted mean, both profiles, combined
-    key): {"chroma", "chroma_mean", "key_edmm", "key_edma", "key"}. It reads neither
-    the band split nor the crossovers, so features.analyse can run it before the
-    first split (key-locked crossovers); the chroma is cached on ctx."""
+    key with the bass tie-break and its confidence): {"chroma", "chroma_mean",
+    "key_edmm", "key_edma", "key", "bass_pitch_classes"}. It reads neither the band
+    split nor the crossovers, so features.analyse can run it before the first split
+    (key-locked crossovers); the chroma and the bass histogram are cached on ctx."""
     g = ctx.grid
     ch = chroma(ctx)
     if frame_power is None:
-        y = ctx.mono_ar
+        y = ctx.mono_ar - float(np.mean(ctx.mono_ar))  # DC carries no key (and weighs nothing)
         hop = 2048
         cen = np.round(g.times * AR).astype(np.int64)
         frame_power = window_mean(y * y, cen, hop)
     w = np.where(np.isfinite(frame_power), frame_power, 0.0)
     cm = (ch * w[None, :]).sum(axis=1) / w.sum() if w.sum() > 0 else ch.mean(axis=1)
-    out = {"chroma": ch, "chroma_mean": cm,
+    if "bass_profile" not in ctx.cache:
+        ctx.cache["bass_profile"] = bass_profile(ctx.x, ctx.fs)
+    bp = ctx.cache["bass_profile"]
+    hist = bp["hist"]
+    out = {"chroma": ch, "chroma_mean": cm, "bass_pitch_classes": hist,
            "key_edmm": key_from_chroma(cm, "edmm"), "key_edma": key_from_chroma(cm, "edma")}
-    out["key"] = combined_key(out["key_edmm"], out["key_edma"])
+    out["key"] = combined_key(out["key_edmm"], out["key_edma"], hist, bp["first_root"])
+    kc = key_confidence(out["key_edma"], cm, out["key_edmm"], weighted=bool(w.sum() > 0))
+    out["key"]["confidence"] = kc.pop("value")
+    out["key"]["confidence_factors"] = kc
     return out
 
 

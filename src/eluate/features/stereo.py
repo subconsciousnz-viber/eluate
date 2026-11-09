@@ -6,21 +6,29 @@ Contract:
 - Per band and grid frame, over the 400 ms window centred on the grid time
   (in-signal samples only at the ends):
   - `corr`: Pearson correlation of L and R (means removed per window); NaN when
-    either channel's variance is below 1e-12 of full scale or the frame is gated.
+    either channel's variance is below 1e-12 of full scale, the quieter
+    channel's variance is below VAR_RATIO_FLOOR (-40 dB) of the louder one's
+    (audit features F10, spec A12: correlation is scale-invariant, so a hard-
+    panned band with -60 dB of bleed read 1.0, "mono", and got full width
+    makeup; it is not measurable), or the frame is gated.
   - `sm_ratio_db`: 10 log10(E_S / E_M), energies of S = (L - R)/sqrt2 and
     M = (L + R)/sqrt2 (not mean-removed); -inf for pure mono, +inf for pure
     antiphase.
   - `gated`: band stereo RMS sqrt(mean (L^2 + R^2)/2) > -60 dBFS.
 - Summaries over gated frames: `corr_summary[b]` = pooled Pearson coefficient
-  sum(cov) / sqrt(sum(var_L) sum(var_R)) (energy weighted); `sm_ratio_summary_db[b]`
-  = 10 log10(sum E_S / sum E_M); NaN when no frame is gated.
+  sum(cov) / sqrt(sum(var_L) sum(var_R)) (energy weighted) over the frames
+  whose correlation is measurable; `sm_ratio_summary_db[b]` = 10 log10(sum
+  E_S / sum E_M); `balance_db[b]` = 10 log10(sum var_R / sum var_L) over the
+  gated frames (the L/R balance the ratio floor judges, for the report); NaN
+  when no frame is gated (or, for the correlation, none is measurable).
 - `decoherence[b]` = clip(1 - corr_summary[b], 0, 1): 0 for mono, 1 for
   uncorrelated or anti-correlated. The multiband stage scales the high-side
   makeup by (1 - decoherence) (spec 3.5). When the correlation is not
-  measurable (a hard-panned band, one channel silent, or a silent band) it is
-  DECOHERENCE_DEFAULT = 1.0, i.e. no width makeup, and
-  `decoherence_measurable[b]` is False (audit 04 A12: NaN reached the plan,
-  whose dataclasses reject it).
+  measurable (a hard-panned band, with or without bleed under -40 dB, one
+  channel silent, or a silent band) it is DECOHERENCE_DEFAULT = 1.0, i.e. no
+  width makeup, and `decoherence_measurable[b]` is False (audit 04 A12: NaN
+  reached the plan, whose dataclasses reject it). The planner reads
+  `band_decoherence` with that default and `band_decoherence_measurable`.
 - `side_strip_suggestion(ltas_m_db, ltas_s_db, centres, ltas_ref_db)`: see
   its docstring (spec 3.3 draft 0.4, audit 04 A13).
 """
@@ -34,6 +42,7 @@ from ._common import Context, ensure_context, window_mean
 WINDOW_S = 0.4
 GATE_DBFS = -60.0
 VAR_FLOOR = 1e-12
+VAR_RATIO_FLOOR = 1e-4  # quieter / louder channel variance under this (-40 dB): hard-panned, not measurable (F10)
 SIDE_STRIP_RATIO_DB = -20.0
 SIDE_STRIP_RANGE = (60.0, 150.0)
 SIDE_STRIP_DEFAULT = 100.0
@@ -65,6 +74,10 @@ def _summaries(st: dict) -> dict:
         rms_db = 10.0 * np.log10(st["pw"])
         gated = rms_db > GATE_DBFS
         ok = gated & (st["var_l"] > VAR_FLOOR) & (st["var_r"] > VAR_FLOOR)
+        # F10: a hard-panned frame (the quieter channel under -40 dB of the louder) has
+        # a correlation that says nothing about the width the makeup would add
+        ratio = np.minimum(st["var_l"], st["var_r"]) / np.maximum(np.maximum(st["var_l"], st["var_r"]), VAR_FLOOR)
+        ok &= ratio > VAR_RATIO_FLOOR
         corr = np.where(ok, st["cov"] / np.sqrt(st["var_l"] * st["var_r"]), np.nan)
         corr = np.clip(corr, -1.0, 1.0)
         sm = np.where(gated, 10.0 * np.log10(st["e_s"] / st["e_m"]), np.nan)
@@ -75,8 +88,10 @@ def _summaries(st: dict) -> dict:
             cs = np.nan
         sms = (float(10.0 * np.log10(np.sum(st["e_s"][gated]) / np.sum(st["e_m"][gated])))
                if np.any(gated) else np.nan)
+        bal = (float(10.0 * np.log10(np.sum(st["var_r"][gated]) / np.sum(st["var_l"][gated])))
+               if np.any(gated) else np.nan)
     return {"corr": corr, "sm_ratio_db": sm, "gated": gated, "corr_summary": cs,
-            "sm_ratio_summary_db": sms}
+            "sm_ratio_summary_db": sms, "balance_db": bal}
 
 
 def decoherence_of(corr_summary: float) -> float:
@@ -132,15 +147,16 @@ def analyse(x: np.ndarray, fs: float, ctx: Context | None = None) -> dict:
     gated = np.zeros((nb, g.k), dtype=bool)
     cs = np.full(nb, np.nan)
     sms = np.full(nb, np.nan)
+    bal = np.full(nb, np.nan)
     for b, band in ctx.iter_bands():
         s = _summaries(_frame_stats(band, g.centres, length))
         corr[b], sm[b], gated[b] = s["corr"], s["sm_ratio_db"], s["gated"]
-        cs[b], sms[b] = s["corr_summary"], s["sm_ratio_summary_db"]
+        cs[b], sms[b], bal[b] = s["corr_summary"], s["sm_ratio_summary_db"], s["balance_db"]
         del band                # free this band before the iterator computes the next
     full = _summaries(_frame_stats(ctx.x, g.centres, length))
     return {
         "t": g.times, "corr": corr, "sm_ratio_db": sm, "gated": gated,
-        "corr_summary": cs, "sm_ratio_summary_db": sms,
+        "corr_summary": cs, "sm_ratio_summary_db": sms, "balance_db": bal,
         "decoherence": np.array([d if np.isfinite(d) else DECOHERENCE_DEFAULT
                                  for d in (decoherence_of(c) for c in cs)]),
         "decoherence_measurable": np.isfinite(cs),

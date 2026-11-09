@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 
 from eluate import noise
+from fixtures import synthetic as syn
 
 FS = 48000
 
@@ -80,3 +81,41 @@ def test_a_borrowed_mask_is_padded_to_a_longer_signal():
     assert np.array_equal(after["quiet"][: len(before["quiet"])], before["quiet"])
     assert not after["quiet"][len(before["quiet"]):].any()
     assert after["db"] == pytest.approx(before["db"], abs=0.01)
+
+
+def _intro_track(hiss_db, kind, seconds=10.0):
+    """A 3 s silent intro, then the groove fixture; hiss over all of it, peak 0.5."""
+    g, _ = syn.groove_track(FS, seconds)
+    g -= syn.pink_noise(g.shape[0], FS, rms_dbfs=-55.0, seed=7)     # the fixture's own bed out
+    y = np.concatenate([np.zeros((3 * FS, 2)), g])
+    if hiss_db is not None:
+        y += (syn.pink_noise(y.shape[0], FS, rms_dbfs=hiss_db, seed=99) if kind == "pink"
+              else np.random.default_rng(99).standard_normal(y.shape) * 10 ** (hiss_db / 20))
+    return y * (0.5 / np.max(np.abs(y)))
+
+
+@pytest.mark.parametrize("kind", ["white", "pink"])
+def test_loud_hiss_is_flagged_not_minus_infinity(kind):
+    """Audit features F8: hiss at -50 / -40 dBFS left no frame 35 dB under the loud level,
+    so the floor read -inf (unflagged); the noise-plateau fallback reads it, 10 dB apart."""
+    got = {h: noise.floor(_intro_track(h, kind), FS) for h in (-70.0, -60.0, -50.0, -40.0)}
+    assert got[-70.0]["db"] < noise.FLAG_DB and got[-70.0]["quiet_rule"].startswith("below loud")
+    for h in (-60.0, -50.0, -40.0):
+        assert got[h]["db"] >= noise.FLAG_DB, (h, got[h]["db"])
+    for h in (-50.0, -40.0):
+        assert got[h]["quiet_rule"] == "noise plateau" and got[h]["may_include_music"]
+        assert got[h]["quiet_s"] >= 1.5 and all(e <= 3.1 for _, e in got[h]["quiet_spans"])  # the intro
+        assert noise.assess(got[h], got[h])["status"] == "present"
+    assert got[-40.0]["db"] - got[-50.0]["db"] == pytest.approx(10.0, abs=1.0)
+    assert got[-50.0]["db"] - got[-60.0]["db"] == pytest.approx(10.0, abs=1.0)
+
+
+def test_music_without_a_noise_plateau_reads_no_floor():
+    """The F8 fallback needs a stationary, noise-like run well under the loud level: a
+    held chord breakdown 14 dB down, a beatless pad and a clean intro do not qualify."""
+    g, _ = syn.groove_track(FS, 8.0)
+    y = np.concatenate([g, 0.2 * syn.sustained_chord(FS, 4.0), g])
+    assert noise.floor(y, FS)["db"] == float("-inf")
+    assert noise.floor(syn.ambient_pad(FS, 10.0), FS)["db"] == float("-inf")
+    clean = noise.floor(_intro_track(None, "white"), FS)
+    assert clean["db"] < -120.0 and clean["quiet_rule"].startswith("below loud")

@@ -52,6 +52,25 @@ def test_plan_inputs(result, track):
     assert pi["edges"]["abrupt_start"]  # the fixture starts on a kick at full level
     assert pi["bass_root_midi"].size == pi["beat_times"].size
     assert np.all(pi["bass_root_midi"][np.isfinite(pi["bass_root_midi"])] == 33)  # A1, 55 Hz
+    # audit features F1 / F2: the grid's evidence and the key's confidence reach the plan
+    assert pi["grid_informative"] and pi["grid_reason"].startswith("an onset at")
+    assert pi["grid_evidence"]["beat_onset_coverage"] >= 0.9
+    assert pi["key_confidence"] is None or 0.0 <= pi["key_confidence"] <= 1.0
+    assert pi["key_confidence"] == pi["key"].get("confidence")
+
+
+def test_key_lock_receives_the_key_record():
+    """Audit features F2: a fcs_from_key taking `key` (or `key_confidence`) gets the
+    confidence, so the planner can keep the fixed crossovers on a weak key."""
+    from eluate.features import _fcs_from_key
+    rec = {"tonic": "A", "confidence": 0.3}
+    assert _fcs_from_key(lambda tonic, key=None: (tonic, key["confidence"]), rec) == ("A", 0.3)
+    assert _fcs_from_key(lambda tonic, key_confidence=None: (tonic, key_confidence), rec) == ("A", 0.3)
+    assert _fcs_from_key(lambda tonic: tonic, rec) == "A"
+    r = analyse(syn.pink_noise(FS * 4, FS, seed=1), FS,
+                fcs_from_key=lambda tonic, key=None: (60.0, 240.0, 960.0, 3840.0)
+                if key["confidence"] is not None and key["confidence"] >= 0.5 else (100.0, 400.0, 1600.0, 6400.0))
+    assert r["meta"]["key_confidence"] < 0.4 and r["meta"]["crossovers"] == (100.0, 400.0, 1600.0, 6400.0)
 
 
 @pytest.mark.slow

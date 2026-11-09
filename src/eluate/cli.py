@@ -13,8 +13,8 @@ Contract:
   work/analysis.json (arrays summarised as shape / min / max / mean) and
   work/source.json (input path, size, mtime, the audio file's SHA-256, fs,
   length, the crossovers used, the crossovers requested (null = key-locked),
-  bpm, R_ref, the input gain and ANALYSIS_VERSION). The audio is read in place
-  and never copied.
+  bpm, R_ref, the input gain, ANALYSIS_VERSION and the analysis sources' hash,
+  `analysis_code`). The audio is read in place and never copied.
 - `eluate plan work/ [--tilt T] [--target-rms R] [--preserve]
   [--xover ...] [--subside F]` writes work/plan.json +
   work/plan.npz (realised on the source audio), work/targets.json and
@@ -26,8 +26,8 @@ Contract:
   [--max-renders N] [--bpm B]`: analyse (reusing out/features.npz when
   source.json matches the audio's SHA-256, the requested crossovers (a
   key-locked analysis is reused for a request without --xover, whatever
-  crossovers the key gave), bpm, R_ref and ANALYSIS_VERSION, and it loads; on reuse source.json
-  takes the input's current path), plan, solve, write
+  crossovers the key gave), bpm, R_ref, ANALYSIS_VERSION and `analysis_code`, and it loads; on
+  reuse source.json takes the input's current path), plan, solve, write
   out/master.wav (24-bit PCM, or 16-bit with TPDF dither at 44.1 kHz under --cd:
   plan.output, the samples the solver measured), out/plan.json, out/solve.json, the report
   with A/B, and out/run.json (runtime per phase, peak memory, solver
@@ -159,7 +159,12 @@ def _requested(crossovers) -> list | None:
 # change to planner.analyse or eluate.features alters what the analysis holds (a value,
 # a field added or removed), so every cached features.npz is analysed again once.
 # 1: first versioned cache (S2 tempo octave decision, noise_floor_db).
-ANALYSIS_VERSION = 1
+# 2: grid evidence, key confidence, noise fallback, adaptive kick gate (audit features, 2026-11-10).
+# Since 2026-11-10 the cache also carries `analysis_code`, a SHA-256 over the analysis
+# sources (ANALYSIS_SOURCES: eluate/features/*, noise.py, planner.py), so a code change
+# that forgets the bump still invalidates every cache (audit features F20).
+ANALYSIS_VERSION = 2
+ANALYSIS_SOURCES = ("eluate/features/", "eluate/noise.py", "eluate/planner.py")
 
 
 def _source_record(path: Path, fs: int, n: int, analysis: dict, crossovers=None,
@@ -172,7 +177,7 @@ def _source_record(path: Path, fs: int, n: int, analysis: dict, crossovers=None,
     st = path.stat()
     meta = analysis["meta"]
     inp = meta.get("input") or {}
-    return {"analysis_version": ANALYSIS_VERSION,
+    return {"analysis_version": ANALYSIS_VERSION, "analysis_code": analysis_code_hash(),
             "path": str(path.resolve()), "size": st.st_size, "mtime": st.st_mtime,
             "sha256": file_sha256(path), "fs": int(fs), "n": int(n),
             "source_fs": int(source_fs if source_fs is not None else fs),
@@ -338,14 +343,17 @@ def _matches(src_file: Path, inp: Path, bpm: float | None = None, crossovers=Non
     requested crossovers (None = key-locked: the crossovers the key gave are a function
     of the audio, so they need no check of their own), bpm, R_ref, the same delivery
     resampling (resampled_to; an analysis of the file at its own rate never serves a
-    --cd run, nor the other way round) and the analysis code's version. A source.json
-    from before input normalisation (no r_ref_dbfs) or of another ANALYSIS_VERSION (or
-    none) never matches."""
+    --cd run, nor the other way round), the analysis code's version and its source hash
+    (`analysis_code`, audit features F20). A source.json from before input normalisation
+    (no r_ref_dbfs), of another ANALYSIS_VERSION (or none) or of other analysis sources
+    never matches."""
     if not src_file.exists():
         return False
     try:
         s = json.loads(src_file.read_text(encoding="utf-8"))
         if s.get("analysis_version") != ANALYSIS_VERSION:
+            return False
+        if s.get("analysis_code") != analysis_code_hash():
             return False
         if ("crossovers_requested" not in s or s["crossovers_requested"] != _requested(crossovers)
                 or s.get("r_ref_dbfs") != planner.R_REF_DBFS):
@@ -384,6 +392,17 @@ def source_hashes() -> dict:
     root = Path(__file__).resolve().parent
     return {str(p.relative_to(root.parent)).replace("\\", "/"):
             hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(root.rglob("*.py"))}
+
+
+def analysis_code_hash() -> str:
+    """One SHA-256 over the per-file hashes of the analysis sources (ANALYSIS_SOURCES,
+    paths relative to src/): the cache key's code part (audit features F20)."""
+    import hashlib
+    h = hashlib.sha256()
+    for name, digest in source_hashes().items():
+        if any(name.startswith(prefix) for prefix in ANALYSIS_SOURCES):
+            h.update(f"{name}:{digest}\n".encode("utf-8"))
+    return h.hexdigest()
 
 
 def do_master(inp: Path, out: Path, controls: planner.Controls, master_ref: Path | None = None,
@@ -841,7 +860,24 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _user_cache_dir() -> Path:
+    """The per-user cache directory: %LOCALAPPDATA% on Windows, ~/Library/Caches on
+    macOS, $XDG_CACHE_HOME or ~/.cache elsewhere; eluate's subfolder of it."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = str(Path.home() / "Library" / "Caches")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "eluate"
+
+
 def main(argv=None) -> int:
+    # librosa's pYIN is numba-compiled on first use (about a minute cold, audit features F19);
+    # a user cache dir keeps the compiled code across runs whatever the install's
+    # writability (the desktop shell sets its own; numba reads this when first imported)
+    if not os.environ.get("NUMBA_CACHE_DIR"):
+        os.environ["NUMBA_CACHE_DIR"] = str(_user_cache_dir() / "numba")
     args = build_parser().parse_args(argv)
     log = lambda m: print(m, flush=True)  # noqa: E731
     try:

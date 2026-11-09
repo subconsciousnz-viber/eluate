@@ -235,3 +235,43 @@ def test_chord_tone_rule():
     assert resonance._chord_tone(311.13, on, None, chords)[0] is False          # D#: in none
     assert resonance._chord_tone(311.13, on, {"label": "D#m"}, chords)[0] is True  # tonic triad
     assert resonance._chord_tone(452.0, on, None, chords)[0] is False           # 47 cents off A
+
+
+def test_injected_ring_with_a_key_and_chords(ring_in_pink):
+    """The F12 rules leave the spec gate's ring alone when a key and chords are given
+    (A minor: the 7 kHz ring is 10 cents from A8, and pink noise holds no note whose
+    harmonic it could be)."""
+    _, y, meta = ring_in_pink
+    chords = [{"start": float(b), "end": float(b + 2.0), "chord": "Am"} for b in np.arange(0, 20, 2.0)]
+    r = [r for r in resonance.analyse(y, FS, key={"label": "Am"}, chords=chords)["resonances"]
+         if abs(r["f0"] / 7000.0 - 1.0) < 0.01]
+    assert len(r) == 1 and r[0]["harmonic_of"] is None and r[0]["flag"] in ("resonance", "musical")
+    assert abs(r[0]["start"] - meta["start_s"]) < 0.2 and abs(r[0]["end"] - meta["end_s"]) < 0.2
+
+
+@pytest.mark.parametrize("f0", [300.0, 450.0])
+def test_low_ring_has_no_span_at_the_file_start(f0):
+    """Audit features F13: rings at 300 and 450 Hz present over 9 to 21 s also read
+    present at 0.0 to 0.26 s (the half-empty first window's shape, replicated by the
+    moving mean), so `start` was 0; padded frames now carry no weight."""
+    x = syn.pink_noise(FS * 20, FS, seed=11)
+    y, _ = syn.add_ring(x, FS, f0=f0, q=12.0, gain_db=9.0, start_s=6.0, end_s=14.0)
+    r = [r for r in resonance.analyse(y, FS)["resonances"] if abs(r["f0"] / f0 - 1.0) < 0.01]
+    assert len(r) == 1
+    assert abs(r[0]["start"] - 6.0) < 1.0 and r[0]["spans"][0][0] > 5.0
+    on = (np.arange(r[0]["excess_db"].size) + 0.5) * 0.1
+    assert np.all(r[0]["excess_db"][on < 4.0] == 0.0)
+
+
+@pytest.mark.slow
+def test_dense_loop_renders_no_notch():
+    """Audit features F12: a dense loop with no resonance (kick, hats, bass, pad, a
+    detuned supersaw, a 16th arpeggio) had notches rendered at 1832 Hz (7th harmonic of
+    C4), 2198 Hz (5th of A4) and 19.3 kHz (a one-sided baseline at the roll-off)."""
+    from eluate import planner
+    x, _ = syn.dense_loop(44100, 48.0)
+    a = planner.analyse(x, 44100)
+    _, rows, merged = planner.plan_notches(a)
+    assert merged == [], [(r["f0_hz"], r["flag"], r["reason"]) for r in rows]
+    flags = {r["flag"] for r in a["resonance"]["resonances"]}
+    assert "harmonic" in flags or "hf_exempt" in flags

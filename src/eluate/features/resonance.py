@@ -23,6 +23,12 @@ Contract:
   at a 9 dB excess threshold (at 6 dB its ~2 periodograms fire on noise); on
   the tested fixtures it adds no detection the long pass misses
   (brief-04 D.24).
+  Frames whose window is more than EDGE_PAD_MAX zero padding (the first and
+  last one at hop N / 4) carry no weight in the time average, like inactive
+  frames (audit features F13): the moving mean replicates the end frames, so
+  at N = 16384 the half-empty first window's shape filled the first 0.26 s,
+  and rings at 300 and 450 Hz present over 9 to 21 s read present there too
+  (`start` 0, a cut at the file start).
 - Baseline (spec 3.3 draft 0.4: flank median): per frame, the mean of two
   medians in dB over the flanks [f 2^-1/2, f 2^-1/6] and [f 2^1/6, f 2^1/2] (a
   1-octave window with its central 1/3 octave excluded; a linear slope
@@ -60,7 +66,7 @@ Contract:
   about 0.4). Spans: frame presence after closing gaps < 0.25 s and dropping
   runs < 0.25 s, unioned over the merged members.
 - Classification (`flag`, `depth_scale`):
-  Order: sub_exempt, tonal, musical, resonance.
+  Order: sub_exempt, tonal, hf_exempt, harmonic, musical, resonance.
   - "sub_exempt" (depth 0): f0 < 80 Hz, or 80 to 150 Hz with no section at
     >= 50 % persistence (spec 3.3 draft 0.4, audit 04 F6). From 80 to 150 Hz
     the depth scale of a flagged candidate is halved.
@@ -84,6 +90,20 @@ Contract:
     resonance raises broadband content by its filter's gain and is as wide as
     the filter; on five real premasters every candidate above 24 dB was a bass
     or chord tone (40 to 66 dB).
+  - "hf_exempt" (depth 0; audit features F12): f0 above HF_STRICT_HZ unless
+    its baseline is two-sided (the upper flank inside the kept bins, so only
+    at 88.2 kHz and above) and its peak excess at least HF_EXCESS_DB. Up there
+    a one-sided baseline reads the uneven roll-off of hats and air as peaks:
+    a dense synthetic loop with no resonance had a 19.3 kHz candidate (excess
+    12.4 dB, lower flank only) rendered as a 3 dB notch.
+  - "harmonic" (depth 0; audit features F12): a partial of the arrangement's
+    own notes. For some k in HARMONIC_K the sub-harmonic f0 / k is itself
+    present as a peak over at least PARTIAL_FRACTION of the candidate's
+    frames and is a chord tone (the chord-invariance test below, on f0 / k).
+    On the dense loop the 7th harmonic of C4 (1832 Hz) and the 5th of A4
+    (2198 Hz) of a detuned supersaw, which the ladder misses (the detuned
+    voices smear its partials), were rendered as notches. A ring in noise,
+    between a note's partials or above an absent note does not qualify.
   - "musical" also when the chord-invariance check passes (`_chord_tone`, with
     `key` and `chords` from pitch.py): the pitch class within 35 cents of equal
     temperament is in the key's tonic triad or in the triad of at least half of
@@ -96,7 +116,7 @@ Contract:
   excess_db (common grid, 0 where absent), excess_max_db, persistence (per
   section), flag, depth_scale, channel, channels_seen, partials, series,
   resolution (N), ladder_fraction, ladder_m, ladder_b, members, line,
-  bw_peak_hz, chord_tone, chord_share.
+  bw_peak_hz, chord_tone, chord_share, harmonic_of ({"k", "f_hz"} or None).
 """
 
 from __future__ import annotations
@@ -134,6 +154,9 @@ LINE_BINS = 3.0         # -3 dB width at or under 3 bins: a line, i.e. a held to
 EXCESS_TONAL_DB = 24.0  # above this a peak is a sustained tone, not a filter boost (brief-04 D.33)
 Q_FIT_MIN = 2.0         # a fitted half-dB Q below this is a shelf or a bump, not narrowband
 CHORD_CENTS = 35.0
+HF_STRICT_HZ = 16000.0   # above this ... (F12)
+HF_EXCESS_DB = 12.0      # ... a resonance needs this peak excess
+HARMONIC_K = (2, 3, 4, 5, 6, 7, 8)  # "harmonic": f0 / k a present chord tone (F12)
 CHORD_SHARE = 0.5
 COHERENCE = "ladder"  # "ladder" (default, borrowed HNR ladder), "peaks" or "either"
 LADDER_MIN = 0.1
@@ -145,6 +168,7 @@ SHORT_PASS_BELOW_HZ = 500.0
 SHORT_SMOOTH_S = 0.5
 SHORT_EXCESS_DB = 9.0  # about 2 periodograms in 0.5 s at N = 16384: 6 dB fires on noise
 FLANK_MIN_BINS = 3
+EDGE_PAD_MAX = 0.2  # a frame more than this zero padding carries no weight in the time average (F13)
 SPEC_PARTIALS = (2.0, 3.0, 4.0, 1 / 2, 1 / 3, 1 / 4)
 SERIES_M = range(2, 33)
 BASE_STEP_OCT = 1.0 / 24.0
@@ -172,12 +196,15 @@ class _Res:
             smooth_s = max(SMOOTH_S, SMOOTH_FRAMES * self.n / fs)
         self.smooth_s = smooth_s
         smooth = max(1, int(round(smooth_s * fs / self.hop)))
+        # frames whose window is mostly zero padding (the file's ends) weigh nothing (F13)
+        c = np.arange(self.t.size) * self.hop
+        pad = (np.maximum(0, self.n // 2 - c) + np.maximum(0, c + self.n // 2 - x.shape[0])) / self.n
         tot = p.sum(axis=1)
         act = (tot > tot.max() * 10 ** (-FRAME_RANGE_DB / 10)) if tot.max() > 0 else np.zeros(tot.shape, bool)
         # activity-weighted mean of the unit-power spectral shapes: silent frames
         # neither count nor dilute (audit 04 A4); a frame is active when its
         # window's weight is mostly active
-        w = act.astype(np.float64)
+        w = (act & (pad <= EDGE_PAD_MAX)).astype(np.float64)
         wsum = uniform_filter1d(w, smooth, mode="nearest")
         self.active = wsum > 0.5
         # in place, same operations in the same order as the expression form
@@ -777,12 +804,23 @@ def analyse(x: np.ndarray, fs: float, ctx: Context | None = None, sections=None,
         fit_ok = np.isfinite(c["q"]) and np.isfinite(c["q_unc"]) and c["q_unc"] < 0.5 * c["q"]
         broad = fit_ok and c["q"] < Q_FIT_MIN
         chord_tone, chord_share = _chord_tone(f0, c["on_t"], key, chords)
+        harmonic_of = None
+        if key or chords:
+            for kh in HARMONIC_K:
+                fk = f0 / kh
+                if fk >= 30.0 and _chord_tone(fk, c["on_t"], key, chords)[0] and partial(fk):
+                    harmonic_of = {"k": kh, "f_hz": float(fk)}
+                    break
         if broad:
             continue  # a shelf-like bump (e.g. at a mix's high-frequency rolloff), not narrowband
         if f0 < SUB_EXEMPT_HZ or (low and max(c["persistence"]) < LOW_PERSISTENCE):
             flag, depth = "sub_exempt", 0.0
         elif line or ex_max > EXCESS_TONAL_DB:
             flag, depth = "tonal", 0.0
+        elif f0 > HF_STRICT_HZ and (ex_max < HF_EXCESS_DB or f0 * 2 ** (BASELINE_OCT / 2) > r.f[-1]):
+            flag, depth = "hf_exempt", 0.0
+        elif harmonic_of is not None:
+            flag, depth = "harmonic", 0.0
         elif musical or chord_tone:
             flag, depth = "musical", MUSICAL_DEPTH_SCALE
         else:
@@ -801,7 +839,7 @@ def analyse(x: np.ndarray, fs: float, ctx: Context | None = None, sections=None,
             "partials": present, "series": series_hit, "resolution": r.n,
             "ladder_fraction": lad, "ladder_m": lad_m, "ladder_b": lad_b, "members": c["members"],
             "line": bool(line), "bw_peak_hz": float(bw_peak), "chord_tone": bool(chord_tone),
-            "chord_share": float(chord_share),
+            "chord_share": float(chord_share), "harmonic_of": harmonic_of,
         })
     return {"t": g.times, "resonances": out, "sections": sections,
             "params": {"excess_db": EXCESS_DB, "q_min": Q_MIN, "persistence": PERSISTENCE,
