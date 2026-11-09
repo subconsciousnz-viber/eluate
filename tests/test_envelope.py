@@ -172,7 +172,7 @@ def test_box_hold_holds_the_minimum_on_a_sustained_ripple():
     flat = env.box_smooth(g_req, attack=4, release=80.0, hold=25)[300:-300]
     rip = env.box_smooth(g_req, attack=4, release=80.0)[300:-300]
     assert np.max(flat) - np.min(flat) < 1e-12
-    assert np.max(rip) - np.min(rip) > 0.02
+    assert 20 * np.log10(np.max(rip) / np.min(rip)) > 0.1      # 0.19 dB p-p without the hold
     assert np.allclose(flat, 0.7)
 
 

@@ -454,6 +454,9 @@ LIMITER_RELEASE_MIN_MS = 80.0    # D7: faster limiter releases ripple on sustain
 # (sub 100 ms, low 80, the rest 50; speclim keeps SPECLIM_RELEASE_MS), and every band
 # detector reads the peak over one period of its lower edge (multiband.detector_window_ms).
 LIMITER_HOLD_MS = 25.0
+# planner audit S4-6: the 8x limiter aims this far under the ceiling (LimiterPlan.aim_margin_db)
+# so the base-rate re-limit stays the exception (it took 0.29 dB on 98 % of the 30 s loop)
+LIMITER_AIM_MARGIN_DB = 0.03
 CEILING_RELEASE_MS = (100.0, 80.0, 50.0, 50.0, 50.0)   # band ceilings, low to high
 XOVER_PHASES = ("minimum", "zero")   # Controls.xover_phase: the lowest crossover (xover_phases)
 
@@ -2287,7 +2290,8 @@ def plan_from_analysis(analysis: dict, controls: Controls, x: np.ndarray | None 
                       speclim_allow_db=prof["speclim_allow_db"] if controls.speclim else None,
                       speclim_max_cut_db=prof["speclim_max_cut_db"],
                       speclim_lookahead_ms=ch["speclim_lookahead_ms"],
-                      hold_ms=ch["limiter_hold_ms"], **clip)
+                      hold_ms=ch["limiter_hold_ms"], aim_margin_db=LIMITER_AIM_MARGIN_DB,
+                      **clip)
     plan = Plan(fs=fs, preserve_mix=controls.preserve_mix,
                 input=None if inp is None else InputPlan(**inp), inputeq=inputeq, notch=notch,
                 sidestrip=side, multiband=mb, tone=None, saturate=sat,

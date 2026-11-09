@@ -58,14 +58,16 @@ is computed here.
 5. Limiter at 8x: detector = max over channels of |u_bl| (stereo-linked),
    g = envelope.box_smooth (or qp_smooth) of required_gain(detector, C), attack
    attack_ms, release release_ms at the 8x rate. y = resample.decimate(u_bl g, 8).
-   The 8x limiter aims at C' = C - AIM_MARGIN_DB (0.03 dB, 2026-11-10): after the
-   decimation the 8x / 32x / Annex 2 meters read a limited peak a few hundredths of
-   a dB above the 8x detector's (the decimation filter's ringing on the gain-shaped
-   waveform), so a limiter aimed exactly at C handed nearly every hit to the base-rate
-   re-limit below (planner audit S4-6: 0.29 dB on 98 % of the samples of the synthetic
-   loop). With the margin the re-limit is the exception again (measured below 1 % of
-   the samples on that loop, docs/gain-staging.md 21). The margin is a constant, not a
-   plan field; the reported `max_gain_reduction_db` includes it.
+   Aim margin (plan.aim_margin_db, 2026-11-10, planner audit S4-6): the 8x limiter
+   aims at C' = C - aim_margin_db. After the decimation the 8x / 32x / Annex 2 meters
+   read a limited peak a few hundredths of a dB above the 8x detector's (the
+   decimation filter's ringing on the gain-shaped waveform), so a limiter aimed
+   exactly at C handed nearly every hit to the base-rate re-limit below (0.29 dB on
+   98 % of the samples of the synthetic loop). The planner writes AIM_MARGIN_DB
+   (0.03 dB); with it the re-limit is the exception again (docs/gain-staging.md 21).
+   None or 0 (plans made before) aims at C, bit for bit. The reported
+   `max_gain_reduction_db` includes the margin; the solver's budget arithmetic
+   (P + g - C) does not, an under-read of at most the margin.
    Hold (plan.hold_ms, 2026-11-10, audio-rate audit F2): the lookahead minimum of
    box_smooth is held `hold_ms` past each peak (envelope.box_smooth hold, at the 8x
    rate), so on a sustained 30 to 40 Hz sub at 3 dB of GR the gain no longer recovers
@@ -78,19 +80,24 @@ is computed here.
    the per-sample peak envelope E = max(8x true-peak envelope, 32x FFT envelope, 4x
    BS.1770 Annex 2 envelope) of y; where E exceeds C, g2 = box_smooth(required_gain(E, C - 0.005 dB))
    at base rate with the same attack / release and hold, y *= g2. The gain is 1 away
-   from the excess, so the rest of the track is untouched (to the rounding of
-   the FFT-convolution resampler, below 1e-12). info["relimit"] = {"passes",
-   "max_db" (the largest reduction of any pass), "samples" and "fraction" (the share of
-   base samples whose cumulative re-limit gain is below 1: the release hull keeps a
-   sample "touched" for about 36 release times after an over, so the fraction is a
-   measure of how often the re-limit has to act)}; the per-pass list stays in
-   info["relimit_passes"]. The solver's blocked limiter (solver.limit_blocked) calls
+   from the excess and its release tail, so the rest of the track is untouched (to
+   the rounding of the FFT-convolution resampler, below 1e-12). info["relimit"] =
+   {"passes", "max_db" (the largest reduction of any pass), "samples" and "fraction"
+   (the share of base samples whose cumulative re-limit gain is below 1: the release
+   hull keeps a sample "touched" for about 33 release times after any over, however
+   small) and "fraction_over_0p01_db" (the share reduced by more than 0.01 dB)}; the
+   per-pass list stays in info["relimit_passes"]. What still triggers the re-limit
+   with the aim margin is meter disagreement, not overshoot: on HF-rich peaks at the
+   ceiling the 8x Kaiser true-peak meter reads up to 0.4 dB above the exact 32x FFT
+   envelope (synthetic loop, hats at the ceiling: 8x 1.045, 32x 1.0004, Annex 2 1.008
+   x the ceiling at the worst sample), and the re-limit holds the worst of the three
+   (docs/gain-staging.md 21). The solver's blocked limiter (solver.limit_blocked) calls
    `relimit` and reads `aim` and `hold_samples`, so the two paths stay identical.
 7. Last resort: if max(8x, 32x) true peak still exceeds C, one global trim
    onto C, reported in info["trim_db"]; never seen in the tests.
 info["detector_peak_dbfs"] is the peak of the limiter's 8x detector (after the
 input gain, the clipper and the band-limit): the limiter's own peak GR is
-max(0, that - (ceiling_dbtp - AIM_MARGIN_DB)), exactly, since box_smooth keeps the
+max(0, that - (ceiling_dbtp - aim_margin_db)), exactly, since box_smooth keeps the
 minimum of the required gain (envelope.py).
 Memory: whole-track 8x arrays (about 2.6 GB of allocations per minute of
 stereo); the blocked version is workstream E's (spec 1).
@@ -116,7 +123,8 @@ FFT_EDGE_TAIL = 256     # base samples of silence read either side of the track
 BL_MARGIN = 512         # base samples of context around a clipped span (2 x 182-tap half-length)
 RELIMIT_PASSES = 4
 RELIMIT_MARGIN_DB = 0.005
-AIM_MARGIN_DB = 0.03      # the 8x limiter aims this far under the ceiling (module contract 5)
+AIM_MARGIN_DB = 0.03      # the planner's plan.aim_margin_db (module contract 5)
+RELIMIT_TOUCH_GAIN = 10.0 ** (-0.01 / 20.0)   # info["relimit"]["fraction_over_0p01_db"]
 ATTACK_FLOOR = 2          # samples: box_smooth with attack < 2 does no smoothing
 KNEE_BELOW_DB = 1.0       # knee may start this far below the ceiling at 3 dB depth
 CLIP_TARGET_DB = 1.0      # whole-signal clipper: peak reduction aimed at (gain-staging 3)
@@ -387,9 +395,11 @@ def hold_samples(plan: LimiterPlan, rate_hz: float) -> int:
     return 0 if h is None else int(round(float(h) * 1e-3 * rate_hz))
 
 
-def aim(ceiling: float) -> float:
-    """The level the 8x limiter aims at: the ceiling (linear) less AIM_MARGIN_DB."""
-    return ceiling * 10.0 ** (-AIM_MARGIN_DB / 20.0)
+def aim(ceiling: float, plan: LimiterPlan) -> float:
+    """The level the 8x limiter aims at: the ceiling (linear) less plan.aim_margin_db
+    (None = 0: the ceiling itself, bit for bit)."""
+    m = getattr(plan, "aim_margin_db", None)
+    return ceiling if not m else ceiling * 10.0 ** (-float(m) / 20.0)
 
 
 def _smooth(g_req, attack, release, smoother, hold: int = 0):
@@ -411,16 +421,15 @@ def relimit(y: np.ndarray, fs: float, plan: LimiterPlan, ceiling: float):
     a_base = max(ATTACK_FLOOR, int(round(plan.attack_ms * 1e-3 * fs)))
     r_base = plan.release_ms * 1e-3 * fs
     h_base = hold_samples(plan, fs)
-    touched = None
+    g_tot = None
     for _ in range(RELIMIT_PASSES):
         if e.size == 0 or e.max() <= ceiling:
             break
         g2 = envelope.box_smooth(envelope.required_gain(e, target), attack=a_base,
                                  release=r_base, hold=h_base)
         y = y * g2[:, None]
-        under = g2 < 1.0
-        touched = under if touched is None else (touched | under)
-        passes.append({"samples": int(np.count_nonzero(under)),
+        g_tot = g2 if g_tot is None else g_tot * g2
+        passes.append({"samples": int(np.count_nonzero(g2 < 1.0)),
                        "max_reduction_db": float(-20.0 * np.log10(g2.min()))})
         e8, e32, e4 = _peak_envelopes(y, fs)
         e = np.maximum(np.maximum(e8, e32), e4)
@@ -430,11 +439,13 @@ def relimit(y: np.ndarray, fs: float, plan: LimiterPlan, ceiling: float):
     if worst > plan.ceiling_dbtp:
         trim_db = plan.ceiling_dbtp - worst
         y = y * 10.0 ** (trim_db / 20.0)
-    n_touched = 0 if touched is None else int(np.count_nonzero(touched))
+    n_touched = 0 if g_tot is None else int(np.count_nonzero(g_tot < 1.0))
+    n_heard = 0 if g_tot is None else int(np.count_nonzero(g_tot < RELIMIT_TOUCH_GAIN))
     summary = {"passes": len(passes),
                "max_db": max([p["max_reduction_db"] for p in passes], default=0.0),
                "samples": n_touched,
-               "fraction": float(n_touched / y.shape[0]) if y.shape[0] else 0.0}
+               "fraction": float(n_touched / y.shape[0]) if y.shape[0] else 0.0,
+               "fraction_over_0p01_db": float(n_heard / y.shape[0]) if y.shape[0] else 0.0}
     return y, {"true_peak_8x_before_relimit_dbtp": tp8_0,
                "true_peak_32x_before_relimit_dbtp": tp32_0, "relimit_passes": passes,
                "relimit": summary, "true_peak_8x_dbtp": tp8 + trim_db,
@@ -473,7 +484,7 @@ def apply_with_info(x: np.ndarray, fs: float, plan: LimiterPlan):
     del uc
     det = np.max(np.abs(u), axis=1)
     det_peak = _db(det.max(initial=0.0))
-    g_req = envelope.required_gain(det, aim(ceiling))
+    g_req = envelope.required_gain(det, aim(ceiling, plan))
     attack = max(ATTACK_FLOOR, int(round(plan.attack_ms * 1e-3 * fs_up)))
     release = plan.release_ms * 1e-3 * fs_up
     g, qp_info = _smooth(g_req, attack, release, plan.smoother, hold_samples(plan, fs_up))

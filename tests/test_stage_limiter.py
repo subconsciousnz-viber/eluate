@@ -64,16 +64,31 @@ def test_hold_removes_the_sub_cycle_ripple(f0):
 
 
 def test_aim_margin_is_in_the_reported_gr():
-    """The 8x limiter aims AIM_MARGIN_DB under the ceiling: its reported GR on a steady
-    over is the over plus the margin, and the output's 8x true peak sits at the aim."""
+    """plan.aim_margin_db (planner audit S4-6): the 8x limiter aims the margin under the
+    ceiling: its reported GR on a steady over is the over plus the margin, the output's 8x
+    true peak sits at the aim and nothing is left for the re-limit. None aims at the
+    ceiling (plans made before), bit for bit the same as 0."""
     fs = FS
     t = np.arange(3 * fs) / fs
     x = np.stack([0.5 * np.sin(2 * np.pi * 1000 * t)] * 2, axis=1)   # -6 dBFS
-    _, info = limiter.apply_with_info(x, fs, LimiterPlan(ceiling_dbtp=-1.0, input_gain_db=8.0))
+    m = limiter.AIM_MARGIN_DB
+    base = LimiterPlan(ceiling_dbtp=-1.0, input_gain_db=8.0)
+    _, info = limiter.apply_with_info(x, fs, LimiterPlan(**{**base.__dict__, "aim_margin_db": m}))
     over = -6.02 + 8.0 + 1.0
-    assert info["max_gain_reduction_db"] == pytest.approx(over + limiter.AIM_MARGIN_DB, abs=0.02)
-    assert info["true_peak_8x_dbtp"] == pytest.approx(-1.0 - limiter.AIM_MARGIN_DB, abs=0.01)
-    assert info["relimit"]["passes"] == 0 and info["relimit"]["fraction"] == 0.0
+    assert info["max_gain_reduction_db"] == pytest.approx(over + m, abs=0.02)
+    assert info["true_peak_8x_dbtp"] == pytest.approx(-1.0 - m, abs=0.01)
+    assert info["relimit"] == {"passes": 0, "max_db": 0.0, "samples": 0, "fraction": 0.0,
+                               "fraction_over_0p01_db": 0.0}
+    y0, i0 = limiter.apply_with_info(x, fs, base)
+    assert base.aim_margin_db is None
+    assert i0["max_gain_reduction_db"] == pytest.approx(over, abs=0.02)
+    assert np.array_equal(y0, limiter.apply(x, fs, LimiterPlan(**{**base.__dict__,
+                                                                 "aim_margin_db": 0.0})))
+    for bad in (-0.01, 1.5, float("nan")):
+        with pytest.raises(ValueError):
+            LimiterPlan(aim_margin_db=bad)
+    from eluate import planner
+    assert planner.LIMITER_AIM_MARGIN_DB == m
 
 
 def _fractional_impulses(n, fs, period_s, amp, rng):
@@ -163,19 +178,19 @@ def test_clipper_with_hf_content_at_onset(fs):
     assert info["max_gain_reduction_db"] < i0["max_gain_reduction_db"]
 
 
-def test_local_relimit_leaves_the_rest_untouched(monkeypatch):
+def test_local_relimit_leaves_the_rest_untouched():
     """The re-limit acts only around the excess: a quiet section 0.6 s before the only
     hot event equals (to rounding) the same section rendered alone through the limiter.
-    The 8x limiter is aimed exactly at the ceiling here (no AIM_MARGIN_DB) so that the
-    re-limit has something to do on this stimulus (with the margin it does not fire)."""
+    info["relimit"] summarises the passes (LimiterPlan() aims at the ceiling, no margin,
+    so the re-limit has something to do on this stimulus)."""
     fs = FS
-    monkeypatch.setattr(limiter, "AIM_MARGIN_DB", 0.0)
     x = _bed_plus_hf_burst(fs, burst_db=4.0, onset=0.8)
     y, info = limiter.apply_with_info(x, fs, LimiterPlan())
     assert info["relimit_passes"] and info["trim_db"] == 0.0
     assert info["relimit"]["passes"] == len(info["relimit_passes"])
     assert info["relimit"]["max_db"] == max(p["max_reduction_db"] for p in info["relimit_passes"])
     assert 0.0 < info["relimit"]["fraction"] < 1.0
+    assert 0.0 <= info["relimit"]["fraction_over_0p01_db"] <= info["relimit"]["fraction"]
     early = slice(0, int(0.2 * fs))
     y_ref, _ = limiter.apply_with_info(x[: int(0.4 * fs)], fs, LimiterPlan())
     assert np.max(np.abs(y[early] - y_ref[early])) < 1e-12  # FFT-convolution rounding

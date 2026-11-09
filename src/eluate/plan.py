@@ -950,7 +950,13 @@ class LimiterPlan:
     peak's value for this long before the release starts (envelope.box_smooth hold, also
     in the base-rate re-limit), so a sustained 30 to 40 Hz sub at 3 dB of GR no longer
     ripples inside each half cycle. The planner writes planner.LIMITER_HOLD_MS (25 ms);
-    None (plans made before) or 0 is the original smoother, bit for bit."""
+    None (plans made before) or 0 is the original smoother, bit for bit.
+
+    aim_margin_db (2026-11-10, planner audit S4-6): the 8x limiter aims this far under
+    the ceiling (dB, in [0, 1]), so the decimated output's 8x / 32x / Annex 2 peaks
+    land under the ceiling and the base-rate re-limit is the exception, not a second
+    limiter over the whole track. The planner writes planner.LIMITER_AIM_MARGIN_DB;
+    None (plans made before) or 0 aims at the ceiling, bit for bit."""
 
     ceiling_dbtp: float = -0.3
     input_gain_db: float = 0.0
@@ -976,8 +982,13 @@ class LimiterPlan:
     speclim_max_cut_db: float | None = None
     speclim_lookahead_ms: float | list[float] | None = None
     hold_ms: float | None = None
+    aim_margin_db: float | None = None
 
     def __post_init__(self):
+        if self.aim_margin_db is not None:
+            self.aim_margin_db = float(self.aim_margin_db)
+            if not (math.isfinite(self.aim_margin_db) and 0.0 <= self.aim_margin_db <= 1.0):
+                raise ValueError("aim_margin_db must lie in [0, 1]")
         if self.hold_ms is not None:
             self.hold_ms = float(self.hold_ms)
             if not (math.isfinite(self.hold_ms) and self.hold_ms >= 0.0):
