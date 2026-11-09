@@ -27,6 +27,8 @@ the ground truth a test needs (onset times, roots, ring extent). No file I/O.
 - `groove_track`: kick, off-beat hats, an unducked bass root and pad triads
   per bar (the kick + bass + pad material that hid kicks, audit features F5).
 - `ambient_pad`, `sustained_chord`: beatless material (no metrical evidence).
+- `dense_loop`: the groove plus a detuned supersaw pad and a 16th arpeggio,
+  with no resonance (notch false positives, audit features F12).
 """
 
 from __future__ import annotations
@@ -479,3 +481,47 @@ def sustained_chord(fs: float, seconds: float = 30.0, seed: int | None = 3) -> n
         for k in (1, 2, 3, 4):
             x += 0.08 / k * np.sin(2 * np.pi * k * f * t + k)
     return np.stack([x, x * 0.97], axis=1) + pink_noise(n, fs, rms_dbfs=-45.0, seed=seed)
+
+
+def dense_loop(fs: float, seconds: float = 48.0, seed: int | None = 0):
+    """groove_track at 126 BPM (Am F C G) plus a detuned supersaw pad (three saws per
+    chord tone at -12, 0, +12 cents, panned) and a 16th-note pluck arpeggio an
+    octave up: dense material with no resonance (audit features F12, whose notch
+    detector rendered three false cuts on it). Peak 0.5. Returns (x, meta) as
+    groove_track."""
+    x, m = groove_track(fs, seconds, bpm=126.0, seed=seed)
+    n = x.shape[0]
+    t = np.arange(n) / fs
+    bars = m["bar_times"]
+    y = np.zeros((n, 2))
+
+    def saw(f, tt, nh):
+        return sum(np.sin(2 * np.pi * k * f * tt) / k for k in range(1, nh + 1) if k * f < 18000.0)
+    for i, b0 in enumerate(bars):
+        b1 = bars[i + 1] if i + 1 < bars.size else seconds
+        c = m["chords"][i]
+        minor = c.endswith("m")
+        root = _NOTE[c[:-1] if minor else c]
+        ivs = (0, 3, 7) if minor else (0, 4, 7)
+        i0, i1 = int(b0 * fs), min(n, int(b1 * fs))
+        tt = t[i0:i1] - b0
+        env = np.minimum(1, np.minimum(tt, tt[-1] - tt) / 0.05)
+        for iv in ivs:
+            f = 440.0 * 2 ** ((60 + (root + iv) % 12 - 69) / 12.0)
+            for cents, pan in ((-12, 0.3), (0, 0.5), (12, 0.7)):
+                v = saw(f * 2 ** (cents / 1200), tt + 0.0003 * np.sin(2 * np.pi * 5 * tt), 30) * env * 0.012
+                y[i0:i1, 0] += v * (1 - pan)
+                y[i0:i1, 1] += v * pan
+        for s in range(16):
+            ts = b0 + s * (b1 - b0) / 16
+            j0 = int(ts * fs)
+            mm = min(int(0.2 * fs), n - j0)
+            if mm <= 0:
+                continue
+            tp = np.arange(mm) / fs
+            f = 440.0 * 2 ** ((72 + (root + (ivs + (12,))[s % 4]) % 12 - 69) / 12.0)
+            v = 0.05 * np.exp(-tp / 0.06) * saw(f, tp, 12)
+            y[j0:j0 + mm, 0] += v * (0.4 + 0.2 * (s % 2))
+            y[j0:j0 + mm, 1] += v * (0.6 - 0.2 * (s % 2))
+    x = x + y * (np.max(np.abs(x)) / max(1e-9, np.max(np.abs(y)))) * 0.6
+    return x * (0.5 / np.max(np.abs(x))), m
