@@ -669,20 +669,20 @@ def do_master_stems(paths, out: Path, controls: planner.Controls, mix: Path | No
     """
     step = progress or (lambda *a, **k: None)
     t0 = time.perf_counter()
-    if controls.profile not in (None, "stems"):
+    # a profile other than the default one was asked for: say it is set aside (the default
+    # is every run's, so naming it would be noise)
+    if controls.profile not in (None, "stems", planner.Controls().profile):
         log(f"profile {controls.profile} set aside: a stem set is mastered under the stems profile")
     controls = dataclasses.replace(controls, profile="stems")
-    names = [Path(p).stem for p in paths]
-    # fixes are matched to stems by name: two files with one basename would get one set
-    dups = sorted({n for n in names if names.count(n) > 1})
-    if dups:
-        raise ValueError("stems must have distinct file names: " + ", ".join(
-            f"{d} ({', '.join(str(p) for p in paths if Path(p).stem == d)})" for d in dups))
+    # fixes are matched to stems by name: a missing file, one file twice or two files
+    # with one basename are refused before anything runs (stems.check_paths)
+    paths = stems.check_paths(paths)
+    names = [p.stem for p in paths]
     # the memory guard, stem-aware, before any audio is read: the set is held through
     # every pass on top of the sum's master (memory.stems_extra_mb)
     frames = max(sf.info(str(p)).frames for p in paths)
-    threads, _ = memory.guard(frames, controls.threads, log,
-                              extra_mb=memory.stems_extra_mb(frames, len(paths)))
+    threads, mem = memory.guard(frames, controls.threads, log,
+                                extra_mb=memory.stems_extra_mb(frames, len(paths)))
     controls = dataclasses.replace(controls, threads=threads)
     total = 1 + STEM_PASSES_MAX
     st, fs, nt, sum_path = sum_stems(paths, out, mix, log)
@@ -753,7 +753,7 @@ def do_master_stems(paths, out: Path, controls: planner.Controls, mix: Path | No
         _promote(out / STEM_PASS_DIR.format(best), out, log)
     run = dict(runs[best])
     run["stems"] = {"kept": best, "passes": len(passes), "stopped": why,
-                    "runtime_s": time.perf_counter() - t0}
+                    "runtime_s": time.perf_counter() - t0, "memory": mem}
     rep = dict(atts[best])
     rep.update(null_test=nt, passes=passes, kept=best, stopped=stopped, stopped_why=why)
     stems.write_report(out, rep)

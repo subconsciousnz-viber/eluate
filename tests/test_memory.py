@@ -109,3 +109,43 @@ def test_master_refuses_cleanly(tmp_path, monkeypatch, capsys):
     err = capsys.readouterr()
     assert "This render needs about" in err.out + err.err
     assert not (tmp_path / "out" / "run.json").exists()
+
+
+def test_stems_extra_and_the_guard(monkeypatch):
+    """Item 9 (stems audit 2026-11-10): a stem set adds stems x frames x 2 ch x 8 bytes x
+    STEMS_FACTOR (the set and stemfix.apply's copy); 8 stems x 6 min x 48 kHz is 4.1 GiB."""
+    frames = 6 * 60 * 48000
+    assert memory.stems_extra_mb(frames, 8) == pytest.approx(
+        memory.STEMS_FACTOR * 8 * frames * 16 / 2 ** 20)
+    assert memory.stems_extra_mb(frames, 8) / 1024 == pytest.approx(4.12, abs=0.02)
+    extra = memory.stems_extra_mb(frames, 8)
+    # what fits for the sum's master alone does not fit with the set held beside it
+    _fake(monkeypatch, memory.estimate_mb(frames, 1) + extra / 2)
+    assert memory.guard(frames, 1, lambda m: None)[0] == 1
+    with pytest.raises(ValueError, match="This render needs about"):
+        memory.guard(frames, 1, lambda m: None, extra_mb=extra)
+    _fake(monkeypatch, 64 * 1024)
+    threads, rec = memory.guard(frames, 4, lambda m: None, extra_mb=extra)
+    assert threads == 4 and rec["extra_mb"] == round(extra)
+    assert rec["estimate_mb"] == round(memory.estimate_mb(frames, 4) + extra)
+
+
+def test_master_stems_guard_counts_the_set(tmp_path, monkeypatch, capsys):
+    """The stems flow guards with the set before reading any audio: refused in one line."""
+    import numpy as np
+    import soundfile as sf
+    paths = []
+    for nm in ("kick", "bass"):
+        p = tmp_path / f"{nm}.wav"
+        sf.write(p, np.zeros((FS, 2)), FS, subtype="FLOAT")
+        paths.append(str(p))
+    seen = {}
+
+    def guard(frames, threads, log=print, extra_mb=0.0):
+        seen.update(frames=frames, extra=extra_mb)
+        raise ValueError("This render needs about 9.9 GB of memory")
+    monkeypatch.setattr(memory, "guard", guard)
+    monkeypatch.setattr(cli.stems, "read_stems", lambda *a, **k: pytest.fail("audio read"))
+    assert cli.main(["master", "--stems", *paths, "-o", str(tmp_path / "out")]) == 2
+    assert seen == {"frames": FS, "extra": pytest.approx(memory.stems_extra_mb(FS, 2))}
+    assert "This render needs about" in capsys.readouterr().err
