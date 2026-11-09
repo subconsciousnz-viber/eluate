@@ -16,7 +16,10 @@
 //! to one thread (BLAS_THREAD_VARS): the engine's own pool does the parallel work.
 //! Its stdout lines prefixed with ENGINE_PREFIX are JSON messages, passed to the page as
 //! `engine` events tagged with the page's job id; when the process ends an `exit` event
-//! follows with its code, whether it was stopped, and the tail of stderr. Files the engine reports in a `data` message (the master and the A/B pair)
+//! follows with its code, whether it was stopped, and the tail of stderr (both pipes are
+//! read to their end whatever bytes they carry; a prefixed line that is not a JSON object
+//! is logged and skipped). Engine children die with the shell: a Job Object on Windows,
+//! PR_SET_PDEATHSIG on Linux (`engine_job`, `die_with_shell`). Files the engine reports in a `data` message (the master and the A/B pair)
 //! are added to the asset protocol scope so the page can play them; nothing else is readable.
 //! Masters are written next to the premaster, in "<name> - eluate/".
 //!
@@ -37,7 +40,7 @@ mod votes;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -139,20 +142,79 @@ fn creation_flags(limit_cpu: bool) -> u32 {
     CREATE_NO_WINDOW | if limit_cpu { BELOW_NORMAL_PRIORITY_CLASS } else { 0 }
 }
 
-/// A canonical path without Windows' verbatim prefix, so the engine, the opener and the
-/// page see an ordinary path (C:\..., \\server\share\...).
+/// The longest path (UTF-16 units) Win32 opens without the verbatim prefix when
+/// LongPathsEnabled is off (MAX_PATH less its terminating NUL). The engine is Python, which
+/// opens a longer path only as `\\?\...` on such a machine.
+const MAX_PLAIN_PATH: usize = 259;
+
+/// A canonical path (symlinks, junctions, `..` and 8.3 names resolved) without Windows'
+/// verbatim prefix where dropping it is safe (`unverbatim`), so the engine, the opener and
+/// the page see an ordinary path (C:\..., \\server\share\...). canonicalize fails, or
+/// answers `\\?\Volume{GUID}\...`, on some RAM-disk, virtual-drive, cloud-sync and SMB
+/// volumes: an existing path there is made absolute instead (`absolute_path`; audit
+/// desktop #9). None: the path does not exist.
 fn canon(p: &Path) -> Option<PathBuf> {
-    let c = std::fs::canonicalize(p).ok()?;
-    let s = c.to_string_lossy();
-    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        return Some(PathBuf::from(format!(r"\\{rest}")));
+    match std::fs::canonicalize(p) {
+        Ok(c) => {
+            let s = c.to_string_lossy();
+            if s.starts_with(r"\\?\Volume{") {
+                return absolute_path(p).or(Some(c));
+            }
+            Some(PathBuf::from(unverbatim(&s)))
+        }
+        Err(_) => absolute_path(p),
     }
-    if let Some(rest) = s.strip_prefix(r"\\?\") {
-        if rest.as_bytes().get(1) == Some(&b':') {
-            return Some(PathBuf::from(rest));
+}
+
+/// `s` without its verbatim prefix (`\\?\C:\...` -> `C:\...`, `\\?\UNC\server\...` ->
+/// `\\server\...`) when the plain form names the same file: at most MAX_PLAIN_PATH long and
+/// no component Win32 would rewrite (a trailing dot or space, a DOS device name such as
+/// CON or NUL.txt). Anything else, a `\\?\Volume{GUID}` path included, is returned as is.
+fn unverbatim(s: &str) -> String {
+    let (plain, rest) = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        (format!(r"\\{rest}"), rest)
+    } else if let Some(rest) = s.strip_prefix(r"\\?\").filter(|r| r.as_bytes().get(1) == Some(&b':')) {
+        (rest.to_string(), rest)
+    } else {
+        return s.to_string();
+    };
+    let short = plain.encode_utf16().count() <= MAX_PLAIN_PATH;
+    if short && rest.split('\\').skip(1).all(plain_component) { plain } else { s.to_string() }
+}
+
+/// A path component Win32 leaves alone outside a verbatim path.
+fn plain_component(c: &str) -> bool {
+    const DEVICES: [&str; 4] = ["CON", "PRN", "AUX", "NUL"];
+    let base = c.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let numbered = (base.starts_with("COM") || base.starts_with("LPT"))
+        && base.len() == 4
+        && base.as_bytes()[3].is_ascii_digit();
+    !c.ends_with('.') && !c.ends_with(' ') && !DEVICES.contains(&base.as_str()) && !numbered
+}
+
+/// The fallback normaliser: an existing path made absolute (`..` resolved lexically,
+/// separators made native), with the verbatim prefix added on Windows when it is too
+/// long to open without it. Symlinks are not resolved here: canonicalize could not.
+fn absolute_path(p: &Path) -> Option<PathBuf> {
+    std::fs::metadata(p).ok()?;
+    let a = std::path::absolute(p).ok()?;
+    if cfg!(windows) {
+        if let Some(v) = verbatim_if_long(&a.to_string_lossy()) {
+            return Some(PathBuf::from(v));
         }
     }
-    Some(c)
+    Some(a)
+}
+
+/// A plain absolute Windows path past MAX_PLAIN_PATH in its verbatim form, else None.
+fn verbatim_if_long(s: &str) -> Option<String> {
+    if s.encode_utf16().count() <= MAX_PLAIN_PATH {
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix(r"\\").filter(|r| !r.starts_with(['?', '.'])) {
+        return Some(format!(r"\\?\UNC\{rest}"));
+    }
+    (s.as_bytes().get(1) == Some(&b':')).then(|| format!(r"\\?\{s}"))
 }
 
 fn is_out_dir(p: &Path) -> bool {
@@ -180,7 +242,8 @@ fn is_input_audio(p: &Path) -> bool {
 
 /// Files and folders as chosen (picked or dropped) to the inputs they stand for: a file
 /// as itself, a folder as its audio files, top level only, sorted by name; an engine
-/// output folder contributes nothing. Canonical, first occurrence kept, at most
+/// output folder contributes nothing. Canonical (a symlink as its target), first
+/// occurrence kept, at most
 /// MAX_INPUTS (`capped` says the rest were left out).
 fn list_inputs(chosen: &[PathBuf]) -> (Vec<PathBuf>, bool) {
     let mut seen = HashSet::new();
@@ -199,10 +262,15 @@ fn list_inputs(chosen: &[PathBuf]) -> (Vec<PathBuf>, bool) {
             if is_out_dir(&c) {
                 continue;
             }
+            // the name first (no file system call), then the entry made canonical as a
+            // chosen file is: a symlink is granted as its target, which is what
+            // check_granted looks up (audit desktop #8), and is judged by it too
             let mut files: Vec<PathBuf> = std::fs::read_dir(&c)
                 .map(|rd| rd.filter_map(Result::ok).map(|e| e.path()).collect())
                 .unwrap_or_default();
-            files.retain(|f| f.is_file() && is_input_audio(f));
+            files.retain(|f| is_input_audio(f));
+            let mut files: Vec<PathBuf> =
+                files.iter().filter_map(|f| canon(f)).filter(|f| f.is_file() && is_input_audio(f)).collect();
             files.sort_by_key(|f| f.file_name().map(|n| n.to_string_lossy().to_lowercase()));
             for f in files {
                 push(f, &mut out);
@@ -318,12 +386,14 @@ fn engine_command(app: &AppHandle) -> Result<Command, String> {
             return Ok(Command::new(p));
         }
     }
+    // development runs only (audit desktop #22): a release build runs its bundled engine
+    // or none, whatever ELUATE_PYTHON says
     let python = std::env::var_os("ELUATE_PYTHON").map(PathBuf::from).or_else(|| {
         // a development run from the repository uses its virtual environment
         let venv = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..").join(".venv");
         let p = if cfg!(windows) { venv.join("Scripts").join("python.exe") } else { venv.join("bin").join("python") };
-        (cfg!(debug_assertions) && p.is_file()).then_some(p)
-    });
+        p.is_file().then_some(p)
+    }).filter(|_| cfg!(debug_assertions));
     match python {
         Some(py) => {
             let mut c = Command::new(py);
@@ -433,6 +503,124 @@ fn set_awake(app: &AppHandle) {
     let _ = app.state::<KeepAwake>().0.lock().unwrap().send(render_busy(app));
 }
 
+/// Reads `r` to its end and hands each line, without its line ending, to `f`. Bytes that
+/// are not UTF-8 (a native library writing in the ANSI code page) are replaced, never
+/// fatal: a reader that stopped early would leave the engine blocked on a full pipe, the
+/// job running forever and the machine kept awake (audit desktop #5).
+fn each_line(r: impl Read, mut f: impl FnMut(String)) {
+    let mut r = BufReader::new(r);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match r.read_until(b'\n', &mut buf) {
+            Ok(0) => return,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                    buf.pop();
+                }
+                f(String::from_utf8_lossy(&buf).into_owned());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// What one line of engine stdout is.
+#[derive(Debug, PartialEq)]
+enum EngineLine {
+    /// Not a message (no ENGINE_PREFIX): ignored.
+    Other,
+    /// A message for the page, tagged with the page's job id.
+    Message(Value),
+    /// A prefixed line that is not a JSON object: logged and skipped.
+    Bad(&'static str),
+}
+
+/// Reads one stdout line. Only a JSON object takes the job tag: indexing any other JSON
+/// value by key panics, and under panic = "abort" that would end the app and orphan
+/// every engine (audit desktop #6).
+fn engine_line(line: &str, job: u64) -> EngineLine {
+    let Some(body) = line.strip_prefix(ENGINE_PREFIX) else { return EngineLine::Other };
+    let Ok(mut msg) = serde_json::from_str::<Value>(body) else { return EngineLine::Bad("not JSON") };
+    let Some(obj) = msg.as_object_mut() else { return EngineLine::Bad("not a JSON object") };
+    obj.insert("job".into(), json!(job));
+    EngineLine::Message(msg)
+}
+
+/// The Job Object every engine child joins (Windows; audit desktop #7), made once at
+/// startup (`run`) with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. Its handle is never closed,
+/// so Windows closes it when the shell process ends, however it ends (a crash, End task,
+/// logoff), and that kills every engine still running. 0 if it could not be made: the
+/// engines then outlive a crashed shell as before, until their next write to the closed
+/// pipe.
+#[cfg(windows)]
+fn engine_job() -> usize {
+    use std::sync::OnceLock;
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    static JOB: OnceLock<usize> = OnceLock::new();
+    *JOB.get_or_init(|| {
+        // SAFETY: plain Win32 calls on a handle this function owns; `info` outlives the call.
+        unsafe {
+            let h = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if h.is_null() {
+                return 0;
+            }
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = SetInformationJobObject(
+                h,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            if ok == 0 {
+                CloseHandle(h);
+                return 0;
+            }
+            h as usize
+        }
+    })
+}
+
+/// Puts a just-spawned engine into `engine_job`. The child runs for the moment between
+/// spawn and this call outside the job; anything it starts afterwards joins it too.
+#[cfg(windows)]
+fn tie_to_shell(child: &Child) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+    let job = engine_job();
+    if job != 0 {
+        // SAFETY: both handles are valid for the call (the job is never closed, the child
+        // is borrowed).
+        unsafe { AssignProcessToJobObject(job as _, child.as_raw_handle() as _) };
+    }
+}
+
+/// Linux: the engine gets SIGKILL when the thread that spawned it ends (PR_SET_PDEATHSIG).
+/// Engines are spawned from `start_job`, a synchronous command, so on the main thread,
+/// which lives as long as the shell. If `start_job` ever becomes async this must move to a
+/// long-lived spawner thread. macOS has no equivalent (desktop/README.md).
+#[cfg(target_os = "linux")]
+fn die_with_shell(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    let parent = std::process::id();
+    // SAFETY: prctl, getppid and _exit are async-signal-safe, as pre_exec requires.
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong);
+            if libc::getppid() as u32 != parent {
+                libc::_exit(1); // the shell died before prctl took effect
+            }
+            Ok(())
+        });
+    }
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn start_job(
@@ -461,6 +649,10 @@ fn start_job(
     cmd.args(engine_args(&kind, &paths, &args, engine_threads(limit_cpu, cores, parallel), set.as_ref())?);
     if let Ok(cache) = app.path().app_cache_dir() {
         cmd.env("NUMBA_CACHE_DIR", cache.join("numba"));
+        // a known working directory, not the shell's (audit desktop #23)
+        if std::fs::create_dir_all(&cache).is_ok() {
+            cmd.current_dir(&cache);
+        }
     }
     for v in BLAS_THREAD_VARS {
         cmd.env(v, "1");
@@ -475,7 +667,11 @@ fn start_job(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(creation_flags(limit_cpu));
     }
+    #[cfg(target_os = "linux")]
+    die_with_shell(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| format!("Engine did not start: {e}"))?;
+    #[cfg(windows)]
+    tie_to_shell(&child);
     let stdout = child.stdout.take().ok_or("No engine output")?;
     let stderr = child.stderr.take().ok_or("No engine output")?;
     let child = Arc::new(Mutex::new(Some(child)));
@@ -486,42 +682,46 @@ fn start_job(
     }
 
     let tail = Arc::new(Mutex::new(VecDeque::<String>::new()));
-    let log_path = app.path().app_log_dir().ok().map(|d| {
+    let log = Arc::new(Mutex::new(app.path().app_log_dir().ok().and_then(|d| {
         let _ = std::fs::create_dir_all(&d);
-        d.join("engine.log")
-    });
-    let tail_w = tail.clone();
+        let p = d.join("engine.log");
+        if std::fs::metadata(&p).map(|m| m.len() > LOG_MAX_BYTES).unwrap_or(false) {
+            let _ = std::fs::rename(&p, p.with_extension("log.1"));
+        }
+        std::fs::OpenOptions::new().create(true).append(true).open(p).ok()
+    })));
+    // every line says which job wrote it: several engines share the file
+    let tag = format!("[{slot} {job}]");
+    let log_line = move |log: &Mutex<Option<std::fs::File>>, line: &str| {
+        if let Some(f) = log.lock().unwrap().as_mut() {
+            let _ = writeln!(f, "{tag} {line}");
+        }
+    };
+    let (tail_w, log_w, log_line_w) = (tail.clone(), log.clone(), log_line.clone());
     let err_thread = std::thread::spawn(move || {
-        let mut log = log_path.and_then(|p| {
-            if std::fs::metadata(&p).map(|m| m.len() > LOG_MAX_BYTES).unwrap_or(false) {
-                let _ = std::fs::rename(&p, p.with_extension("log.1"));
-            }
-            std::fs::OpenOptions::new().create(true).append(true).open(p).ok()
-        });
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if let Some(f) = log.as_mut() {
-                let _ = writeln!(f, "{line}");
-            }
+        each_line(stderr, |line| {
+            log_line_w(&log_w, &line);
             let mut t = tail_w.lock().unwrap();
             t.push_back(line);
             if t.len() > STDERR_TAIL {
                 t.pop_front();
             }
-        }
+        });
     });
 
     std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            let Some(body) = line.strip_prefix(ENGINE_PREFIX) else { continue };
-            let Ok(mut msg) = serde_json::from_str::<Value>(body) else { continue };
-            if msg.get("event").and_then(Value::as_str) == Some("data") {
-                if let Some(ui) = msg.get("ui") {
-                    allow_media(&app, ui);
+        each_line(stdout, |line| match engine_line(&line, job) {
+            EngineLine::Message(msg) => {
+                if msg.get("event").and_then(Value::as_str) == Some("data") {
+                    if let Some(ui) = msg.get("ui") {
+                        allow_media(&app, ui);
+                    }
                 }
+                let _ = app.emit("engine", msg);
             }
-            msg["job"] = json!(job);
-            let _ = app.emit("engine", msg);
-        }
+            EngineLine::Bad(why) => log_line(&log, &format!("shell: engine message skipped ({why})")),
+            EngineLine::Other => {}
+        });
         let _ = err_thread.join();
         let code = child
             .lock()
@@ -743,6 +943,8 @@ fn keep_awake_thread() -> Sender<bool> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(windows)]
+    engine_job();
     let builder = tauri::Builder::default();
     #[cfg(debug_assertions)]
     let builder = builder.invoke_handler(tauri::generate_handler![
@@ -862,7 +1064,7 @@ mod tests {
         for i in 0..MAX_INPUTS + 5 {
             touch(&d.join(format!("t{i:03}.wav")));
         }
-        let (got, capped) = list_inputs(&[d.clone()]);
+        let (got, capped) = list_inputs(std::slice::from_ref(&d));
         assert_eq!(got.len(), MAX_INPUTS);
         assert!(capped);
         let _ = std::fs::remove_dir_all(&d);
@@ -947,12 +1149,12 @@ mod tests {
         let song = d.join("song.wav").to_string_lossy().into_owned();
         let other = d.join("other.wav").to_string_lossy().into_owned();
         for kind in ["analyse", "master", "preview", "ui-data"] {
-            assert_eq!(job_inputs(&g, kind, &[other.clone()]).unwrap_err(), "Not a chosen file");
+            assert_eq!(job_inputs(&g, kind, std::slice::from_ref(&other)).unwrap_err(), "Not a chosen file");
             assert_eq!(job_inputs(&g, kind, &[song.clone(), song.clone()]).unwrap_err(),
                        "Wrong number of inputs");
             assert_eq!(job_inputs(&g, kind, &[]).unwrap_err(), "Wrong number of inputs");
         }
-        let paths = job_inputs(&g, "analyse", &[song.clone()]).unwrap();
+        let paths = job_inputs(&g, "analyse", std::slice::from_ref(&song)).unwrap();
         // the page's -o and --threads come first, so the shell's own win (argparse keeps
         // the last)
         let page: Vec<String> = ["--bpm", "128", "-o", "C:/elsewhere", "--threads", "64"]
@@ -990,11 +1192,11 @@ mod tests {
         }
         let s = |v: Vec<OsString>| v.iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
         // stems-sum: the set's files and work dir, nothing from the page
-        let a = s(engine_args("stems-sum", &[work.clone()], &[], 6, Some(&set)).unwrap());
+        let a = s(engine_args("stems-sum", std::slice::from_ref(&work), &[], 6, Some(&set)).unwrap());
         assert_eq!(a, ["stems-sum", "C:/s/128 drift Am bass.wav", "C:/s/128 drift Am kik.wav", "--mix",
                        "C:/s/mix.wav", "-o", &work.to_string_lossy()]);
         // master of the sum: the page's flags, then the set's --stems / --mix, then -o work
-        let m = s(engine_args("master", &[sum.clone()], &ok, 6, Some(&set)).unwrap());
+        let m = s(engine_args("master", std::slice::from_ref(&sum), &ok, 6, Some(&set)).unwrap());
         let i = m.iter().position(|x| x == "--stems").unwrap();
         assert!(i > m.iter().position(|x| x == "--bpm").unwrap());
         assert_eq!(m[i + 1..i + 5], ["C:/s/128 drift Am bass.wav", "C:/s/128 drift Am kik.wav", "--mix", "C:/s/mix.wav"]);
@@ -1052,5 +1254,140 @@ mod tests {
     fn work_dir_matches_the_engine() {
         assert_eq!(work_dir(Path::new("C:/m/Track 1.wav")).unwrap(),
                    Path::new("C:/m").join("Track 1 - eluate"));
+    }
+
+    fn lines_of(bytes: &[u8]) -> Vec<String> {
+        let mut got = Vec::new();
+        each_line(bytes, |l| got.push(l));
+        got
+    }
+
+    #[test]
+    fn engine_pipes_are_read_to_the_end_whatever_the_bytes() {
+        // invalid UTF-8 (an ANSI code page path from a native library) is replaced, and the
+        // lines after it are still read (lines() would have stopped at it)
+        let got = lines_of(b"one\r\nC:\\\xe9t\xe9\\x.wav \xff\xfe\nthree\n\nlast without newline");
+        assert_eq!(got.len(), 5);
+        assert_eq!(got[0], "one");
+        assert!(got[1].starts_with("C:\\") && got[1].contains('\u{fffd}'));
+        assert_eq!(got[2..], ["three", "", "last without newline"]);
+        assert!(lines_of(b"").is_empty());
+    }
+
+    #[test]
+    fn only_json_objects_become_engine_events() {
+        let EngineLine::Message(m) = engine_line(r#"@@eluate {"event":"stage","stage":"x"}"#, 7) else {
+            panic!("an object is a message")
+        };
+        assert_eq!((m["job"].as_u64(), m["event"].as_str()), (Some(7), Some("stage")));
+        assert_eq!(engine_line("plain progress text", 7), EngineLine::Other);
+        // these panicked the reader (and, with panic = "abort", the app) before
+        for bad in ["@@eluate 5", r#"@@eluate "x""#, "@@eluate [1]", "@@eluate true", "@@eluate null"] {
+            assert_eq!(engine_line(bad, 7), EngineLine::Bad("not a JSON object"), "{bad}");
+        }
+        assert_eq!(engine_line("@@eluate {not json", 7), EngineLine::Bad("not JSON"));
+        // a stdout with junk bytes and a bad message still yields the good one after it
+        let n = lines_of(b"@@eluate 5\n\xff\n@@eluate {\"event\":\"exit\"}\n")
+            .iter()
+            .filter(|l| matches!(engine_line(l, 1), EngineLine::Message(_)))
+            .count();
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn verbatim_prefix_is_dropped_only_when_safe() {
+        assert_eq!(unverbatim(r"\\?\C:\m\Track 1.wav"), r"C:\m\Track 1.wav");
+        assert_eq!(unverbatim(r"\\?\UNC\server\share\a.wav"), r"\\server\share\a.wav");
+        assert_eq!(unverbatim(r"C:\m\a.wav"), r"C:\m\a.wav");
+        // a volume GUID path has no plain form
+        let vol = r"\\?\Volume{0b1f8c6e-0000-0000-0000-100000000000}\a.wav";
+        assert_eq!(unverbatim(vol), vol);
+        // too long for a plain path without LongPathsEnabled: kept verbatim
+        let long = format!(r"\\?\C:\{}\a.wav", "d".repeat(MAX_PLAIN_PATH));
+        assert_eq!(unverbatim(&long), long);
+        let fits = format!(r"\\?\C:\{}", "d".repeat(MAX_PLAIN_PATH - 3));
+        assert_eq!(unverbatim(&fits), &fits[4..]);
+        // names Win32 would rewrite outside a verbatim path
+        for odd in [r"\\?\C:\m\trailing.\a.wav", r"\\?\C:\m\space \a.wav", r"\\?\C:\m\NUL.wav",
+                    r"\\?\C:\m\con", r"\\?\C:\m\com1.txt", r"\\?\UNC\srv\share\aux"] {
+            assert_eq!(unverbatim(odd), odd);
+        }
+        assert_eq!(unverbatim(r"\\?\C:\m\console.wav"), r"C:\m\console.wav");
+        assert_eq!(unverbatim(r"\\?\C:\m\com10.wav"), r"C:\m\com10.wav");
+        // the fallback normaliser's long-path rule
+        assert_eq!(verbatim_if_long(r"C:\m\a.wav"), None);
+        let long = format!(r"C:\{}", "d".repeat(MAX_PLAIN_PATH));
+        assert_eq!(verbatim_if_long(&long), Some(format!(r"\\?\{long}")));
+        let unc = format!(r"\\srv\share\{}", "d".repeat(MAX_PLAIN_PATH));
+        assert_eq!(verbatim_if_long(&unc), Some(format!(r"\\?\UNC\{}", &unc[2..])));
+    }
+
+    #[test]
+    fn fallback_normaliser_makes_existing_paths_absolute() {
+        let d = tmp("absolute");
+        touch(&d.join("song.wav"));
+        let rel = d.join("sub").join("..").join("song.wav");
+        let a = absolute_path(&rel).unwrap();
+        assert!(a.is_absolute() && a.is_file());
+        assert!(absolute_path(&d.join("none.wav")).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+
+    #[cfg(unix)]
+    fn symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[test]
+    fn folder_symlinks_are_granted_as_their_targets() {
+        let d = tmp("symlink");
+        touch(&d.join("outside").join("x.wav"));
+        touch(&d.join("in").join("own.wav"));
+        if symlink(&d.join("outside").join("x.wav"), &d.join("in").join("link.wav")).is_err() {
+            // creating a symlink needs Developer Mode or admin rights on Windows
+            eprintln!("symlinks unavailable here: test skipped");
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        // a folder's link is granted as its target: the path the page gets back is usable
+        let g = Granted::default();
+        let v = grant(&g, &[d.join("in")]);
+        let inputs: Vec<String> =
+            v["inputs"].as_array().unwrap().iter().map(|p| p.as_str().unwrap().to_string()).collect();
+        assert_eq!(inputs.len(), 2, "{v}");
+        for p in &inputs {
+            assert!(check_granted(&g, p).is_ok(), "{p}");
+        }
+        assert!(check_granted(&g, &d.join("in").join("link.wav").to_string_lossy()).is_ok());
+        // the link and its target chosen together are one input
+        let g = Granted::default();
+        let v = grant(&g, &[d.join("in"), d.join("outside").join("x.wav")]);
+        assert_eq!(v["inputs"].as_array().unwrap().len(), 2, "{v}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn engine_children_join_the_kill_on_close_job() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+        let mut child = Command::new("cmd")
+            .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        tie_to_shell(&child);
+        assert_ne!(engine_job(), 0);
+        let mut inside = 0;
+        // SAFETY: valid handles for the call; `inside` outlives it.
+        let ok = unsafe { IsProcessInJob(child.as_raw_handle() as _, engine_job() as _, &mut inside) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(ok != 0 && inside != 0);
     }
 }

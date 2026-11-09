@@ -6,12 +6,39 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 ROOT = os.path.abspath(os.path.join(SPECPATH, "..", ".."))
 
+# Test suites are not collected (audit 2026-11-10 desktop #12): no `tests` / `conftest`
+# submodules and no files under a tests/ folder (scipy's alone is ~17 MB with its data).
+# `testing` packages are dropped too, except the two the engine imports at run time
+# (checked from source with sklearn blocked: scipy._lib._array_api imports numpy.testing,
+# scipy's array_api_extra its own testing module). The analysis still follows every real
+# import, so the filter only stops the forced collection.
+RUNTIME_TESTING = ("numpy.testing", "scipy._external.array_api_extra.testing")
+
+
+def not_a_test(module):
+    parts = module.split(".")[1:]
+    if any(p in ("tests", "conftest") for p in parts):
+        return False
+    return "testing" not in parts or module.startswith(RUNTIME_TESTING)
+
+
+NO_TEST_DATA = ["**/tests", "**/tests/**", "**/conftest.py"]
+
+# scikit-learn is not collected and is excluded below: librosa imports it only lazily,
+# inside librosa.decompose and librosa.segment functions the engine never calls (beat_track,
+# onset_strength, pyin, mfcc, chroma_stft and chroma_cqt do not). Checked from source:
+# eluate.app_engine, cli, planner, solver, uidata and those librosa functions import with
+# sys.modules["sklearn"] = None. Re-check with `node scripts/smoke.mjs` on a built engine.
+# Expected saving with the tests above: roughly 40-55 MB of ~370 MB (sklearn 27 MB; tests
+# of numpy 6.7, scipy 16.6, numba 4.7 MB, measured in site-packages, less in the PYZ).
 datas, binaries, hidden = [], [], []
-for pkg in ("numpy", "scipy", "librosa", "numba", "llvmlite", "sklearn", "soundfile",
+for pkg in ("numpy", "scipy", "librosa", "numba", "llvmlite", "soundfile",
             "_soundfile_data", "soxr", "lazy_loader", "joblib", "msgpack", "pooch",
             "audioread", "decorator"):
     try:
-        d, b, h = collect_all(pkg)
+        d, b, h = collect_all(pkg, filter_submodules=not_a_test, exclude_datas=NO_TEST_DATA)
+    except TypeError:
+        raise  # an older PyInstaller without these arguments: fail, never collect nothing
     except Exception:
         continue
     datas += d
@@ -27,6 +54,7 @@ a = Analysis(
     hiddenimports=hidden,
     excludes=["matplotlib", "tkinter", "pytest", "IPython", "PyQt5", "PyQt6", "PySide6",
               "torch", "tensorflow", "demucs", "pyloudnorm",
+              "sklearn",  # see above: librosa's lazy, unused import
               # Pulled in only by test, build-time or plotting modules that collect_all sweeps
               # up (traced in build-engine/xref-eluate-engine.html); never imported by the
               # engine. PIL: sklearn.datasets image loaders and pygments' image formatter.
