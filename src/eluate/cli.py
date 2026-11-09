@@ -778,7 +778,24 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _user_cache_dir() -> Path:
+    """The per-user cache directory: %LOCALAPPDATA% on Windows, ~/Library/Caches on
+    macOS, $XDG_CACHE_HOME or ~/.cache elsewhere; eluate's subfolder of it."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = str(Path.home() / "Library" / "Caches")
+    else:
+        base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "eluate"
+
+
 def main(argv=None) -> int:
+    # librosa's pYIN is numba-compiled on first use (about a minute cold, audit features F19);
+    # a user cache dir keeps the compiled code across runs whatever the install's
+    # writability (the desktop shell sets its own; numba reads this when first imported)
+    if not os.environ.get("NUMBA_CACHE_DIR"):
+        os.environ["NUMBA_CACHE_DIR"] = str(_user_cache_dir() / "numba")
     args = build_parser().parse_args(argv)
     log = lambda m: print(m, flush=True)  # noqa: E731
     try:
