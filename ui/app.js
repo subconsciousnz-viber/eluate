@@ -19,6 +19,12 @@ const TILT_REF = -4.5;
 // the slope Tilt moves from: under Live the mix's own (planner.target_slope), else TILT_REF
 const tiltRef = () => (state.profile === "live" && isRender() && D.tilt && D.tilt.before
   ? D.tilt.before.stereo : TILT_REF);
+// the target shown is the displayed master's own (its report); the controls only set the
+// next render, which Render's `changed` state already shows
+const shownTiltTarget = () => (isRender() && D.tilt && D.tilt.target != null ? D.tilt.target
+  : tiltRef() + state.tilt);
+const shownLoudTarget = () => (isRender() && D.loudness && D.loudness.target != null
+  ? D.loudness.target : state.loud);
 // Character = the engine's timing presets (docs/gain-staging.md 7); auto picks from tempo
 const CHARACTERS = ["auto", "transparent", "slow", "moderate", "fast", "aggressive"];
 const REF_CREST = 7.1;                 // fallback only: evaluate.FLAG_CREST_DB
@@ -27,8 +33,17 @@ const AUDIO_EXT = /\.(wav|flac|aiff?|w64)$/i;
 const SOURCE_REPO = "https://github.com/subconsciousnz-viber/eluate";
 
 const minus = (s) => String(s).replace("-", "\u2212");
-const fmt = (v, d = 1, sign = false) =>
-  v == null || !Number.isFinite(+v) ? "\u2013" : minus((sign && v > 0 ? "+" : "") + Number(v).toFixed(d));
+const fmt = (v, d = 1, sign = false) => {
+  if (v == null || v === "" || !Number.isFinite(+v)) return "\u2013";
+  let s = Number(v).toFixed(d);
+  if (+s === 0) s = s.replace("-", "");          // no "\u22120.0" or "+0.0"
+  return minus((sign && +s > 0 ? "+" : "") + s);
+};
+// amber is never colour alone: CSS puts a dot before every .short, and this names it
+const SR_SHORT = '<span class="sr-only"> (flagged)</span>';
+const flagged = (short) => (short ? SR_SHORT : "");
+// a delivery value is {before, after} or a bare number (summary rows)
+const afterOf = (v) => (v && typeof v === "object" ? v.after : v);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 const clock = (t) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
 const el = (tag, attrs = {}, text) => {
@@ -81,6 +96,11 @@ let queueFirst = null;                   // the track whose analysis the queue w
 const analysePending = [];               // previewed tracks waiting for the analyse slot
 const summaryPending = new Set();        // inputs whose row the list slot has not read yet
 let progress = 1;                        // fraction of the after layers revealed
+// Reopening a mastered folder: until a shared control is touched or Render pressed, the
+// first Done track's shared controls are adopted (adopted), and Done tracks made with other
+// settings keep their master (t.keep: "Done · other settings", never re-rendered until a
+// control is edited)
+let touched = false, adopted = false;
 
 const stem = (p) => p.split(/[\\/]/).pop().replace(/\.[^.]+$/, "");
 const folderOf = (p) => p.replace(/[\\/][^\\/]*$/, "");
@@ -96,7 +116,8 @@ function keyOf(s) {
 }
 function keyOfControls(c) {
   return keyOf({
-    loud: c.rms_target ?? c.target_rms ?? DEFAULT_LOUD, tilt: c.tilt_db || 0, preserve: c.preserve_mix,
+    loud: c.rms_target ?? c.target_rms ?? (PROFILES[c.profile] || PROFILES.electronic).loud,
+    tilt: c.tilt_db || 0, preserve: c.preserve_mix,
     delivery: c.streaming ? "streaming" : "master", character: c.character || "auto",
     profile: c.profile || "electronic",
     bpm: c.bpm, xo: c.crossovers_hz, sideHp: c.subside_hz,
@@ -110,8 +131,20 @@ function settingsFor(t) {
   saveTrackParams();
   return keyOf({ ...state, bpm: t.bpm, xo: t.xo, sideHp: t.sideHp });
 }
-// a stem set renders, analyses and previews only once its sum exists (t.unsummed)
-const needsRender = (t) => !t.unsummed && (t.status !== "done" || t.rendered !== settingsFor(t));
+// a stem set renders, analyses and previews only once its sum exists (t.unsummed); a
+// reopened master made with other settings is kept until a control is edited (t.keep)
+const needsRender = (t) => !t.unsummed && (t.status !== "done" || (!t.keep && t.rendered !== settingsFor(t)));
+const otherSettings = (t) => t.status === "done" && t.rendered !== settingsFor(t);
+// a control edit: a shared one (no argument) releases every kept master, a per-track one
+// (its track, or null with none selected) only that track's
+function touch(one) {
+  if (one !== undefined) { if (one) one.keep = false; return; }
+  touched = true;
+  for (const t of tracks) t.keep = false;
+}
+// what a Done track's master is against the current controls
+const doneWord = (t) => (!otherSettings(t) ? "Done" : t.keep ? "Done · other settings"
+  : "Done · settings changed");
 
 const isRender = () => D && D.kind === "render";
 const crossovers = () => state.xo || (isRender() ? D.crossovers : null);
@@ -150,6 +183,7 @@ async function startJob(slot, kind, t, inputs) {
               logs: [] };
   if (kind === "master") { j.key = settingsFor(t); j.step = 1; j.steps = 4; }
   if (kind === "analyse") { saveTrackParams(); j.akey = analysisKey(t); }
+  if (kind === "preview") j.target = state.loud;   // the level the preview is placed at
   slots[slot === "render" ? `render-${id}` : slot === "stems" ? `stems-${id}` : slot] = j;
   const args = kind === "master" ? masterArgs(t) : kind === "analyse" ? analyseArgs(t)
     : kind === "preview" ? ["--target-rms", state.loud.toFixed(1)] : [];
@@ -173,8 +207,10 @@ function onEngine(p) {
                        pass: p.pass || null, passesMax: p.passes_max || null, then: p.then_s ?? null });
     if (p.eta_s != null) { j.eta = p.eta_s; j.etaAt = performance.now(); }
     if (isRenderSlot(slot)) j.track.stage = p.stage;
-  } else if (p.event === "log") { j.logs.push(p.msg); if (j.logs.length > 200) j.logs.shift(); }
-  else if (p.event === "data") onData(p.ui, j);
+  } else if (p.event === "log") {
+    j.logs.push(p.msg); if (j.logs.length > 200) j.logs.shift();
+    return;                              // nothing on screen changes
+  } else if (p.event === "data") onData(p.ui, j);
   else if (p.event === "error") j.error = p.msg;
   else if (p.event === "exit") {
     if (isRenderSlot(slot) || slot.startsWith("stems-")) delete slots[slot]; else slots[slot] = null;
@@ -185,16 +221,33 @@ function onEngine(p) {
 }
 
 function rowOf(ui) {
+  const d = ui.delivery || {};
   if (ui.kind === "summary") {
     return { loudness: ui.loudness, tilt: ui.tilt, crest: ui.crest, crestBefore: ui.crestBefore,
-             truePeak: ui.truePeak, flags: ui.flags || [] };
+             truePeak: afterOf(ui.true_peak_max_dbtp) ?? ui.truePeak, integrated: afterOf(ui.integrated_lufs),
+             preset: ui.character_preset || null, flags: ui.flags || [] };
   }
   return { loudness: ui.loudness.reached, tilt: ui.tilt.after.stereo, crest: ui.crest.after,
-           crestBefore: ui.crest.before, truePeak: ui.truePeak, flags: ui.flags || [] };
+           crestBefore: ui.crest.before, truePeak: afterOf(d.true_peak_max_dbtp) ?? ui.truePeak,
+           integrated: afterOf(d.integrated_lufs), preset: (ui.character && ui.character.preset) || null,
+           flags: ui.flags || [] };
+}
+
+// The shared controls a reopened master was made with (run.json controls), adopted while
+// nothing was touched, so a reopened folder reads Done instead of re-mastering at defaults
+function adoptShared(c) {
+  const profile = c.profile in PROFILES ? c.profile : "electronic";
+  state.profile = profile;
+  state.loud = c.rms_target ?? c.target_rms ?? PROFILES[profile].loud;
+  state.tilt = c.tilt_db || 0;
+  state.preserve = !!c.preserve_mix;
+  state.delivery = c.streaming ? "streaming" : "master";
+  state.character = CHARACTERS.includes(c.character) ? c.character : "auto";
+  adopted = true;
 }
 
 function onData(ui, j) {
-  if (ui.kind === "stems") { j.track.nullTest = ui.null; return; }
+  if (ui.kind === "stems") { j.track.nullTest = ui.null || { verdict: "none" }; return; }
   if (ui.kind === "summary") {
     summaryPending.delete(ui.input.toLowerCase());
     const t = tracks.find((x) => samePath(x.input, ui.input));
@@ -208,16 +261,39 @@ function onData(ui, j) {
         t.bpm = c.bpm ?? null; t.xo = c.crossovers_hz || null; t.sideHp = c.subside_hz ?? null;
         if (t === sel()) { state.bpm = t.bpm; state.xo = t.xo; state.sideHp = t.sideHp; }
       }
+      if (ui.controls && !touched && !adopted) adoptShared(c);
       t.rendered = ui.controls ? keyOfControls(c) : null;
+      // made with other settings (or unknown ones): kept until a control is edited after
+      // this, never re-mastered silently
+      t.keep = t.rendered !== settingsFor(t);
       if (t === sel() && !t.ui) startJob("view", "ui-data", t);
     }
     drawAll();
     return;
   }
   const t = j.track;
-  if (ui.kind === "render") { t.ui = ui; t.row = rowOf(ui); }
-  else if (ui.kind === "preview") t.preview = ui;
+  if (ui.kind === "render") {
+    t.ui = ui; t.row = rowOf(ui);
+    if (j.kind === "master") blinds.delete(ui.master);   // a new master: a new blind session
+  } else if (ui.kind === "preview") { ui.previewTarget = j.target; t.preview = ui; }
   if (t === sel() && (ui.kind === "render" || !t.ui)) setData(ui, j.kind === "master");
+}
+
+// The engine's error (an exception's text, or the exit code) in plain words for the status
+// line; the raw text stays in the row and status tooltips (t.errorRaw)
+function plainError(msg, code) {
+  const m = String(msg || "");
+  if (!m) return code === -1 || code == null ? "Engine stopped unexpectedly" : `Engine stopped (${code})`;
+  if (/\[Errno 2\]|FileNotFoundError|No such file/i.test(m)) return "File not found";
+  if (/\[Errno 13\]|PermissionError|Permission denied|Access is denied/i.test(m)) return "Can't write next to the file";
+  if (/\[Errno 28\]|No space left|not enough space/i.test(m)) return "Disk full";
+  if (/MemoryError|out of memory|not enough memory|memory guard/i.test(m)) return "Not enough memory";
+  if (/LibsndfileError|Format not recognised|unknown format|Error opening/i.test(m)) return "Can't read this audio file";
+  return m;
+}
+function failTrack(t, j, code) {
+  t.error = plainError(j.error, code);
+  t.errorRaw = j.error || `Engine stopped (${code})`;
 }
 
 function onExit(slot, j, p) {
@@ -226,8 +302,8 @@ function onExit(slot, j, p) {
   if (isRenderSlot(slot)) {
     t.stage = "";
     if (p.killed) { if (!t.removed) restorePrior(t); }
-    else if (failed) { t.status = "error"; t.error = j.error || `Engine stopped (${p.code})`; }
-    else { t.status = "done"; t.error = null; t.rendered = j.key; }
+    else if (failed) { t.status = "error"; failTrack(t, j, p.code); }
+    else { t.status = "done"; t.error = null; t.rendered = j.key; t.keep = false; }
     // a Render pressed after Cancel, before the stopped render ended, starts here
     if (queueOn) runNext();
   } else if (slot.startsWith("stems-")) {
@@ -235,7 +311,7 @@ function onExit(slot, j, p) {
     // and background analysis run as for any track
     if (failed || p.killed) {
       t.status = "error";
-      t.error = p.killed ? "Stopped" : j.error || `Engine stopped (${p.code})`;
+      if (p.killed) { t.error = "Stopped"; t.errorRaw = null; } else failTrack(t, j, p.code);
     } else if (!t.removed) {
       t.unsummed = false; t.status = "queued";
       readRows([t]);
@@ -246,7 +322,7 @@ function onExit(slot, j, p) {
     if (!failed && !p.killed) t.analysedKey = j.akey;
     if (queueOn) runNext(); else pumpAnalyse();
   } else if (slot === "view") {
-    if (failed) t.error = j.error || `Engine stopped (${p.code})`;
+    if (failed) failTrack(t, j, p.code);
     t.previewed = true;
     if (j.kind === "preview" && !failed && !p.killed) wantAnalyse(t);
   }
@@ -257,6 +333,7 @@ function onExit(slot, j, p) {
 // 2026-10-24: "single track should wait"); the analysis made after the preview is reused.
 function render() {
   queueOn = true; queuePass += 1;
+  touched = true;                        // from here the controls are the user's: none adopted
   analysePending.length = 0;             // each master analyses (or reuses) its own
   if (slots.analyse) queueFirst = slots.analyse.track;
   runNext();
@@ -371,9 +448,14 @@ function showName(name) {
   document.title = name || "Eluate";
 }
 
-function select(i) {
+// settle: the selection moves by key, so the track's view job waits until the keys stop
+// (one engine process per settled selection, not one per keypress)
+let viewTimer = null;
+function select(i, settle = false) {
   saveTrackParams();
   pauseAll();
+  clearTimeout(viewTimer);
+  if (i !== selected) flagsOpen = false;
   selected = i;
   const t = sel();
   showName(t ? t.name : null);
@@ -382,14 +464,19 @@ function select(i) {
   D = t.ui || t.preview || null;
   if (t.unsummed) { drawAll(); return; }   // a stem set still summing: nothing to read yet
   if (isRender()) setAudio();
-  if (!t.ui && t.status === "done") startJob("view", "ui-data", t);
-  else if (!t.ui && !t.preview && !(slots.view && slots.view.track === t)) startJob("view", "preview", t);
+  const view = () => {
+    if (sel() !== t) return;
+    if (!t.ui && t.status === "done") startJob("view", "ui-data", t);
+    else if (!t.ui && !t.preview && !(slots.view && slots.view.track === t)) startJob("view", "preview", t);
+  };
+  if (settle) viewTimer = setTimeout(view, 250); else view();
   drawAll();
 }
 
 async function removeTrack(i) {
   const t = tracks[i];
-  if (!t) return;
+  if (!t || t.removing) return;          // a second Delete while the first awaits the shell
+  t.removing = true;
   const j = renderOf(t);
   if (j) {
     t.removed = true;
@@ -405,10 +492,14 @@ async function removeTrack(i) {
     if (IS_APP) await TAURI.core.invoke("stop_job", { slot: `stems-${sj.id}` }).catch(() => {});
   }
   summaryPending.delete(t.input.toLowerCase());
-  tracks.splice(i, 1);
-  const next = selected === i ? Math.min(i, tracks.length - 1) : selected > i ? selected - 1 : selected;
+  // the list may have changed while the shell stopped the jobs: find both tracks again
+  const k = tracks.indexOf(t);
+  if (k < 0) return;
+  saveTrackParams();
+  const cur = sel();
+  tracks.splice(k, 1);
   selected = -1;
-  select(next);
+  select(cur && cur !== t ? tracks.indexOf(cur) : Math.min(k, tracks.length - 1));
 }
 
 function setData(ui, animate) {
@@ -440,13 +531,20 @@ const aboutLeft = (s) => (s == null ? "" : s < 45 ? "under a minute left"
   : `about ${Math.max(1, Math.round(s / 60))} min left`);
 const shortLeft = (s) => (s == null ? "" : s < 45 ? "<1 min" : `~${Math.max(1, Math.round(s / 60))} min`);
 
+// the row's state word without the ticking time (the option's accessible name)
+function rowWord(t) {
+  const j = renderOf(t) || analysisOf(t) || stemsOf(t);
+  if (j) return j.stage;
+  if (t.status === "running") return "Analysing";
+  return t.status === "done" ? doneWord(t) : STATUS[t.status];
+}
 function rowState(t) {
   const j = renderOf(t) || analysisOf(t) || stemsOf(t);
   if (j) {
     const left = shortLeft(secondsLeft(j));
     return left ? `${j.stage} · ${left}` : `${j.stage} ${clock((performance.now() - j.t0) / 1000)}`;
   }
-  return t.status === "running" ? "Analysing" : STATUS[t.status];
+  return rowWord(t);
 }
 
 function drawList() {
@@ -455,10 +553,18 @@ function drawList() {
   if (list.hidden) { rows.innerHTML = ""; return; }
   rows.innerHTML = tracks.map((t, i) => {
     const r = t.row, fl = shortFlags(r), has = (k) => fl.some((f) => f.kind === k);
-    const cell = (v, short, extra = "") => `<span class="num${short ? " short" : ""}">${v}${extra}</span>`;
+    const cell = (v, short, extra = "") =>
+      `<span class="num${short ? " short" : ""}">${v}${extra}${flagged(short)}</span>`;
+    const said = (name, v, unit, short) => `${name} ${v}${unit ? " " + unit : ""}${short ? " (flagged)" : ""}`;
+    const label = [t.name, rowWord(t), t.error || ""].concat(r ? [
+      said("loudness", fmt(r.loudness), "dB RMS", has("loudness")), said("tilt", fmt(r.tilt), "dB/oct", has("tilt")),
+      said("crest", fmt(r.crest), "dB", has("crest")), said("true peak", fmt(r.truePeak, 2), "dBTP", has("tp")),
+      `${fl.length} ${fl.length === 1 ? "flag" : "flags"}`] : []).filter(Boolean).join(", ");
+    const raw = t.error ? t.errorRaw || t.error : "";
     return `<div role="option" id="row-${i}" data-i="${i}" aria-selected="${i === selected}"` +
-      ` class="trk st-${analysisOf(t) ? "running" : t.status}"${t.error ? ` title="${esc(t.error)}"` : ""}>` +
-      `<span class="nm">${esc(t.name)}</span><span class="st">${esc(rowState(t))}</span>` +
+      ` aria-label="${esc(label)}"` +
+      ` class="trk st-${analysisOf(t) ? "running" : t.status}"${raw ? ` title="${esc(raw)}"` : ""}>` +
+      `<span class="nm" title="${esc(t.name)}">${esc(t.name)}</span><span class="st">${esc(rowState(t))}</span>` +
       (r ? cell(fmt(r.loudness), has("loudness")) + cell(fmt(r.tilt), has("tilt")) +
            cell(fmt(r.crest), has("crest"), r.crestBefore != null ? `<small>${fmt(r.crestBefore)}</small>` : "") +
            cell(fmt(r.truePeak, 2), has("tp")) +
@@ -467,6 +573,15 @@ function drawList() {
       `<button type="button" class="rm" data-rm="${i}" tabindex="-1" aria-hidden="true">×</button></div>`;
   }).join("");
   rows.setAttribute("aria-activedescendant", selected >= 0 ? `row-${selected}` : "");
+}
+
+// the 1 s tick: only the state cells' time moves, the rows are not rebuilt
+function tickList() {
+  if ($("list").hidden) return;
+  tracks.forEach((t, i) => {
+    const c = document.querySelector(`#row-${i} .st`);
+    if (c) setText(c, rowState(t));
+  });
 }
 
 function bindList() {
@@ -487,7 +602,7 @@ function bindList() {
     else if (e.key === "Delete") { e.preventDefault(); removeTrack(selected); return; }
     else return;
     e.preventDefault();
-    if (i !== selected) select(i);
+    if (i !== selected) select(i, true);
     const row = $(`row-${selected}`);
     if (row) row.scrollIntoView({ block: "nearest" });
   });
@@ -497,16 +612,23 @@ function bindList() {
 // by the shell when a queue of two or more tracks ends.
 function writeSummaries() {
   if (!IS_APP || tracks.length < 2) return;
-  const q = (s) => `"${String(s ?? "").replace(/"/g, '""')}"`;
-  const n = (v, d = 2) => (v == null ? "" : Number(v).toFixed(d));
-  const head = "Name,State,Loudness (dB RMS),Tilt (dB/oct),Crest (dB),Crest before (dB),True peak (dBTP),Flags";
+  // a cell starting = + - @ (or a tab / CR) would be a formula in a spreadsheet: quoted as text
+  const q = (s) => {
+    s = String(s ?? "");
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+    return `"${s.replace(/"/g, '""')}"`;
+  };
+  const n = (v, d = 2) => (v == null || !Number.isFinite(+v) ? "" : Number(v).toFixed(d));
+  const head = "Name,State,Loudness (dB RMS),Integrated (LUFS),Tilt (dB/oct),Crest (dB),Crest before (dB)," +
+    "True peak (dBTP),Character,Flags";
   const byFolder = new Map();
   for (const t of tracks) {
     const f = folderOf(t.input);
     if (!byFolder.has(f)) byFolder.set(f, []);
     const r = t.row || {};
-    byFolder.get(f).push([q(t.name), q(STATUS[t.status] || t.status), n(r.loudness), n(r.tilt), n(r.crest),
-      n(r.crestBefore), n(r.truePeak), q(shortFlags(r).map((x) => x.kind).join("; "))].join(","));
+    byFolder.get(f).push([q(t.name), q(STATUS[t.status] || t.status), n(r.loudness), n(r.integrated), n(r.tilt),
+      n(r.crest), n(r.crestBefore), n(r.truePeak), q(r.preset || ""),
+      q(shortFlags(r).map((x) => x.kind).join("; "))].join(","));
   }
   for (const [folder, lines] of byFolder) {
     TAURI.core.invoke("write_summary", { folder, csv: [head, ...lines].join("\r\n") + "\r\n" }).catch(() => {});
@@ -525,8 +647,16 @@ function stageLine(j) {
   if (j.render) text += ` · render ${j.render} of up to ${j.rendersMax}`;
   if (j.pass) text += ` · stems pass ${j.pass} of up to ${j.passesMax}`;
   const long = j.kind === "master" || j.kind === "analyse";
-  const time = aboutLeft(secondsLeft(j)) || (long ? clock((performance.now() - j.t0) / 1000) : "");
+  const time = aboutLeft(secondsLeft(j)) || (long ? `${clock((performance.now() - j.t0) / 1000)} elapsed` : "");
   return { text, time };
+}
+
+// a stem set's null test, once its sum exists: the residual against the mix, or no mix
+function nullWord(t) {
+  const nt = t && t.stems && t.nullTest;
+  if (!nt) return "";
+  if (nt.verdict === "none") return "no mix";
+  return nt.residual_db != null ? `null ${fmt(nt.residual_db, 0)} dB` : `null ${nt.verdict}`;
 }
 
 const setText = (n, v) => { if (n.textContent !== v) n.textContent = v; };
@@ -546,19 +676,20 @@ function drawStage() {
     ({ text, time } = stageLine(j));
     if (r && busy) text += ` · ${queuePosition()}`;
   } else if (err) text = t.error;
-  else if (t && t.status === "done" && !needsRender(t)) text = "Done";
+  else if (t && t.status === "done") text = doneWord(t);
   else if (t && busy) text = STATUS[t.status] || "Queued";
   else if (t && (t.previewed || t.ui)) text = "Ready";
+  if (!j && !err && text && nullWord(t)) text += ` · ${nullWord(t)}`;
   if (!r && !err && t && busy) text += ` · rendering ${queuePosition()}`;
   s.classList.toggle("error", !!err);
   s.classList.toggle("running", !!j);
-  if (live.getAttribute("role") !== (err ? "alert" : "status")) {
-    live.setAttribute("role", err ? "alert" : "status");
-    live.setAttribute("aria-live", err ? "assertive" : "polite");
-  }
-  setText(live, text);
+  // the status line is the polite live region; an error is shown beside it (not announced
+  // twice) and announced once by the separate alert
+  setText(live, err ? "" : text);
+  setText($("stage-err"), err ? text : "");
+  setText($("stage-alert"), err ? text : "");
   setText($("stage-time"), time);
-  s.title = [text, time].filter(Boolean).join(" · ");
+  s.title = [err ? t.errorRaw || text : text, time].filter(Boolean).join(" · ");
 }
 
 // While the queue runs (a render, or the analysis it waits for) the settings that would
@@ -603,9 +734,13 @@ function markChanged() {
 
 /* ------------------------------------------------------------------ targets */
 
-function timingFor(bpm) {
-  return bpm < 70 ? "Slow" : bpm <= 140 ? "Moderate" : "Fast";
+// Auto's timing preset for a tempo (planner.character_choice): slow only for a tempo the user
+// gave, a detected one under 70 BPM stays moderate. A fallback: the render says which it used
+// (D.character.preset).
+function timingFor(bpm, given) {
+  return bpm < 70 ? (given ? "Slow" : "Moderate") : bpm <= 140 ? "Moderate" : "Fast";
 }
+const cap = (s) => s[0].toUpperCase() + s.slice(1);
 
 // Amber comes from the engine's checks (report.json flags_structured), the same list
 // report.md reads; the page's own thresholds are only for data made before them.
@@ -616,7 +751,7 @@ function isShort(kind, fallback) {
 
 function reached() {
   if (!isRender()) return null;
-  const tg = tiltRef() + state.tilt;
+  const tg = shownTiltTarget();
   return {
     loud: D.loudness.reached, loudTarget: D.loudness.target,
     loudShort: isShort("loudness", D.loudness.target - D.loudness.reached > D.loudness.tol),
@@ -633,43 +768,65 @@ function drawTargets() {
   $("loud-v").textContent = fmt(state.loud);
   const lg = $("loud-got");
   lg.className = "got" + (r && r.loudShort ? " short" : "");
-  lg.innerHTML = r ? `Reached ${fmt(r.loud)} dB RMS` + (r.loudShort && D.loudness.heldBy ? `<small>held by limiter</small>` : "") : "";
+  lg.innerHTML = r ? `Reached ${fmt(r.loud)} dB RMS` + flagged(r.loudShort) +
+    (r.loudShort && D.loudness.heldBy ? `<small>held by limiter</small>` : "") : "";
 
   $("tilt").value = state.tilt;
   $("tilt-v").textContent = fmt(state.tilt, 1, true);
   const t = $("tilt-got");
   t.className = "got" + (r && r.tiltShort ? " short" : "");
-  t.innerHTML = r ? `Reached ${fmt(r.tilt)} <span class="of">/ Target ${fmt(r.tiltTarget)} dB/oct</span>` : "";
+  t.innerHTML = r ? `Reached ${fmt(r.tilt)}${flagged(r.tiltShort)} <span class="of">/ Target ${fmt(r.tiltTarget)} dB/oct</span>` : "";
 
   $("preserve").setAttribute("aria-checked", String(state.preserve));
   $("preserve-v").textContent = state.preserve ? "On" : "Off";
 
   const b = bpmNow();
   $("bpm").value = state.bpm ?? "";
-  $("bpm").placeholder = b ? fmt(b, b % 1 ? 1 : 0) : "Auto";
+  $("bpm").placeholder = b ? fmt(b, Math.abs(b - Math.round(b)) < 0.05 ? 0 : 1) : "Auto";
   $("bpm-v").textContent = state.bpm ? fmt(state.bpm, state.bpm % 1 ? 1 : 0) : "Auto";
-  $("bpm-got").innerHTML = b && state.character === "auto" ? `<span class="of">${timingFor(b)}</span>` : "";
+  // the displayed master's timing preset (the engine's); before a render, Auto's rule
+  const preset = isRender() && D.character && D.character.preset;
+  const given = state.bpm != null || !!(isRender() && D.controls && D.controls.bpm != null);
+  $("bpm-got").innerHTML = preset ? `<span class="of">${esc(cap(String(preset)))}</span>`
+    : b && state.character === "auto" ? `<span class="of">${timingFor(b, given)}</span>` : "";
+
+  syncSeg("delivery", state.delivery);
+  syncSeg("profile", state.profile);
 
   const sm = $("summary");
   sm.innerHTML = r
-    ? `<span class="item"><span class="k">Loudness</span><span class="v${r.loudShort ? " short" : ""}">${fmt(r.loud)}</span><span class="of">target ${fmt(r.loudTarget)} dB RMS</span></span>` +
-      `<span class="item"><span class="k">Tilt</span><span class="v${r.tiltShort ? " short" : ""}">${fmt(r.tilt)}</span><span class="of">target ${fmt(r.tiltTarget)} dB/oct</span></span>`
+    ? `<span class="item"><span class="k">Loudness</span><span class="v${r.loudShort ? " short" : ""}">${fmt(r.loud)}${flagged(r.loudShort)}</span><span class="of">target ${fmt(r.loudTarget)} dB RMS</span></span>` +
+      `<span class="item"><span class="k">Tilt</span><span class="v${r.tiltShort ? " short" : ""}">${fmt(r.tilt)}${flagged(r.tiltShort)}</span><span class="of">target ${fmt(r.tiltTarget)} dB/oct</span></span>`
     : "";
 }
 
+// a radio group's checked button follows the state (the reopened master's adopted settings)
+function syncSeg(id, v) {
+  for (const b of $(id).querySelectorAll('[role="radio"]')) {
+    b.setAttribute("aria-checked", String(b.dataset.v === v));
+    b.tabIndex = b.dataset.v === v ? 0 : -1;
+  }
+}
+
+// a control edit: the pending render changes, so do Render, the status and the list's states
+function edited(one) {
+  touch(one);
+  drawTargets(); markChanged(); drawStage(); drawList();
+}
+
 function bindTargets() {
-  const changed = () => { drawTargets(); markChanged(); };
   $("loud").addEventListener("input", (e) => {
-    state.loud = +e.target.value; changed(); drawTimeline();
+    state.loud = +e.target.value; edited(); drawTimeline();
   });
-  $("tilt").addEventListener("input", (e) => { state.tilt = +e.target.value; changed(); drawSpectrum(); });
-  $("preserve").addEventListener("click", () => { state.preserve = !state.preserve; changed(); });
+  $("tilt").addEventListener("input", (e) => { state.tilt = +e.target.value; edited(); });
+  $("preserve").addEventListener("click", () => { state.preserve = !state.preserve; edited(); });
   const setBpm = (v) => {
     state.bpm = Number.isFinite(v) && v > 0 ? Math.min(220, Math.max(40, Math.round(v * 2) / 2)) : null;
-    changed();
-    // the analysis depends on the tempo: the selected track's runs again with it
     const t = sel();
-    if (t) { saveTrackParams(); t.noAuto = false; if (t.previewed) wantAnalyse(t); }
+    saveTrackParams();
+    edited(t);
+    // the analysis depends on the tempo: the selected track's runs again with it
+    if (t) { t.noAuto = false; if (t.previewed) wantAnalyse(t); }
   };
   $("bpm").addEventListener("change", (e) => setBpm(e.target.value === "" ? NaN : +e.target.value));
   $("disclosure").addEventListener("click", () => {
@@ -697,7 +854,8 @@ function drawCharacter() {
     b.tabIndex = checked ? 0 : -1;
   }
   bindRadioGroup(seg, (value) => {
-    state.character = value; drawCharacter(); drawTargets(); markChanged();
+    if (value === state.character) return;
+    state.character = value; drawCharacter(); edited();
   });
 }
 
@@ -731,16 +889,29 @@ function drawTimeline() {
       "stroke-dasharray": d ? "1 4" : "none" }));
     g.append(el("text", { x: TL.L - 8, y: LY(d) + 4, "text-anchor": "end", class: "tl-axis" }, fmt(d, 0)));
   }
-  g.append(el("line", { x1: TL.L, x2: w - TL.R, y1: LY(state.loud), y2: LY(state.loud),
-    stroke: "var(--reach)", "stroke-width": 1.25 }));
-  g.append(el("text", { x: TL.L - 8, y: LY(state.loud) + 4, "text-anchor": "end", class: "tl-axis",
-    style: "fill: var(--reach)" }, fmt(state.loud)));
+  // the target is the displayed master's (its report); the Loudness control, when moved off
+  // it, is the next render's, drawn faint and dashed. Before a render they are the same.
+  const tgt = shownLoudTarget();
+  const pending = isRender() && Math.abs(state.loud - tgt) >= 0.05 ? state.loud : null;
+  // a dark halo under the line keeps it visible over the After fill (WCAG 1.4.11)
+  const targetLine = () => {
+    g.append(el("line", { x1: TL.L, x2: w - TL.R, y1: LY(tgt), y2: LY(tgt), stroke: "var(--steel)",
+      "stroke-width": 3.25, class: "tl-target-halo" }));
+    g.append(el("line", { x1: TL.L, x2: w - TL.R, y1: LY(tgt), y2: LY(tgt), stroke: "var(--reach)",
+      "stroke-width": 1.25, class: "tl-target" }));
+    if (pending != null) {
+      g.append(el("line", { x1: TL.L, x2: w - TL.R, y1: LY(pending), y2: LY(pending), stroke: "var(--reach)",
+        "stroke-width": 1, "stroke-dasharray": "3 4", opacity: 0.6, class: "tl-pending" }));
+    }
+  };
+  g.append(el("text", { x: TL.L - 8, y: LY(tgt) + 4, "text-anchor": "end", class: "tl-axis",
+    style: "fill: var(--reach)" }, fmt(tgt)));
   const [gy, gh] = TL.gr;
   const base = gy + gh;
   g.append(el("line", { x1: TL.L, x2: w - TL.R, y1: base, y2: base, stroke: "var(--rule)" }));
   g.append(el("text", { x: TL.L - 8, y: base - 2, "text-anchor": "end", class: "tl-label" }, "GR"));
 
-  if (!D) { host.replaceChildren(svg); tlGeom = null; return; }
+  if (!D) { targetLine(); host.replaceChildren(svg); tlGeom = null; return; }
 
   const n = D.env.before.length;
   const X = (i) => TL.L + (i + 0.5) * pw / n;
@@ -767,12 +938,14 @@ function drawTimeline() {
     after.append(el("path", { d: area(D.meter.after), fill: "var(--ice)", opacity: 0.85 }));
   }
   g.append(after);
-  g.append(el("path", { d: line(D.env.before), fill: "none", stroke: "var(--graphite)",
+  // a preview was placed at the target it was read with: it follows the slider since
+  const shift = !isRender() && D.previewTarget != null ? state.loud - D.previewTarget : 0;
+  const moved = (arr) => (shift ? arr.map((v) => (v == null ? v : v + shift)) : arr);
+  g.append(el("path", { d: line(moved(D.env.before)), fill: "none", stroke: "var(--graphite)",
     "stroke-width": 0.75, opacity: 0.8 }));
-  g.append(el("path", { d: line(D.meter.before), fill: "none", stroke: "var(--graphite)", "stroke-width": 1.5 }));
+  g.append(el("path", { d: line(moved(D.meter.before)), fill: "none", stroke: "var(--graphite)", "stroke-width": 1.5 }));
   // the target line on top of the curves
-  g.append(el("line", { x1: TL.L, x2: w - TL.R, y1: LY(state.loud), y2: LY(state.loud),
-    stroke: "var(--reach)", "stroke-width": 1.25 }));
+  targetLine();
 
   // sections
   const [sy, sh] = TL.sec;
@@ -838,9 +1011,10 @@ function bindTimeline() {
     hl.setAttribute("x1", x); hl.setAttribute("x2", x); hl.setAttribute("visibility", "visible");
     const t = f * D.duration;
     const sec = (D.sections || []).find((s) => t >= s.start && t < s.end);
+    const shift = !isRender() && D.previewTarget != null ? state.loud - D.previewTarget : 0;
     ro.innerHTML = `<b>${clock(t)}</b>` +
       (D.meter.after ? `<span>After RMS</span><b>${fmt(D.meter.after[i])} dBFS</b>` : "") +
-      `<span>Before RMS</span><b>${fmt(D.meter.before[i])} dBFS</b>` +
+      `<span>Before RMS</span><b>${fmt(D.meter.before[i] == null ? null : D.meter.before[i] + shift)} dBFS</b>` +
       (D.limiterGr ? `<span>GR</span><b>${fmt(D.limiterGr[i])} dB</b>` : "") +
       (sec && sec.change != null ? `<span>${esc(sec.label)}</span><b>${fmt(sec.change, 1, true)} LU</b>` : "");
   });
@@ -868,6 +1042,13 @@ function bindTimeline() {
     else return;
     e.preventDefault();
     seek(next);
+    // by keyboard the position also reads the levels there (the chart's data, R6 one clause)
+    const at = Math.max(0, Math.min(D.duration, next));
+    const i = Math.min(D.meter.before.length - 1, Math.floor(at / D.duration * D.meter.before.length));
+    const sec = (D.sections || []).find((s) => at >= s.start && at < s.end);
+    host.setAttribute("aria-valuetext", `${clock(at)} of ${clock(D.duration)}` +
+      (D.meter.after ? `, after ${fmt(D.meter.after[i])} dBFS` : "") +
+      `, before ${fmt(D.meter.before[i])} dBFS` + (sec ? `, ${sec.label}` : ""));
   });
 }
 
@@ -880,10 +1061,11 @@ function fitLine(hz, db, lo = 100, hi = 10000) {
   hz.forEach((f, i) => {
     if (f >= lo && f <= hi && Number.isFinite(db[i])) { xs.push(Math.log2(f / 1000)); ys.push(db[i]); }
   });
+  if (!xs.length) return null;
   const mx = xs.reduce((a, b) => a + b, 0) / xs.length, my = ys.reduce((a, b) => a + b, 0) / ys.length;
   let num = 0, den = 0;
   xs.forEach((x, i) => { num += (x - mx) * (ys[i] - my); den += (x - mx) ** 2; });
-  const slope = num / den;
+  const slope = num / (den || 1);
   return { slope, mx, my, at: (f) => my + slope * (Math.log2(f / 1000) - mx) };
 }
 
@@ -906,45 +1088,54 @@ function drawSpectrum() {
   const F = (x) => 10 ** (lf0 + (x - SP.L) / pw * (lf1 - lf0));
   const vals = [];
   dhz.forEach((f, i) => { if (f >= 30) for (const d of [dBefore[i], dAfter[i]]) if (Number.isFinite(d)) vals.push(d); });
+  if (!vals.length) { host.replaceChildren(); return; }
   const top = Math.ceil(Math.max(...vals) / 6) * 6 + 3, bot = Math.floor(Math.min(...vals) / 6) * 6 - 3;
   const Y = (d) => SP.T + (top - d) / (top - bot) * ph;
 
-  const svg = el("svg", { viewBox: `0 0 ${w} ${h}`, role: "img",
-    "aria-label": `Spectrum chart, ${v}` });
+  // a group, not an image: the crossover / side high-pass sliders inside it stay reachable;
+  // the drawing itself is hidden from assistive tech (the values are in the text beside it)
+  const svg = el("svg", { viewBox: `0 0 ${w} ${h}`, role: "group",
+    "aria-label": `Spectrum, ${{ M: "Mid", S: "Side", stereo: "Stereo" }[v] || v}` });
+  const art = el("g", { "aria-hidden": "true" });
+  svg.append(art);
   for (const f of [50, 100, 200, 500, 1000, 2000, 5000, 10000]) {
-    svg.append(el("line", { x1: X(f), x2: X(f), y1: SP.T, y2: SP.T + ph, stroke: "var(--rule)", opacity: 0.5 }));
-    svg.append(el("text", { x: X(f), y: h - 4, "text-anchor": "middle", class: "tl-axis" },
+    art.append(el("line", { x1: X(f), x2: X(f), y1: SP.T, y2: SP.T + ph, stroke: "var(--rule)", opacity: 0.5 }));
+    art.append(el("text", { x: X(f), y: h - 4, "text-anchor": "middle", class: "tl-axis" },
       f >= 1000 ? `${f / 1000}k` : String(f)));
   }
   for (let d = Math.ceil((bot + 3) / 12) * 12; d <= top - 3; d += 24) {
-    svg.append(el("line", { x1: SP.L, x2: w - SP.R, y1: Y(d), y2: Y(d), stroke: "var(--rule)", opacity: 0.5,
+    art.append(el("line", { x1: SP.L, x2: w - SP.R, y1: Y(d), y2: Y(d), stroke: "var(--rule)", opacity: 0.5,
       "stroke-dasharray": "1 4" }));
-    svg.append(el("text", { x: SP.L - 8, y: Y(d) + 4, "text-anchor": "end", class: "tl-axis" }, fmt(d, 0)));
+    art.append(el("text", { x: SP.L - 8, y: Y(d) + 4, "text-anchor": "end", class: "tl-axis" }, fmt(d, 0)));
   }
-  svg.append(el("text", { x: SP.L - 8, y: h - 4, "text-anchor": "end", class: "tl-axis" }, "Hz"));
+  art.append(el("text", { x: SP.L - 8, y: h - 4, "text-anchor": "end", class: "tl-axis" }, "Hz"));
 
   const fit = fitLine(hz, after);
-  const tgSlope = tiltRef() + state.tilt;
-  const tgAt = (f) => fit.my + tgSlope * (Math.log2(f / 1000) - fit.mx);
+  // the displayed master's target; amber is the engine's tilt flag, which is the stereo
+  // slope's, so the Mid and Side views draw the target without it
+  const tgSlope = shownTiltTarget();
   const got = D.tilt.after[v];
-  const short = Math.abs(got - tgSlope) > D.tilt.tol;
+  const short = v === "stereo" && isShort("tilt", Math.abs(got - tgSlope) > D.tilt.tol);
   const fr = [100, 10000];
-  if (short) {
-    svg.append(el("polygon", { points: [
-      [X(fr[0]), Y(fit.at(fr[0]))], [X(fr[1]), Y(fit.at(fr[1]))],
-      [X(fr[1]), Y(tgAt(fr[1]))], [X(fr[0]), Y(tgAt(fr[0]))]].map((p) => p.join(",")).join(" "),
-      fill: "var(--amber)", opacity: 0.16 }));
+  if (fit) {
+    const tgAt = (f) => fit.my + tgSlope * (Math.log2(f / 1000) - fit.mx);
+    if (short) {
+      art.append(el("polygon", { points: [
+        [X(fr[0]), Y(fit.at(fr[0]))], [X(fr[1]), Y(fit.at(fr[1]))],
+        [X(fr[1]), Y(tgAt(fr[1]))], [X(fr[0]), Y(tgAt(fr[0]))]].map((p) => p.join(",")).join(" "),
+        fill: "var(--amber)", opacity: 0.16 }));
+    }
+    art.append(el("line", { x1: X(fr[0]), x2: X(fr[1]), y1: Y(tgAt(fr[0])), y2: Y(tgAt(fr[1])),
+      stroke: "var(--reach)", "stroke-width": 1.5 }));
+    art.append(el("line", { x1: X(fr[0]), x2: X(fr[1]), y1: Y(fit.at(fr[0])), y2: Y(fit.at(fr[1])),
+      stroke: short ? "var(--amber)" : "var(--reach)", "stroke-width": 1, "stroke-dasharray": "4 3" }));
   }
-  svg.append(el("line", { x1: X(fr[0]), x2: X(fr[1]), y1: Y(tgAt(fr[0])), y2: Y(tgAt(fr[1])),
-    stroke: "var(--reach)", "stroke-width": 1.5 }));
-  svg.append(el("line", { x1: X(fr[0]), x2: X(fr[1]), y1: Y(fit.at(fr[0])), y2: Y(fit.at(fr[1])),
-    stroke: short ? "var(--amber)" : "var(--reach)", "stroke-width": 1, "stroke-dasharray": "4 3" }));
 
   const path = (arr) => arr.map((d, i) => [dhz[i], d]).filter(([f, d]) => f >= 30 && Number.isFinite(d))
     .map(([f, d], i) => `${i ? "L" : "M"}${X(f).toFixed(1)},${Y(d).toFixed(1)}`).join("");
-  svg.append(el("path", { d: path(dBefore), fill: "none", stroke: "var(--graphite)", "stroke-width": 1.25,
+  art.append(el("path", { d: path(dBefore), fill: "none", stroke: "var(--graphite)", "stroke-width": 1.25,
     "stroke-linejoin": "round" }));
-  svg.append(el("path", { d: path(dAfter), fill: "none", stroke: "var(--ice)", "stroke-width": 1.75,
+  art.append(el("path", { d: path(dAfter), fill: "none", stroke: "var(--ice)", "stroke-width": 1.75,
     "stroke-linejoin": "round" }));
 
   // the presence and air shelves of the channels this view shows (air: "airM" / "airS")
@@ -952,12 +1143,13 @@ function drawSpectrum() {
   chans.flatMap((c) => [c, "air" + c]).forEach((ch, k) => {
     const s = D.shelves && D.shelves[ch];
     if (!s || !s.gain_db) return;
-    const atMax = s.gain_db >= D.shelves.max[ch] - 1e-6;
+    const mx = (D.shelves.max || {})[ch];
+    const atMax = mx != null && s.gain_db >= mx - 1e-6;
     const j = Math.max(0, dhz.findIndex((f) => f >= s.fc_hz));
     const x = X(s.fc_hz), y = Y(dAfter[j]) - 18 - k * 16;
     const col = atMax ? "var(--amber)" : "var(--ice)";
-    svg.append(el("circle", { cx: x, cy: y - 4, r: 3.5, fill: "none", stroke: col, "stroke-width": 1.5 }));
-    svg.append(el("text", { x: x + 9, y, class: "tl-axis", style: `fill:${col}` },
+    art.append(el("circle", { cx: x, cy: y - 4, r: 3.5, fill: "none", stroke: col, "stroke-width": 1.5 }));
+    art.append(el("text", { x: x + 9, y, class: "tl-axis", style: `fill:${col}` },
       `${v === "stereo" ? ch.replace("air", "") + " " : ""}${fmt(s.gain_db, 1, true)}${atMax ? " max" : ""}`));
   });
 
@@ -979,7 +1171,7 @@ function drawSpectrum() {
     gx.append(el("line", { x1: x, x2: x, y1: side ? SP.T + ph * 0.55 : SP.T - 4, y2: SP.T + ph,
       stroke: side ? "var(--graphite)" : "var(--dim)", "stroke-width": 1, "stroke-dasharray": side ? "1 3" : "none" }));
     gx.append(el("text", { x, y: side ? SP.T + ph * 0.55 - 6 : SP.T - 9, "text-anchor": "middle",
-      class: "tl-axis" }, side ? `Side ${Math.round(hd.f)}` : `${Math.round(hd.f)}`));
+      class: "tl-axis" }, side ? `Side ${Math.round(hd.f)} Hz` : `${Math.round(hd.f)} Hz`));
     const set = (f) => {
       if (locked()) return;
       if (side) state.sideHp = Math.min(300, Math.max(20, f));
@@ -987,24 +1179,37 @@ function drawSpectrum() {
         const cur = (state.xo = (state.xo || xo).slice());
         cur[hd.i] = Math.min(hi, Math.max(lo, f));
       }
+      touch(sel());
       markChanged(); drawSpectrum();
       const again = [...$("sp").querySelectorAll(".xo")][side ? xo.length : hd.i];
       if (again) again.focus({ preventScroll: true });
     };
+    // the drag is captured by the chart's host (the handles are redrawn on every move), and
+    // ends on up, cancel or a lost capture; the crossovers feed the analysis, so it reruns
     gx.addEventListener("pointerdown", (e) => {
       e.preventDefault();
       if (locked()) return;
       const r = host.getBoundingClientRect();
       const move = (ev) => set(F(ev.clientX - r.left));
-      const up = () => { removeEventListener("pointermove", move); removeEventListener("pointerup", up); };
-      addEventListener("pointermove", move); addEventListener("pointerup", up);
+      const end = () => {
+        for (const [k, f] of evs) host.removeEventListener(k, f);
+        try { host.releasePointerCapture(e.pointerId); } catch (_) { /* already released */ }
+        settled();
+      };
+      const evs = [["pointermove", move], ["pointerup", end], ["pointercancel", end], ["lostpointercapture", end]];
+      try { host.setPointerCapture(e.pointerId); } catch (_) { /* no active pointer (synthetic) */ }
+      for (const [k, f] of evs) host.addEventListener(k, f);
     });
     gx.addEventListener("keydown", (e) => {
       const stp = e.shiftKey ? 2 ** (1 / 3) : 2 ** (1 / 12);
-      if (e.key === "ArrowRight" || e.key === "ArrowUp") { e.preventDefault(); set(hd.f * stp); }
-      if (e.key === "ArrowLeft" || e.key === "ArrowDown") { e.preventDefault(); set(hd.f / stp); }
-      if (e.key === "Home") { e.preventDefault(); set(lo); }
-      if (e.key === "End") { e.preventDefault(); set(hi); }
+      let f = null;
+      if (e.key === "ArrowRight" || e.key === "ArrowUp") f = hd.f * stp;
+      else if (e.key === "ArrowLeft" || e.key === "ArrowDown") f = hd.f / stp;
+      else if (e.key === "Home") f = lo;
+      else if (e.key === "End") f = hi;
+      else return;
+      e.preventDefault(); set(f);
+      clearTimeout(xoTimer); xoTimer = setTimeout(settled, 600);   // once the keys stop
     });
     svg.append(gx);
   }
@@ -1012,9 +1217,19 @@ function drawSpectrum() {
   host.replaceChildren(svg);
   const st = $("spec-tilt");
   st.className = "spec-tilt" + (short ? " short" : "");
-  st.innerHTML = `<span class="of">Measured</span> ${fmt(got, 2)} <span class="of">/ Target</span> ${fmt(tgSlope, 2)} dB/oct`;
-  st.setAttribute("aria-label", `Tilt ${fmt(got, 2)}, target ${fmt(tgSlope, 2)} dB/oct`);
+  st.innerHTML = `<span class="of">Measured</span> ${fmt(got)}${flagged(short)} <span class="of">/ Target</span> ${fmt(tgSlope)} dB/oct`;
   for (const b of $("view").children) b.setAttribute("aria-checked", String(b.dataset.v === v));
+}
+
+// a crossover / side high-pass edit has settled: it is the selected track's own, and the
+// crossovers change its analysis (the side high-pass only the master)
+let xoTimer = null;
+function settled() {
+  clearTimeout(xoTimer);
+  const t = sel();
+  saveTrackParams();
+  drawStage(); drawList();
+  if (t) { t.noAuto = false; if (t.previewed) wantAnalyse(t); }
 }
 
 // Track level and Spectrum share one card; both stay laid out, so each draws at full width
@@ -1051,15 +1266,20 @@ const current = () => audio[state.listen];
 // order per master, the vote waits until both were heard, and it is saved beside the
 // master (shell write_vote, ab-votes.jsonl) before the answer shows. A vote holds no file
 // name or path. Blind off before a vote shows the answer and casts none.
-let blind = null;                 // { master, map: {x, y}, heard, switches, t0, done, vote }
+// One session per master for the whole run (blinds), so a master whose answer was shown is
+// never voted on again; a master with a vote on disk (D.voted) opens done, unblinded.
+const blinds = new Map();         // master path -> its session
+let blind = null;                 // the displayed master's: { master, map: {x, y}, heard, switches, t0, done, vote, reveal }
 const blindOn = () => state.blind && isRender() && blind && blind.master === D.master && !blind.done;
+const blindDone = () => !!(isRender() && blind && blind.master === D.master && blind.done);
 const sideOf = (v) => (blindOn() ? blind.map[v] : v === "x" ? "before" : "after");
 const buttonOf = (side) => (blindOn() ? (blind.map.x === side ? "x" : "y") : side === "before" ? "x" : "y");
 
-function newBlind() {
-  const flip = Math.random() < 0.5;
+function newBlind(voted = false) {
+  const flip = !voted && Math.random() < 0.5;
   blind = { master: D.master, map: flip ? { x: "after", y: "before" } : { x: "before", y: "after" },
-            heard: new Set(), switches: 0, t0: Date.now(), done: false, vote: null };
+            heard: new Set(), switches: 0, t0: Date.now(), done: voted, vote: null, reveal: "" };
+  blinds.set(D.master, blind);
 }
 
 // plays button v's file from the same position, carrying on if playing
@@ -1090,7 +1310,11 @@ function drawAB() {
   x.textContent = on ? "A" : "Before";
   y.textContent = on ? "B" : "After";
   $("blind-wrap").hidden = !isRender();
-  $("blind").setAttribute("aria-checked", String(state.blind));
+  // once this master's answer is out nothing is blind: the switch reads off and rests
+  // until the next master (state.blind, the preference, is kept)
+  const over = blindDone();
+  $("blind").setAttribute("aria-checked", String(state.blind && !over));
+  $("blind").disabled = over;
   $("vote").hidden = !on;
   const both = on && blind.heard.size === 2;
   for (const b of $("vote").querySelectorAll("button")) b.disabled = !both;
@@ -1100,6 +1324,8 @@ function drawAB() {
   $("share-wrap").hidden = !isRender();
   $("share").setAttribute("aria-checked", String(consent() === "yes"));
 }
+
+const r2 = (v) => (v == null || !Number.isFinite(+v) ? null : +(+v).toFixed(2));
 
 async function castVote(choice) {
   if (!blindOn() || blind.heard.size < 2) return;
@@ -1113,11 +1339,18 @@ async function castVote(choice) {
     measures: {
       loudness: D.loudness.reached, true_peak: D.truePeak,
       crest: { before: D.crest.before, after: D.crest.after }, lra: { before: D.lra.before, after: D.lra.after },
-      tilt: { before: +D.tilt.before.stereo.toFixed(2), after: +D.tilt.after.stereo.toFixed(2) },
+      tilt: { before: r2(D.tilt.before && D.tilt.before.stereo), after: r2(D.tilt.after && D.tilt.after.stereo) },
     },
   };
   blind.vote = vote;
-  if (IS_APP) await TAURI.core.invoke("write_vote", { master: D.master, vote: JSON.stringify(vote) }).catch(() => {});
+  // the vote is saved before the answer shows; a failed save says so and shares nothing
+  if (IS_APP) {
+    try { await TAURI.core.invoke("write_vote", { master: D.master, vote: JSON.stringify(vote) }); } catch (_) {
+      blind.vote = null;
+      endBlind(`${masterSide} was the master. Vote not saved.`);
+      return;
+    }
+  }
   const said = choice === "none" ? "You couldn't tell them apart."
     : vote.preferred === "master" ? "You preferred the master." : "You preferred the original.";
   const c = consent();
@@ -1147,26 +1380,42 @@ async function queueVote(vote) {
   if (IS_APP) await TAURI.core.invoke("queue_vote", { vote: JSON.stringify(wire) }).catch(() => {});
 }
 
+// the panel takes focus and gives it back where it came from (the Share switch, or the vote
+// buttons, which are gone by then: the switch); Escape is No thanks
+let consentReturn = null;
 function showConsent(vote) {
   pendingShare = vote;
+  consentReturn = document.activeElement;
   $("consent").hidden = false;
   $("consent-yes").focus();
+}
+function closeConsent() {
+  $("consent").hidden = true;
+  const back = consentReturn && consentReturn !== document.body && consentReturn.isConnected
+    && !consentReturn.closest("[hidden]")
+    && !consentReturn.disabled ? consentReturn : $("share");
+  consentReturn = null;
+  back.focus();
 }
 
 function bindConsent() {
   $("consent-yes").addEventListener("click", async () => {
-    $("consent").hidden = true;
-    setConsent("yes");
-    if (pendingShare) {
-      await queueVote(pendingShare);
-      if (blind && blind.vote === pendingShare) { blind.reveal += " Vote shared."; drawAB(); }
-    }
+    const vote = pendingShare;
     pendingShare = null;
+    setConsent("yes");
+    closeConsent();
+    if (vote) {
+      await queueVote(vote);
+      if (blind && blind.vote === vote) { blind.reveal += " Vote shared."; drawAB(); }
+    }
   });
   $("consent-no").addEventListener("click", () => {
-    $("consent").hidden = true;
     pendingShare = null;
     setConsent("no");
+    closeConsent();
+  });
+  $("consent").addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); $("consent-no").click(); }
   });
   $("share").addEventListener("click", () => {
     if (consent() === "yes") {
@@ -1201,11 +1450,18 @@ function setAudio() {
     audio[k].src = p ? mediaUrl(p) : "";
   }
   $("play").disabled = !(D.ab && D.ab.before && D.ab.after);
-  // a new master starts a new blind session, on A
-  if (isRender() && (!blind || blind.master !== D.master)) {
-    newBlind();
-    if (state.blind) { pickAB("x"); state.listen = sideOf("x"); }
-    else state.listen = sideOf(state.abSel);
+  // a master met for the first time starts its blind session, on A (done at once when a
+  // vote is already on disk); one met before carries on with its own
+  if (isRender()) {
+    const known = blinds.get(D.master);
+    if (known) {
+      blind = known;
+      state.listen = sideOf(state.abSel);
+    } else {
+      newBlind(!!D.voted);
+      if (blindOn()) { pickAB("x"); state.listen = sideOf("x"); }
+      else state.listen = sideOf(state.abSel);
+    }
   }
   drawAB();
 }
@@ -1275,20 +1531,86 @@ function bindTransport() {
       }
     }
     drawAB();
+    // the switch rests once the answer is out: focus goes to the A/B choice beside it
+    if ($("blind").disabled && document.activeElement === $("blind")) {
+      const on = $("ab").querySelector('[aria-checked="true"]');
+      if (on) on.focus();
+    }
   });
   for (const b of $("vote").querySelectorAll("button")) b.addEventListener("click", () => castVote(b.dataset.v));
 }
 
+// The footer's values for the displayed master: the engine's measurements (report.json,
+// uidata `delivery` for integrated loudness, true peak, playback gains and format), amber
+// from the engine's flags, and Flags n, which discloses the flags' own texts (engine-written,
+// must-know state). Rows whose data is absent (older renders) are left out.
+let flagsOpen = false;
 function drawStats() {
-  if (!isRender()) { $("stats").innerHTML = ""; return; }
+  if (!isRender()) { $("stats").innerHTML = ""; drawFlagList([]); return; }
+  const dl = D.delivery || {};
   const crestLow = isShort("crest", D.crest.after != null && D.crest.after < REF_CREST);
   const noiseShort = isShort("noise", !!(D.noise && D.noise.status));
-  $("stats").innerHTML =
-    `<div><dt>Crest</dt><dd${crestLow ? ' class="short"' : ""}>${fmt(D.crest.after)} dB<small>Before ${fmt(D.crest.before)} dB</small></dd></div>` +
-    `<div><dt>Range</dt><dd${isShort("lra", false) ? ' class="short"' : ""}>${fmt(D.lra.after)} LU<small>Before ${fmt(D.lra.before)} LU</small></dd></div>` +
-    `<div><dt>True peak</dt><dd>${fmt(D.truePeak, 2)} dBTP</dd></div>` +
-    (D.noise && D.noise.after_db != null ? `<div><dt>Noise</dt><dd${noiseShort ? ' class="short"' : ""}>${fmt(D.noise.after_db, 0)} dBFS` +
-      `<small>Before ${fmt(D.noise.before_db, 0)} dBFS</small></dd></div>` : "");
+  const lraShort = isShort("lra", false), tpShort = isShort("tp", false);
+  const dd = (short, body) => `<dd${short ? ' class="short"' : ""}>${body}</dd>`;
+  const stat = (name, short, value, small = "") =>
+    `<div><dt>${name}</dt>${dd(short, `${value}${flagged(short)}${small ? `<small>${small}</small>` : ""}`)}</div>`;
+  const il = dl.integrated_lufs;
+  const tp = afterOf(dl.true_peak_max_dbtp) ?? D.truePeak;
+  const pg = dl.playback_gain_db, fm = dl.format;
+  const fl = shortFlags(D);
+  let html = "";
+  if (il && afterOf(il) != null) html += stat("Integrated", false, `${fmt(afterOf(il))} LUFS`,
+    il.before != null ? `Before ${fmt(il.before)}` : "");
+  html += stat("True peak", tpShort, `${fmt(tp, 2)} dBTP`);
+  html += stat("Crest", crestLow, `${fmt(D.crest.after)} dB`, `Before ${fmt(D.crest.before)} dB`);
+  html += stat("Range", lraShort, `${fmt(D.lra.after)} LU`, `Before ${fmt(D.lra.before)} LU`);
+  if (D.noise && D.noise.after_db != null) html += stat("Noise", noiseShort, `${fmt(D.noise.after_db, 0)} dBFS`,
+    `Before ${fmt(D.noise.before_db, 0)} dBFS`);
+  if (pg && (pg.spotify != null || pg.apple != null)) {
+    html += `<div><dt>Playback</dt><dd>` +
+      (pg.spotify != null ? `<span class="svc">Spotify</span>${fmt(pg.spotify, 1, true)}` : "") +
+      (pg.apple != null ? `<span class="svc">Apple</span>${fmt(pg.apple, 1, true)}` : "") + ` dB</dd></div>`;
+  }
+  if (fm && (fm.sample_rate || fm.bits)) {
+    const dz = fm.dither === true ? "dither" : typeof fm.dither === "string" && fm.dither && fm.dither !== "none"
+      ? (fm.dither.toLowerCase() === "tpdf" ? "TPDF" : fm.dither) : "";
+    const value = [fm.sample_rate ? `${+(fm.sample_rate / 1000).toFixed(1)} kHz` : "", fm.bits ? `${fm.bits}-bit` : "", dz]
+      .filter(Boolean).map(esc).join(" ");
+    html += stat("Format", false, value, fm.ceiling_dbtp != null ? `Ceiling ${fmt(fm.ceiling_dbtp)} dBTP` : "");
+  }
+  if (D.flags) {
+    html += `<div class="flags-stat"><dt id="flags-k">Flags</dt>${dd(fl.length > 0, fl.length
+      ? `<button type="button" class="flags-n" id="flags-btn" aria-expanded="${flagsOpen}" aria-controls="flag-list"` +
+        ` aria-labelledby="flags-k flags-btn">${fl.length}</button>`
+      : "0")}</div>`;
+  }
+  const refocus = document.activeElement && document.activeElement.id === "flags-btn";
+  $("stats").innerHTML = html;
+  if (refocus && $("flags-btn")) $("flags-btn").focus();
+  drawFlagList(fl);
+}
+
+function drawFlagList(fl) {
+  const list = $("flag-list");
+  if (!fl.length) flagsOpen = false;
+  list.innerHTML = fl.map((f) => `<li>${esc(f.text || f.kind)}</li>`).join("");
+  list.hidden = !flagsOpen;
+}
+
+function bindStats() {
+  const toggle = (open) => {
+    flagsOpen = open;
+    const b = $("flags-btn");
+    if (b) b.setAttribute("aria-expanded", String(open));
+    $("flag-list").hidden = !open;
+  };
+  $("stats").addEventListener("click", (e) => { if (e.target.closest("#flags-btn")) toggle(!flagsOpen); });
+  document.querySelector(".transport").addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && flagsOpen) {
+      toggle(false);
+      if ($("flags-btn")) $("flags-btn").focus();
+    }
+  });
 }
 
 /* ------------------------------------------------------------------- shared */
@@ -1350,6 +1672,8 @@ async function openStems(picked) {
   const got = picked || await TAURI.core.invoke("pick_stems").catch(() => null);
   if (!got) return;
   let t = tracks.find((x) => samePath(x.input, got.sum));
+  // a set being summed or rendered is not reset under its running job
+  if (t && (renderOf(t) || stemsOf(t))) { select(tracks.indexOf(t)); return; }
   const fresh = { stems: got.stems, mix: got.mix, unsummed: true, status: "summing", ui: null, preview: null,
                   row: null, error: null, nullTest: null };
   if (t) Object.assign(t, fresh);
@@ -1403,18 +1727,20 @@ async function init() {
     $("cpu").setAttribute("aria-checked", String(state.limitCpu));
     if (queueOn) runNext();
   });
-  segment("delivery", (v) => { state.delivery = v; markChanged(); });
+  // (a radio picked again is no edit: it must not release the kept masters)
+  segment("delivery", (v) => { if (v !== state.delivery) { state.delivery = v; edited(); } });
   segment("profile", (v) => {
+    if (v === state.profile) return;
     // the loudness follows the profile's default unless it was moved off the old one
     if (state.loud === PROFILES[state.profile].loud) state.loud = PROFILES[v].loud;
     state.profile = v;
     const [lo, hi] = PROFILES[v].range;
     state.loud = Math.min(hi, Math.max(lo, state.loud));
-    drawTargets(); drawTimeline(); markChanged();
+    edited(); drawTimeline(); drawSpectrum();
   });
   segment("view", (v) => { state.view = v; drawSpectrum(); });
   segment("graph", showGraph);
-  bindTargets(); bindTimeline(); bindSpectrum(); bindTransport(); bindConsent(); bindList();
+  bindTargets(); bindTimeline(); bindSpectrum(); bindTransport(); bindConsent(); bindList(); bindStats();
   drawAbout();
   if (/controls/.test(location.hash)) $("disclosure").click();
 
@@ -1426,7 +1752,12 @@ async function init() {
     await ev.listen("tauri://drag-leave", () => tl.classList.remove("drop"));
     // drops are expanded and granted by the shell (Rust), which sends the inputs
     await ev.listen("inputs", (e) => { tl.classList.remove("drop"); addInputs(e.payload && e.payload.inputs); });
-    setInterval(() => { if (renderJobs().length || slots.view || slots.analyse) { drawStage(); drawList(); } }, 1000);
+    // the times tick: the status line and the list's state cells, nothing else is redrawn
+    setInterval(() => {
+      if (renderJobs().length || slots.view || slots.analyse || Object.keys(slots).some((k) => k.startsWith("stems-"))) {
+        drawStage(); tickList();
+      }
+    }, 1000);
   }
   new ResizeObserver(() => { drawTimeline(); drawSpectrum(); }).observe(document.querySelector(".app"));
   drawAll();
