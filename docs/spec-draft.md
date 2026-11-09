@@ -96,7 +96,15 @@ Package name `eluate` (maintainer, 2026-10-21; it was `offmaster` until then).
   HP `1 - |H_lp|^2` is exactly the squared Butterworth high-pass (audit F2).
 - Zero-phase splits pre-ring symmetrically once bands get different gains (audit F1). Default is
   `zero` for all crossovers except the lowest, which is decided by listening in gate D with
-  `minimum` as the expected winner.
+  `minimum` as the expected winner. **Decided 2026-11-10** (filter-maths audit F1, docs/gain-staging.md
+  21): new plans make the lowest crossover of the multiband and the frequency-dependent limiter
+  `minimum` (`--xover-phase {minimum,zero}`, default minimum, recorded in the plan); the zero-phase
+  100 Hz split pre-rang a kick by -14.9 dB re its peak 6 ms early at -6 dB of sub GR, the LR4 puts
+  nothing before the onset; the band sum is the LR4 allpass (flat magnitude, 5.3 / 4.5 ms of group
+  delay at 50 / 100 Hz, none above 1 kHz). Saturate's split stays zero phase; saved plans keep
+  their recorded phase. `split_iter` streams every mode (one band alive at a time).
+- Zero-phase passes run blocked with a subnormal flush (`iir.py`, 2026-11-10): bit-identical to
+  `sosfiltfilt` without digital silence, within 1e-12 with it.
 - Edge handling: **zero padding** of `max(512, ceil(20 fs / (2 pi fc_min)))` samples (capped at
   len(x) - 1 with a warning), with odd reflection available as `edge="odd"` (audit 02 D.9). Real
   tracks start from digital silence or a fade, and silence is the true continuation; odd reflection
@@ -169,6 +177,11 @@ A gain envelope `g(t) in (0,1]` is built as (audit F7):
    02 F11). Solved by a banded interior-point method, O(n). Compared against 3-4 in gate D.
 6. The smooth-then-project iteration from draft 0.1 is dropped.
 7. Rates: multiband/notch/tone at 1 ms with cubic interpolation to audio rate; limiter at 8x audio rate.
+8. Hold (2026-11-10, `box_smooth(..., hold)`): the running minimum reaches `hold` samples further
+   back, `[-(L-1)-hold, L-1]`, then the same two averages. The kernel support stays inside every
+   minimum window, so `g <= g_req` still holds by construction; reduction never starts earlier;
+   an isolated dip recovers exactly `hold` samples later. The final limiter holds 25 ms (one 40 Hz
+   period) so it does not ripple inside a sub cycle; hold 0 is the original, bit for bit.
 
 ### 3.5 stages/ (order accepted by maintainer)
 1. `notch`: per confirmed resonance, `y = x - d(t) * BP_zp(x; f0, Q)`, `BP_zp` fixed-frequency
@@ -177,14 +190,19 @@ A gain envelope `g(t) in (0,1]` is built as (audit F7):
    convention), solved through the bilinear warp (audit 05 A5). Kick mask holds depth at zero for
    +-20 ms around each onset at audio rate, padded by one control period on the 1 ms grid (audit 05
    A8). **Merge candidates whose -3 dB bands overlap**, and clamp the composite cut at any frequency
-   to the cap (audit 05 A6). Q >= 1.
+   to the cap (audit 05 A6). Q >= 1. The bands are the realised (bilinear-warped) half-cut edges
+   since 2026-11-10 (the analog edges were 5 to 17 % off above fs / 4 at Q 2); the bandpass pad
+   follows the slowest pole, real or complex.
 2. `sidestrip`: zero-phase HP on S only below `fc_sub` (default 100 Hz; analysis suggestion = lowest
    frequency where S/M ratio exceeds -20 dB, bounded 60 to 150 Hz). Never mono-sums.
 3. `multiband`: N-band M/S (default 5). Per band x {M,S}: a **compressor envelope** (threshold,
    ratio, attack and release as window lengths, from 3.4, max GR 3 dB hard cap) multiplied by a
    **per-band limiter envelope** (ceiling, short lookahead, from 3.4). Threshold shapes the band's
    dynamics; the ceiling catches its peaks, as in iZotope's multiband dynamics (maintainer ruling
-   2026-10-17). Per-band crest is steered here, not at the final stage.
+   2026-10-17). Per-band crest is steered here, not at the final stage. Detector (2026-11-10): the
+   peak over the trailing window of one period of the band's lower edge, floored at 2 ms (25, 10,
+   3, 2, 2 ms on the default crossovers), so the low bands do not ripple inside a cycle; band
+   ceilings release 100 / 80 / 50 / 50 / 50 ms; ms_link takes its minimum on the control grid.
    S in the sub and low bands: makeup 0. S in the high-mid and air bands: makeup +2 dB scaled by
    `(1 - decoherence)`, bounded to [0, +3] dB; M makeup bounded to +-3 dB at validation (audit 05
    Q6). Band targets come from `tone`.
