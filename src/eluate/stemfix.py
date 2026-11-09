@@ -31,12 +31,14 @@ Mapping (limit -> fix):
   projection share there is at least EQ_SHARE_MIN (a stem cancelling against the rest is
   never boosted to fix the sum). The section is detail["section"], else parsed from the
   limit text. Sizing: when the entry's detail carries "wanted_db" (the total gain the
-  sum's section wanted, the planner's range_deficit_db), excess = wanted_db - gain_db (the
+  sum's section wanted: the planner's range_deficit_db for the shelves, the median of its
+  fit's node deficits in the range for the low shelf, bell and band shelf; stems.attribute),
+  excess = wanted_db - gain_db (the
   applied bound) and the per-stem gain g solves 1 + (g - 1) S = 10^(excess / 20), S the
   chosen stems' summed share (a stem's projection moves the sum's level in the range by its share);
   a known excess of 0 or less (the section sits at its bound for the slope target, having
   wanted less than it got in the range) proposes nothing; EQ_STEP_DB only when wanted_db
-  is unknown. Shapes: high and air shelves the inputeq first-order high shelf (the
+  is unknown (a report without the planner's record). Shapes: high and air shelves the inputeq first-order high shelf (the
   _side ones on the stem's S only), low shelf the RBJ low shelf at Q EQ_LOW_SHELF_Q, bell
   and band shelf an RBJ peak at the range's geometric centre (Q = centre / width; the
   band shelf's flat cut approximated). All zero phase, forward-backward at half the dB
@@ -94,8 +96,8 @@ carrying the sub with its pads and leads is never ducked full band); a name toke
 to a bass's energy (a tiebreak); without both hints the kick's crest must beat the bass's
 by ROLE_CREST_GAP_DB. No bass that passes: no duck (the entry's stems are compressed).
 A bass already dipping under the kick (a sidechain in the mix) is not ducked again: per
-onset `existing_dip_db` (its low-band RMS before and after the kick against under it)
-comes off the depth.
+onset `existing_dip_db` (its low-band RMS before and after the kick against its RMS
+DUCK_DURING_MS under it, when at least DUCK_EXISTING_MIN_DB) comes off the depth.
 Kick onsets: the kick's low-band 1 ms envelope (peak held over ENV_HOLD_MS) rising ONSET_RISE_DB above its minimum
 over the previous ONSET_RISE_MS, within ONSET_RANGE_DB of its loud level (99.5th
 percentile), at least ONSET_GAP_MS apart. Per onset the bass gain dips by depth x w on a
@@ -167,7 +169,11 @@ ROLE_BROADBAND_SHARE = 0.5  # ... and not the set's dominant broadband stem (its
 KICK_HINTS = ("kick", "kik", "kck", "bd", "bassdrum", "drum", "drums")
 BASS_HINTS = ("bass", "sub", "808")
 DUCK_PRE_MS = (55, 5)       # existing_dip_db: the bass before an onset, [i - 55 ms, i - 5 ms]
-DUCK_DURING_MIN_MS = 50     # ... under the kick, [i, i + max(hold, this)] (two 41 Hz periods)
+DUCK_DURING_MS = (10, 60)   # ... under the kick, [i + 10 ms, i + 60 ms]: two 41 Hz periods
+                            # where a sidechain's dip is deepest, past a note's own attack and
+                            # the lowpass's delay (a note starting with the kick reads 0.6 dB
+                            # from i on, 0.1 dB from i + 10 ms)
+DUCK_EXISTING_MIN_DB = 1.0  # an existing dip under this is a note's envelope, not a sidechain
 DUCK_POST_MS = (100, 200)   # ... and after it, [i + 100 ms, i + 200 ms]
 ENV_HOLD_MS = 25            # the low-band envelope's peak hold: one period at 40 Hz
 ONSET_RISE_DB = 9.0         # a kick's attack rises at least this within ONSET_RISE_MS (real kicks
@@ -346,12 +352,16 @@ def _release_ms(bpm) -> float:
     return DUCK_RELEASE_DEFAULT_MS
 
 
-def existing_dip_db(lo: np.ndarray, fs: int, onset_frame: int, hold_frames: int) -> float:
+def existing_dip_db(lo: np.ndarray, fs: int, onset_frame: int) -> float:
     """How far the bass's low band (lo, its lowpassed mono) already dips under a kick at
-    this onset (1 ms frames): its RMS over the DUCK_PRE_MS window before the onset and the
-    DUCK_POST_MS window after, the lower of the two (a sidechain's signature is a bass at
-    level on both sides of the dip; a note starting or ending at the kick reads 0), minus
-    its RMS over the hold ([onset, onset + max(hold, DUCK_DURING_MIN_MS)]); floored at 0."""
+    this onset (1 ms frames): its level outside the dip, the louder of its RMS over the
+    DUCK_PRE_MS window before the onset and the DUCK_POST_MS window after (a slow
+    sidechain release still holds the bass down 100 ms on; a note starting at the kick has
+    no level before it and reads its own level after), minus its RMS over DUCK_DURING_MS
+    after the onset (a note ending at the kick, silent there: 0, and its overlap weight is
+    0 anyway); under DUCK_EXISTING_MIN_DB it reads 0. On a sub sidechained 6 dB with a 100 ms
+    release it reads about 3.8 dB, so a 3 dB duck adds none; 3 dB / 60 ms reads 1.5 (the
+    duck adds 1.5); 1.5 dB / 30 ms and an unducked sub read 0."""
     spf = fs / _RATE
     n = lo.shape[0]
 
@@ -366,10 +376,12 @@ def existing_dip_db(lo: np.ndarray, fs: int, onset_frame: int, hold_frames: int)
     i = onset_frame
     pre = rms_db(i - DUCK_PRE_MS[0], i - DUCK_PRE_MS[1])
     post = rms_db(i + DUCK_POST_MS[0], i + DUCK_POST_MS[1])
-    during = rms_db(i, i + max(hold_frames, DUCK_DURING_MIN_MS))
-    if pre is None or post is None or during is None or not math.isfinite(during):
+    during = rms_db(i + DUCK_DURING_MS[0], i + DUCK_DURING_MS[1])
+    ref = max((v for v in (pre, post) if v is not None), default=None)
+    if ref is None or during is None or not math.isfinite(during):
         return 0.0
-    return max(0.0, min(pre, post) - during)
+    d = ref - during
+    return d if d >= DUCK_EXISTING_MIN_DB else 0.0
 
 
 def duck_gain_db(kick: np.ndarray, bass: np.ndarray, fs: int, depth_db: float,
@@ -394,7 +406,7 @@ def duck_gain_db(kick: np.ndarray, bass: np.ndarray, fs: int, depth_db: float,
         w = float(np.clip((b - (ref - OVERLAP_RANGE_DB)) / OVERLAP_RANGE_DB, 0.0, 1.0))
         if w <= 0.0:
             continue
-        d = max(0.0, depth_db * w - existing_dip_db(lo, fs, i, h))
+        d = max(0.0, depth_db * w - existing_dip_db(lo, fs, i))
         if d <= 1e-9:
             continue
         a0 = max(0, i - la)
@@ -664,12 +676,16 @@ def plan(rep: dict, stems: np.ndarray, names, fs: int, prior: list[dict] | None 
         top = [r["name"] for r in rows[:2]]
         # the second stem is compressed too when it is within COMP_SECOND_DB of the first
         # on the entry's ranking: its leave-one-out drop of the sum's peak where it is
-        # given (stems.attribute, limiter moments), else its own peak
-        pkey = "peak_drop_db" if rows[0].get("peak_drop_db") is not None else "peak_db"
+        # given (stems.attribute, limiter moments), else its own peak. A stem whose removal
+        # does not lower the sum's peak (it cancels there) is never compressed for it.
+        loo = any(r.get("peak_drop_db") is not None for r in rows[:2])
+        pkey = "peak_drop_db" if loo else "peak_db"
         p0 = _num(rows[0].get(pkey))
         named = [rows[0]["name"]] + [r["name"] for r in rows[1:2]
                                      if p0 is not None and _num(r.get(pkey)) is not None
                                      and p0 - r[pkey] <= COMP_SECOND_DB]
+        if loo:
+            named = [nm for nm, r in zip(named, rows) if (_num(r.get(pkey)) or 0.0) > 0.0]
         moments = det.get("moments_s")
         if low:
             k, b, on = role()
