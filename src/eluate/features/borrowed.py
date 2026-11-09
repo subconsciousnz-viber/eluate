@@ -8,7 +8,8 @@
 Origins (copied, not imported; the maintainer holds the copyright):
 - `detect_onsets`, `superflux`: TRANSMUTATION engine/transients.py `detect_onsets`
   (rebuilt 2026-08-18): log-compressed SuperFlux, multiplicative local-median
-  threshold plus a global salience gate, 64-sample attack refinement, 50 ms gap.
+  threshold plus a global salience gate, 64-sample attack refinement (64 at
+  44.1 kHz, the same 1.45 ms at other rates: `refine_env`, audit features F17), 50 ms gap.
   Logic unchanged. The per-frame rfft loop is vectorised in blocks and the flux
   computation is split out as `superflux` so the envelope can be reported as
   onset strength; `detect_onsets(x, sr)` returns the same sample indices as the
@@ -100,6 +101,16 @@ def superflux(audio, sr, hop: int = 512, n_fft: int = 2048):
     return flux, n_frames
 
 
+REFINE_ENV_S = 64 / 44100  # the C++'s 64-sample refinement envelope, as a duration
+
+
+def refine_env(sr: float) -> int:
+    """The onset refinement's moving-energy length in samples: TRANSMUTATION's 64 at
+    44.1 kHz (so the port stays bit-identical there), the same 1.45 ms at other rates
+    (audit features F17: a fixed 64 samples was 0.67 ms at 96 kHz)."""
+    return max(2, int(round(REFINE_ENV_S * float(sr))))
+
+
 def detect_onsets(audio, sr, hop: int = 512, n_fft: int = 2048):
     """Salience-gated SuperFlux onsets (TRANSMUTATION). Sorted sample indices."""
     x = np.asarray(audio, dtype=np.float64)
@@ -125,7 +136,7 @@ def detect_onsets(audio, sr, hop: int = 512, n_fft: int = 2048):
     if not cand:
         return np.array([], dtype=int)
 
-    env_w = 64
+    env_w = refine_env(sr)  # 64 samples at 44.1 kHz, the same 1.45 ms at every rate (F17)
     kernel = np.ones(env_w) / env_w
     onsets = []
     for i in cand:
@@ -168,7 +179,7 @@ def log_filterbank(n_fft: int, sr: float, bands_per_octave: int = 12, f_lo: floa
 
 
 def detect_onsets_fb(audio, sr, hop: int = 512, n_fft: int = 2048, bands_per_octave: int = 12,
-                     local_s: float = 4.0, env_w: int = 64):
+                     local_s: float = 4.0, env_w: int | None = None):
     """SuperFlux as in the literature (Boeck and Widmer 2013): the TRANSMUTATION
     detector with two changes (spec 3.3 draft 0.4, audit 04 A11): the magnitude
     spectrum goes through a log-frequency triangular filterbank before log
@@ -176,7 +187,10 @@ def detect_onsets_fb(audio, sr, hop: int = 512, n_fft: int = 2048, bands_per_oct
     much per octave as a hat's many high ones; and the threshold floor is
     0.07 x the maximum flux within +-local_s instead of the whole track's, so
     a quiet intro keeps its onsets. Refinement, gap and the local-median term
-    are unchanged. `env_w` is the refinement envelope length in samples."""
+    are unchanged. `env_w` is the refinement envelope length in samples
+    (None: refine_env(sr), 64 at 44.1 kHz)."""
+    if env_w is None:
+        env_w = refine_env(sr)
     x = np.asarray(audio, dtype=np.float64)
     if x.size < 2 * hop or not np.any(np.abs(x) > 1e-9):
         return np.array([], dtype=int)

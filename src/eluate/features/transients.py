@@ -38,8 +38,10 @@ Contract:
      F5, 2026-11-10): KICK_FLUX_REL x the KICK_FLUX_PERCENTILE of the flux at
      its 3-point local maxima inside the energy gate (every rise; the +-50 ms
      winners are a fifth kicks and would set the gate on the kicks
-     themselves), floored at KICK_FLUX_MIN_DB (`flux_gate_db` in the debug
-     dict). A fixed 10 dB gate lost 23 of 43 kicks under a sustained
+     themselves), clipped to KICK_FLUX_MIN_DB .. KICK_FLUX_MAX_DB
+     (`flux_gate_db` in the debug dict); the cap is the former fixed gate, as on
+     sparse material (kicks and a hat) the local maxima are mostly the kicks and
+     their own p90 x 1.5 gated every kick out. A fixed 10 dB gate lost 23 of 43 kicks under a sustained
      (unducked) bass and pad: bins holding a sustained tone show no rise and
      dilute the mean, so the kicks peaked at 8 to 10 dB while the track's
      local-maximum flux had its p90 at 3.5 dB (kickless material: 3.2 to 4.7,
@@ -120,6 +122,7 @@ KICK_FLOOR_DB = 80.0
 KICK_FLUX_MIN_DB = 6.0        # the candidate gate's floor (audit features F5; was a fixed 10 dB)
 KICK_FLUX_PERCENTILE = 90.0   # ... and its reference: this percentile of the local-maximum flux ...
 KICK_FLUX_REL = 1.5           # ... times this (kicks under bass + pad peak 8 to 10 dB; the p90 reads 3.2 to 4.7)
+KICK_FLUX_MAX_DB = 10.0       # ... capped at the former fixed gate
 KICK_OFFSET_S = 0.0
 KICK_RANGE_DB = 40.0
 KICK_NEIGHBOUR_S = 0.050
@@ -170,8 +173,10 @@ def kick_onsets(ctx: Context) -> tuple[np.ndarray, dict]:
     rises = np.zeros(d.size, dtype=bool)
     rises[1:-1] = (d[1:-1] >= d[:-2]) & (d[1:-1] >= d[2:]) & (d[1:-1] > 0)
     rises &= inside & (e > e_loc - KICK_RANGE_DB)
-    gate = max(KICK_FLUX_MIN_DB, KICK_FLUX_REL * float(np.percentile(d[rises], KICK_FLUX_PERCENTILE))) \
-        if np.any(rises) else KICK_FLUX_MIN_DB
+    # capped at the former fixed gate: on sparse material (kicks and a hat, little else)
+    # the local maxima are mostly the kicks, whose own p90 would gate them all out
+    gate = float(np.clip(KICK_FLUX_REL * float(np.percentile(d[rises], KICK_FLUX_PERCENTILE)),
+                         KICK_FLUX_MIN_DB, KICK_FLUX_MAX_DB)) if np.any(rises) else KICK_FLUX_MIN_DB
     cand = np.nonzero(live & (d > gate))[0]
     # candidates closer than KICK_MIN_GAP_S: the stronger flux wins (first-come let a
     # 6 dB noise rise in an empty low band 60 to 100 ms before a 30 dB kick take its place)
