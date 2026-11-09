@@ -1417,10 +1417,11 @@ function bindConsent() {
   $("consent").addEventListener("keydown", (e) => {
     if (e.key === "Escape") { e.preventDefault(); $("consent-no").click(); }
   });
-  $("share").addEventListener("click", () => {
+  $("share").addEventListener("click", async () => {
     if (consent() === "yes") {
+      // the switch reads off only once the shell has dropped what was waiting to be sent
+      if (IS_APP) { try { await TAURI.core.invoke("clear_outbox"); } catch (_) { /* shown off anyway */ } }
       setConsent("no");
-      if (IS_APP) TAURI.core.invoke("clear_outbox").catch(() => {});
     } else {
       showConsent(null);                  // switching on is the same yes, with the same words
     }
