@@ -6,6 +6,45 @@ sessions/agents. Draft 0.2 folds in the maintainer's decisions of 2026-10-17 and
 accepted findings from `audit/01-research-review.md` (review of
 `research/report.md`). Items marked **[Q]** are still open.
 
+> **Status 2026-11-10: historical draft.** This spec is the 2026-10-17 work breakdown and is kept
+> for its reasoning and audit trail; it is **not** the current contract. Where it disagrees with
+> the code, the code, its module docstrings and `docs/gain-staging.md` (cited as GS §n) win. Known
+> contradictions, with what supersedes each:
+>
+> 1. **Loudness target** (3.6, 3.7, 9): S95 is retired as a target. The constraint is the RMS
+>    target +-0.3 dB on the 300 ms AES17 meter (`Targets.rms_dbfs`, default
+>    `planner.DEFAULT_TARGET_RMS_DBFS` = -4.1); S95 is still reported. GS §17, §18; retirement
+>    list in GS §14.2.
+> 2. **True-peak ceiling** (3.6): the default is -0.3 dBTP on the 8x meter, 24-bit output;
+>    -1 dBTP with the worst-of-4x/8x/32x meter applies only under `--streaming`. GS §3
+>    "Ceiling", §11 "Ceiling and export".
+> 3. **Solver method** (3.6 "Method", 1 "solver loop"): the lever classes, coordinate descent
+>    and nearest-feasible-point reporting are retired; the solver is a fixed sequence of planned,
+>    true-peak, slope and loudness renders (`solver.py`). GS §14.2 "Retired".
+> 4. **CLI** (4): `--target`, `--genre` and `--harmonic` no longer exist (abbreviations are off,
+>    so `--target` errors). Section 4 below is corrected; `eluate <command> --help` is
+>    authoritative. GS §14.2 "CLI".
+> 5. **`tone` stage** (3.5 item 4, 9): the planner leaves tone off; the spectral move is the
+>    input EQ (`stages/inputeq.py`). The chain (`stages/__init__.py`) is input gain, inputeq,
+>    notch, sidestrip, multiband, tone, saturate, glue, speclim (a ceiling-only multiband),
+>    keyeq, limiter, output; this list omits input, inputeq, speclim and output. GS §10, §12,
+>    §18, §19.
+> 6. **`saturate`** (3.5 item 5): drive is capped at 2 dB (`planner.SAT_MAX_DRIVE_DB`) and set
+>    from the band deficit; the harmonic-vs-linear blend is retired. GS §6, §14.2.
+> 7. **`glue`** (3.5 item 6): default `glue_mode="serial"`, FET-style, 2:1, 0.4 ms attack
+>    (`planner.GLUE_ATTACK_MS`); parallel is an option. GS §13, §18.
+> 8. **Crossovers** (9): default 100 / 400 / 1600 / 6400 Hz, and without `--xover` they are
+>    key-locked to the track's tonic. Corrected in 9 below. GS §4, §11.
+> 9. **Licence** (8, 9): decided, AGPL-3.0-or-later (`LICENSE`, `pyproject.toml`). Corrected
+>    in 8 below.
+> 10. **Pipeline and repository layout** (1, 2): no `offline-master/` root, no
+>    `docs/architecture.md`, and many modules are missing from the list. Section 2 is
+>    corrected; the environment table in 0 is also stale (the pinned set is Python 3.12 and
+>    `requirements/lock-*.txt`, see `requirements/README.md`).
+>
+> References to `audit/NN-*.md` below point to the maintainer's internal review logs, which
+> are not part of the public tree; they are kept as the historical record.
+
 ## 0. Environment (verified 2026-10-17)
 
 | Item | State |
@@ -60,28 +99,39 @@ Design rules that make this orchestratable:
 
 ## 2. Repository layout
 
+As of 2026-11-10 (the draft's original layout, rooted at `offline-master/` with a
+`docs/architecture.md` that was never written, is superseded):
+
 ```
-offline-master/
-  research/report.md            # Phase 1 (Gemini), reviewed in audit/01
-  docs/architecture.md          # Deliverable 2
-  docs/spec-draft.md            # this file
-  audit/NN-topic.md             # audit logs
+(repository root)
+  mastering-engine-brief.md     # the intent
+  research/                     # Phase 1 research report
+  docs/                         # spec-draft.md (this file), gain-staging.md, dynamics-macros.md,
+                                # noise-and-stems.md, batch-mode.md, UI-brief.md, release notes
   src/eluate/
     io.py          # read/write (soundfile), LF-only text writes, 32f internal
     bands.py       # zero-phase complementary band split, minimum-phase option, M/S conversion
-    meter.py       # BS.1770 K-weighting, momentary/short-term/integrated, true peak (4x/8x), PLR/PSR
-    features/      # analysis pass, one module per feature group
-      loudness.py  crest.py  stereo.py  transients.py  tilt.py  resonance.py  structure.py  pitch.py
+    meter.py       # BS.1770 K-weighting, momentary/short-term/integrated, true peak, RMS meter, PLR/PSR
+    oa.py          # streamed overlap-add convolution, bit-identical to scipy's oaconvolve
     envelope.py    # gain-envelope construction: required gain, min-filter + box smoothing, banded QP variant
-    stages/        # render stages, each: (audio, plan_section) -> audio
-      notch.py  sidestrip.py  multiband.py  tone.py  saturate.py  keyeq.py  limiter.py
-    plan.py        # dataclasses + JSON schema for plan.json
-    solver.py      # constraint loop
+    features/      # analysis pass: loudness crest stereo transients tilt resonance structure pitch borrowed
+    planner.py     # analysis -> plan: targets, crossovers, every stage's design
+    plan.py        # dataclasses + JSON schema for plan.json (+ plan.npz sidecar)
+    stages/        # render stages, each apply(x, fs, section) -> y, run in a fixed order:
+      gain.py  inputeq.py  notch.py  sidestrip.py  multiband.py  tone.py  saturate.py  glue.py
+      keyeq.py  limiter.py  resample.py  output.py
+    solver.py      # fixed render sequence: planned, true peak, slope, loudness
     evaluate.py    # before/after report, A/B loudness-matched renders, difference render
+    stems.py  stemfix.py  noise.py          # stem-set mastering, stem corrections, noise-floor detection
+    memory.py  estimate.py  parallel.py     # memory guard, time-left estimate, engine threads
+    processlog.py  app_engine.py  uidata.py # plain-language process log, desktop engine process, UI numbers
     cli.py         # eluate analyse|plan|render|master|report
-  tests/           # synthetic-signal tests per module (section 7)
-  fixtures/        # EBU R128 test vectors, synthetic signals, maintainer's mixes + masters (to be supplied)
-  pyproject.toml   # python>=3.12,<3.14; extras: [demucs]
+  tests/           # synthetic-signal tests per module (section 7); `slow` marker for long ones
+  fixtures/        # synthetic signals; EBU vectors and private premasters are gitignored
+  requirements/    # exact lock files per platform
+  ui/  desktop/    # the desktop shell (HTML UI, Tauri)
+  tools/           # notices and analysis helpers
+  pyproject.toml   # python>=3.12,<3.14; extras: [dev], [demucs]
 ```
 
 Package name `eluate` (maintainer, 2026-10-21; it was `offmaster` until then).
@@ -307,12 +357,21 @@ per-feature distance to it.
 
 ## 4. CLI
 
+As built (2026-11-10; `eluate <command> --help` is authoritative, and the draft's `--target`,
+`--genre` and `--harmonic` are gone):
+
 ```
-eluate analyse  in.wav  -o work/
-eluate plan     work/   --tilt 0 --target -6.5 [--genre techno] [--preserve] --xover 100,500,2000,8000 --subside 100 [--harmonic 0.5]
-eluate render   work/plan.json -o master.wav
-eluate master   in.wav -o out/ [controls]      # analyse + plan + solve + render + report + A/B
-eluate report   out/
+eluate analyse  in.wav  -o work/ [--xover 100,400,1600,6400] [--bpm N]
+eluate plan     work/   [controls]
+eluate render   work/plan.json -o master.wav [--input in.wav]
+eluate master   in.wav -o out/ [--stems a.wav b.wav ...] [--mix M] [controls]   # analyse + plan + solve + render + report + A/B
+eluate report   out/    [--master-ref ref.wav]
+
+controls: --tilt DB/OCT  --target-rms DBFS  --preserve  --xover F1,F2,F3,F4  --subside HZ
+          --profile {electronic,live}  --streaming  --character {auto,transparent,slow,moderate,fast,aggressive}
+          --makeup {peak,rms,auto}  --glue-mode {serial,parallel}  --[no-]kick-detective  --[no-]speclim
+          --crest-mode {loss,report,floor}  --crest-floor  --side-band0-exempt  --tp-meter {worst,8x}
+          --threads N
 ```
 
 ## 5. Workstreams (parallelisable)
@@ -369,8 +428,8 @@ Production target recorded 2026-10-17: JUCE-free C++ core library with a JUCE sh
 
 ## 8. Licence
 
-Deferred by maintainer. Options and caveats are in the 2026-10-17 session notes; the research report
-also recommends GPL-3.0-or-later with AGPL as the SaaS-proof alternative.
+Decided: AGPL-3.0-or-later (`LICENSE`, `pyproject.toml`). (Draft 0.5 had it deferred; the
+research report recommended GPL-3.0-or-later with AGPL as the SaaS-proof alternative.)
 
 ## 9. Decisions (2026-10-17) and remaining questions
 
@@ -379,8 +438,14 @@ correlation plus S/M ratio; saturation drive follows tilt deficit with a harmoni
 S95 as control with genre presets; crest tolerances; crossovers 100/500/2000/8000; fixtures to be
 supplied when needed; name and licence deferred; language deferred until after the prototype.
 
+Superseded since (2026-11-10): crossovers are 100/400/1600/6400 Hz by default and key-locked to
+the tonic without `--xover` (GS §4, §11); the name is `eluate` and the licence AGPL-3.0-or-later;
+S95 control and genre presets are retired for the RMS target (GS §14.2, §17); `tone` is replaced
+by the input EQ and the harmonic-vs-linear control is retired (GS §12, §14.2). Open item 3 is
+closed.
+
 Open:
 1. **[Q]** Five bands (from four crossovers) rather than the brief's four. Assumed yes.
 2. **[Q]** Replace the research report's unsourced genre slope table with slopes measured on your
    material and a handful of commercial releases (gate C), or adopt -4.5 dB/oct flat as the reference.
-3. **[Q]** Licence, when ready.
+3. ~~**[Q]** Licence, when ready.~~ Closed: AGPL-3.0-or-later.

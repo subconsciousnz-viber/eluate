@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]  # the SPDX `license` string and `license-files` need 77
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -36,5 +36,5 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src", "."]
 markers = [
-    "slow: takes more than about 5 s; CI's fast job runs -m \"not slow\" (the full suite runs weekly)",
+    "slow: its own run takes more than about 20 s on an idle machine (CONTRIBUTING.md); CI's fast job runs -m \"not slow\" (the full suite runs weekly)",
 ]

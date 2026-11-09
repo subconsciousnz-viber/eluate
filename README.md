@@ -83,4 +83,6 @@ Copyright (C) 2026 the Eluate contributors
   integrated loudness, each platform's playback gain and the codec-headroom check.
 - **Pipeline:** `analyse`, `plan`, `render` and `report` expose individual stages;
   `master` runs the complete workflow. See the [engine specification](docs/spec-draft.md)
-  and [gain-staging design](docs/gain-staging.md) for rationale and signal-chain detail.
+  and [gain-staging design](docs/gain-staging.md) for rationale and signal-chain detail;
+  the specification is a historical draft, and where it disagrees with the gain-staging
+  design or the code, those win (its status block lists the differences).

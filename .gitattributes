@@ -1,0 +1,19 @@
+# Line endings: the repository stores LF for every text file, on every platform
+# (Windows checkouts included; eol=lf overrides core.autocrlf).
+* text=auto eol=lf
+
+# Binary assets: never normalise or diff as text.
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.icns  binary
+*.ttf   binary
+*.woff  binary
+*.woff2 binary
+*.wav   binary
+*.flac  binary
+*.mp3   binary
+*.npz   binary
+*.npy   binary
+*.pdf   binary
+*.zip   binary

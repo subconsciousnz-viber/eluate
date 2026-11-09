@@ -7,12 +7,22 @@ the desktop shell's build is in [desktop/README.md](desktop/README.md).
 
 ## Tests
 
-- `pytest -m "not slow"`: the fast tier (a few minutes); run it before every pull request.
+- `pytest -m "not slow"`: the fast tier (about 10 minutes on a 12-core machine); run it
+  before every pull request.
 - `pytest`: the full suite, including the `slow` marker; CI runs it weekly.
+- `@pytest.mark.slow` marks a test whose own run (call phase) takes more than about 20 s on an
+  idle machine, typically a full master; check with `pytest -m "not slow" --durations=30`.
+  Tests of 5 to 20 s stay in the fast tier so it keeps covering the pipeline. A slow
+  module-scoped fixture is not a reason to mark its consumers: shrink the fixture instead.
 - Tests that need the EBU loudness vectors (`fixtures/ebu/`, from tech.ebu.ch) or private
   premasters (`fixtures/premasters/manifest.toml`, see `manifest.example.toml`) skip when
   those files are absent.
 - Desktop shell: `cargo test` in `desktop/src-tauri`; UI: `node --check ui/app.js`.
+
+## Line endings
+
+Every text file is stored with LF endings (`.gitattributes` enforces `eol=lf`, also on
+Windows checkouts), so do not commit CRLF files.
 
 ## Sign-off (DCO)
 
