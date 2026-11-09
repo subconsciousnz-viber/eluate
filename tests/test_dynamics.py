@@ -411,10 +411,13 @@ def test_blocked_whole_clipper_matches_whole_track(fs):
 
 # ------------------------------------------------------------ character presets
 
-@pytest.mark.parametrize("bpm,name", [(60.0, "slow"), (69.9, "slow"), (70.0, "moderate"),
-                                      (120.0, "moderate"), (140.0, "moderate"),
-                                      (140.1, "fast"), (174.0, "fast"), (None, "moderate")])
+@pytest.mark.parametrize("bpm,name", [(60.0, "slow"), (69.2, "slow"), (69.9, "moderate"),
+                                      (70.0, "moderate"), (120.0, "moderate"), (140.0, "moderate"),
+                                      (140.1, "moderate"), (141.5, "fast"), (174.0, "fast"),
+                                      (None, "moderate")])
 def test_auto_character_by_tempo(bpm, name):
+    """The boundaries carry +-1 % (planner.AUTO_BPM_TOL) that resolves to moderate
+    (features audit 2026-11-10 F4: a true 140 BPM track read 140.09 and flipped to fast)."""
     assert planner.character_choice("auto", bpm)[0] == name
     assert planner.character_choice("aggressive", bpm)[0] == "aggressive"
 

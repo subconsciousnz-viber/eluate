@@ -157,6 +157,15 @@ def _settings(d: Doc, rep, src, run):
     lo = rep.get("loudness") or {}
     d.h(2, "Settings used")
     pr = (rep.get("planner") or {}).get("profile") or {}
+    tp = (rep.get("planner") or {}).get("tempo") or {}
+    tempo_note = ""
+    if tp.get("source") == "user" and tp.get("detected_bpm") is not None:
+        dev = tp.get("deviation_pct") or 0.0
+        tempo_note = (f"; detected {_f(tp['detected_bpm'], 1)} BPM"
+                      + (f", ratio {_f(tp['bpm'] / tp['detected_bpm'], 2)}"
+                         + (f" ({tp['relation']})" if tp.get("relation") else "")
+                         + ": the given tempo sets every budget's hits, check --bpm"
+                         if abs(dev) > (tp.get("tolerance_pct") or 3.0) else ", in agreement"))
     d.ul([
         f"Profile: {pr.get('name', 'electronic')}" + ("" if pr.get("calibrated", True) else
             " (phase 1: the live profile defaults are uncalibrated; they are the architect's "
@@ -166,8 +175,8 @@ def _settings(d: Doc, rep, src, run):
         f"Tilt: {_f(c.get('tilt_db', 0.0), 1, True)} dB/oct around the -4.5 dB/oct reference, so the "
         f"target slope is {_f(rep['targets']['slope_db_oct'], 2)} dB/oct.",
         f"Preserve mix: {'on' if c.get('preserve_mix') else 'off'}.",
-        f"Tempo: {_f(ch.get('bpm'), 1)} BPM ({ch.get('bpm_source', 'detected')}); timing preset "
-        f"{ch.get('preset', 'n/a')} ({ch.get('reason', '')}).",
+        f"Tempo: {_f(ch.get('bpm'), 1)} BPM ({ch.get('bpm_source', 'detected')}){tempo_note}; "
+        f"timing preset {ch.get('preset', 'n/a')} ({ch.get('reason', '')}).",
         f"Delivery: {'streaming (-1 dBTP, 16-bit with dither)' if c.get('streaming') else 'master (-0.3 dBTP, 24-bit)'}.",
         f"Source: {src.get('path')}.",
     ])
@@ -261,8 +270,13 @@ def _chain(d: Doc, rep):
 
     d.h(3, "4. Side low end")
     s = ch.get("sidestrip") or {}
-    d.p(f"The side channel was high-passed below {_f(s.get('fc_hz'), 0)} Hz, so the low end is mono. "
-        "The mid is not touched.")
+    sc = pl.get("sidestrip") or {}
+    clip = (f" (--subside asked for {_f(sc.get('rule_hz'), 0)} Hz; the corner stays within "
+            f"{_f((sc.get('range_hz') or [60, 150])[0], 0)} to "
+            f"{_f((sc.get('range_hz') or [60, 150])[1], 0)} Hz)"
+            if sc.get("clipped") and sc.get("rule") == "--subside" else "")
+    d.p(f"The side channel was high-passed below {_f(s.get('fc_hz'), 0)} Hz{clip}, so the low end "
+        "is mono. The mid is not touched.")
 
     mb = ch.get("multiband") or {}
     d.h(3, "5. Multiband compression (mid and side, per band)")
@@ -519,7 +533,8 @@ def _noise(d: Doc, rep):
 
 def _flags(d: Doc, rep):
     d.h(2, "Warnings and flags")
-    items = [evaluate.warning_text(w, rep) for w in rep.get("warnings") or []]
+    items = [w["text"] if w.get("stage") == "tempo" and w.get("text") else
+             evaluate.warning_text(w, rep) for w in rep.get("warnings") or []]
     items += rep.get("flags") or []
     d.ul(items or ["None."])
 

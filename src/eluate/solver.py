@@ -435,7 +435,7 @@ def limit_blocked(x: np.ndarray, fs: float, plan: LimiterPlan, block: int = BLOC
     y, rinfo = _relimit(y, fs, plan, ceiling)
     info = {"clip_max_reduction_db": clip_max, "clip_spans": clip_count,
             "max_gain_reduction_db": gr8, "detector_peak_dbfs": det_db, **rinfo, "qp": None,
-            "blocked": True, "block": int(block)}
+            "blocked": True, "block": int(block), "samples": int(n)}
     return (y[:, 0] if squeeze else y), info
 
 

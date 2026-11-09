@@ -243,8 +243,10 @@ def two_levels():
 
 @pytest.mark.slow
 def test_output_independent_of_premaster_level(two_levels):
-    """The chunk's main property: a premaster at any level gives the same master up to
-    float rounding (one 24-bit step where rounding lands either side of a half)."""
+    """The chunk's main property, on one float64 array scaled exactly: a premaster at any
+    level gives the same master up to float rounding (one 24-bit step where rounding
+    lands either side of a half). Two separately written float32 files are the weaker
+    case: test_written_files_at_two_levels_get_the_same_plan (docs/gain-staging.md 11)."""
     (xa, aa, ra), (xb, ab, rb) = two_levels[0.0], two_levels[-17.0]
     assert np.max(np.abs(xb - xa * 10 ** (-17 / 20))) < 1e-15
     ga, gb = aa["meta"]["input"]["gain_db"], ab["meta"]["input"]["gain_db"]
@@ -288,6 +290,35 @@ def test_input_eq_fit_is_level_invariant(two_levels):
     assert planner.inputeq_sections(ra.plan.inputeq) == planner.inputeq_sections(rb.plan.inputeq)
     assert planner.inputeq_sections(planner.refit_inputeq(ea, FS, 0.4)) == \
         planner.inputeq_sections(planner.refit_inputeq(eb, FS, 0.4))
+
+
+@pytest.mark.slow
+def test_written_files_at_two_levels_get_the_same_plan(tmp_path):
+    """Audit 2026-11-10 S4-5: two float32 files of one premaster at -20 and +6 dB against
+    the reference are independent roundings (their LTAS differ by about 5e-8 dB); the
+    input EQ fit's inputs are quantised to 0.01 dB, so the EQ is identical, and the rest of
+    the plan differs by the files' rounding noise alone (measured 7e-7 dB on the unrealised
+    thresholds; the earlier 10 Hz corner flip and -82 dBFS master difference are gone)."""
+    from fixtures.e_signals import short_track
+    x, _ = short_track(FS, 2)
+    plans, analyses = {}, {}
+    for lvl in (0.0, -20.0, 6.0):
+        p = tmp_path / f"l{lvl:+.0f}.wav"
+        io.write(p, x * 10 ** (lvl / 20), FS, "FLOAT")
+        y, _ = io.read(p)
+        analyses[lvl] = planner.analyse(y, FS)
+        plans[lvl] = planner.plan_from_analysis(analyses[lvl], planner.Controls())
+    a0, p0 = analyses[0.0], plans[0.0]
+    for lvl in (-20.0, 6.0):
+        a, p = analyses[lvl], plans[lvl]
+        assert a["meta"]["crossovers"] == a0["meta"]["crossovers"]
+        assert np.max(np.abs(np.asarray(a["plan_inputs"]["ltas_stereo_db"])
+                             - np.asarray(a0["plan_inputs"]["ltas_stereo_db"]))) < 1e-5
+        assert planner.inputeq_sections(p.inputeq) == planner.inputeq_sections(p0.inputeq)
+        assert p.inputeq.design["residual_db"] == p0.inputeq.design["residual_db"]
+        assert np.max(np.abs(np.asarray(p.multiband.threshold_db)
+                             - np.asarray(p0.multiband.threshold_db))) < 1e-5
+        assert p.limiter.input_gain_db == pytest.approx(p0.limiter.input_gain_db, abs=1e-5)
 
 
 def _eq():

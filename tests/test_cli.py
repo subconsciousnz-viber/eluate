@@ -262,9 +262,12 @@ def test_master_and_report(wav, tmp_path, monkeypatch):
 def test_a_failed_master_is_not_done(tmp_path, monkeypatch):
     """Report 3.1: a re-render that fails or is stopped removes the previous run's
     completion marker (run.json) and process log first, so the list does not show the
-    track as done with a mix of two runs' files; an unreadable run.json is not done."""
+    track as done with a mix of two runs' files; since 2026-11-10 (S4-9) every other
+    product goes with them, once the input has been checked (a typo'd path removes
+    nothing, hygiene F4); an unreadable run.json is not done."""
     from eluate import uidata
     inp = tmp_path / "a.wav"
+    sf.write(inp, 0.1 * np.random.default_rng(0).standard_normal((2 * FS, 2)), FS)
     work = uidata.work_dir(inp)
     work.mkdir()
     side = {"rms_meter_dbfs": -4.2, "true_peak_dbtp": -0.3, "sample_peak_dbfs": -0.4,
@@ -276,6 +279,9 @@ def test_a_failed_master_is_not_done(tmp_path, monkeypatch):
     for f in cli.CLEARED_AT_START:
         (work / f).write_text("{}", encoding="utf-8")
     assert uidata.summary(inp)["state"] == "done"
+    with pytest.raises(ValueError, match="no such file"):
+        cli.do_master(tmp_path / "typo.wav", work, cli.planner.Controls(), log=lambda m: None)
+    assert uidata.summary(inp)["state"] == "done"      # nothing touched (F4)
 
     def stopped(*a, **k):
         raise RuntimeError("stopped")
@@ -283,7 +289,8 @@ def test_a_failed_master_is_not_done(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         cli.do_master(inp, work, cli.planner.Controls(), log=lambda m: None)
     assert not any((work / f).exists() for f in cli.CLEARED_AT_START)
-    assert (work / "report.json").exists() and uidata.summary(inp)["state"] == "none"
+    assert not (work / "report.json").exists() and (work / "source.json").exists()
+    assert uidata.summary(inp)["state"] == "none"
     (work / "run.json").write_text('{"controls": ', encoding="utf-8")
     assert uidata.summary(inp)["state"] == "none"
 

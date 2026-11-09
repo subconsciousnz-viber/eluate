@@ -373,14 +373,21 @@ class OutputPlan:
         return {16: "PCM_16", 24: "PCM_24", 32: "FLOAT"}[self.bits]
 
 
+NOTCH_CHANNELS = ("both", "S")
+
+
 @dataclass
 class Notch:
     """One confirmed resonance. gain_db(t) <= 0 is the notch gain at f0 (capped at -6 dB).
-    q = f0 / bandwidth of the notch response at half its deepest dB cut (spec 3.5 item 1)."""
+    q = f0 / bandwidth of the notch response at half its deepest dB cut (spec 3.5 item 1).
+    channel: "both" cuts L and R alike (M and S together; the default, and what plans
+    saved before the field load as), "S" cuts the side channel only (a side-only
+    resonance, features audit 2026-11-10 F7; stages/notch.py applies it in M/S)."""
 
     f0_hz: float
     q: float
     gain_db: Envelope
+    channel: str = "both"
 
     def __post_init__(self):
         _finite("notch", [self.f0_hz, self.q])
@@ -388,6 +395,8 @@ class Notch:
             raise ValueError("notch f0 must be positive")
         if self.q < NOTCH_Q_MIN:
             raise ValueError(f"notch q must be >= {NOTCH_Q_MIN}")
+        if self.channel not in NOTCH_CHANNELS:
+            raise ValueError(f"notch channel must be one of {NOTCH_CHANNELS}")
 
 
 @dataclass
@@ -1164,7 +1173,8 @@ def _opt(d: dict, key: str, fn):
 
 
 def _notch_from(s: dict, env) -> NotchPlan:
-    notches = [Notch(n["f0_hz"], n["q"], env(n["gain_db"])) for n in s["notches"]]
+    notches = [Notch(n["f0_hz"], n["q"], env(n["gain_db"]), n.get("channel", "both"))
+               for n in s["notches"]]
     km = s.get("kick_mask")
     return NotchPlan(notches, None if km is None else env(km))
 

@@ -113,7 +113,13 @@ envelope design above, on the band as the stage splits it:
   "channel": "M" | "S" | "both", "needed_db", "cap_db"}. A compressor whose
   average falls more than envelope.AVERAGE_WARN_DB (0.5 dB) below its target
   (the outlier clamp reaching into the loud hits) warns {"stage": "multiband",
-  "band", "channel", "kind": "average", "target_db", "achieved_db"}. The
+  "band", "channel", "kind": "average", "target_db", "achieved_db"}; one whose
+  threshold search stopped at its floor (threshold_for_peak_gr: the band's
+  loudest-section 1 s RMS minus BRACKET_BELOW_LEVEL_DB, or lo - BRACKET_MAX_DB) with the
+  target still short warns kind "unreachable" instead (with "threshold_db", "floor_db",
+  "bound" "level floor" | "bracket floor", "level_db"), and its result row carries
+  "bound" and "threshold_floor_db" (planner.budget_report: status "target unreachable").
+  The
   envelopes are then built by `design` with the solved values, so they are
   exactly the ones solved. Makeup mode budget["makeup"]: "peak" = + the band's
   combined average peak GR (compressor + limiter; the maximum without hits),
@@ -180,6 +186,12 @@ SOLVE_TOL_DB = 1e-4
 SOLVE_ITER = 80
 BRACKET_STEP_DB = 6.0
 BRACKET_MAX_DB = 48.0
+# the compressor threshold's step-down never goes further than this below the band
+# channel's loudest-section 1 s RMS (threshold_for_peak_gr; audit 2026-11-10 S2-3): at
+# 2:1 a threshold 12 dB under the band's body already takes 6 dB, the per-sample clamp,
+# off everything, so a lower one only turns the band down
+BRACKET_BELOW_LEVEL_DB = 12.0
+UNREACHABLE_TOL_DB = 0.05        # an average this far short at the floor is "unreachable"
 
 
 def _gains_db(plan: MultibandPlan, n: int, fs: float):
@@ -455,23 +467,34 @@ def _loud_top_db(det: np.ndarray, rate_hz: float, hits: dict | None) -> float:
 
 def threshold_for_peak_gr(v: np.ndarray, fs: float, target_db: float, ratio: float,
                           attack_ms: float, release_ms: float, knee_db: float = 0.0,
-                          rate_hz: float = CONTROL_RATE_HZ, hits: dict | None = None) -> dict:
+                          rate_hz: float = CONTROL_RATE_HZ, hits: dict | None = None,
+                          floor_db: float | None = None) -> dict:
     """Compressor threshold (dBFS) giving an average peak GR of target_db on band signal
     v over hits (the maximum without hits), by bisection on comp_envelope (module
     contract). Returns {"threshold_db", "peak_gr_db" (the average peak GR reached),
-    "outlier_gr_db"}; a silent band gives 0 dBFS and 0 dB, a zero target a threshold
-    just above the knee's reach."""
+    "outlier_gr_db", "floor_db", "bound"}; a silent band gives 0 dBFS and 0 dB, a zero
+    target a threshold just above the knee's reach.
+
+    The bracket's step-down stops at the floor: the higher of lo - BRACKET_MAX_DB and
+    floor_db, by default the band's loudest-section 1 s RMS minus BRACKET_BELOW_LEVEL_DB
+    (audit 2026-11-10 S2-3: a sparse band whose meter-smoothed average cannot read the
+    target was driven 48 dB down into its leakage floor, every hit at the clamp and GR on
+    100 % of the time; a threshold more than BRACKET_BELOW_LEVEL_DB under the band's body
+    compresses the body, not its peaks). When the floor binds and the target is still
+    short, "bound" is "level floor" (or "bracket floor") and the threshold returned is
+    the floor's; design_budget then warns kind "unreachable"."""
     v = np.asarray(v, dtype=np.float64)
     if not 0.0 <= target_db <= MULTIBAND_MAX_GR_DB:
         raise ValueError(f"target_db must lie in [0, {MULTIBAND_MAX_GR_DB}]")
     det = detector(v, fs, control_length(v.shape[0], fs, rate_hz), rate_hz)
     pk = float(det.max()) if det.size else 0.0
     if pk <= 0.0:
-        return {"threshold_db": 0.0, "peak_gr_db": 0.0, "outlier_gr_db": 0.0}
+        return {"threshold_db": 0.0, "peak_gr_db": 0.0, "outlier_gr_db": 0.0,
+                "floor_db": None, "bound": None}
     top = 20.0 * np.log10(pk)
     if target_db <= 0.0:
         return {"threshold_db": float(top + knee_db / 2.0 + 0.01), "peak_gr_db": 0.0,
-                "outlier_gr_db": 0.0}
+                "outlier_gr_db": 0.0, "floor_db": None, "bound": None}
     lo = _loud_top_db(det, rate_hz, hits) - target_db / (1.0 - 1.0 / ratio) - knee_db - 1.0
     hi = top + knee_db / 2.0 + 0.01
     # at the cap every lower threshold reads the cap too: aim just under it so the solve
@@ -486,12 +509,19 @@ def threshold_for_peak_gr(v: np.ndarray, fs: float, target_db: float, ratio: flo
         return r["average_db"]
 
     # the meter reading averages the GR, so the target can need a threshold below the
-    # peak-reading bracket: step down until it is reached (at most BRACKET_MAX_DB)
-    floor = lo - BRACKET_MAX_DB
+    # peak-reading bracket: step down until it is reached, never past the floor
+    if floor_db is None:
+        lvl = meter.rms_1s(v, fs)["loud_section_dbfs"]
+        floor_db = lvl - BRACKET_BELOW_LEVEL_DB if np.isfinite(lvl) else -np.inf
+    floor = max(lo - BRACKET_MAX_DB, float(floor_db))
+    kind = "level floor" if float(floor_db) > lo - BRACKET_MAX_DB else "bracket floor"
+    lo = max(lo, floor)
     while gr(lo) < aim and lo > floor:
-        lo -= BRACKET_STEP_DB
+        lo = max(floor, lo - BRACKET_STEP_DB)
     t, g = bisect_peak_gr(gr, lo, hi, aim)
-    return {"threshold_db": float(t), "peak_gr_db": float(g), "outlier_gr_db": float(last[t])}
+    bound = kind if (abs(t - floor) < 1e-9 and g < aim - UNREACHABLE_TOL_DB) else None
+    return {"threshold_db": float(t), "peak_gr_db": float(g), "outlier_gr_db": float(last[t]),
+            "floor_db": float(floor), "bound": bound}
 
 
 def ceiling_for_peak_gr(v: np.ndarray, fs: float, target_db: float,
@@ -656,15 +686,19 @@ def design_budget(x: np.ndarray, fs: float, plan: MultibandPlan,
         if b.get("ratio_from_crest", True):
             rat[k, c] = min(ratio_for_crest(crest, k, c), float(b.get("ratio_max", RATIO_MAX)))
 
+        lvl = meter.rms_1s(v, fs)["loud_section_dbfs"] if np.any(v) else -np.inf
+        # the threshold search never goes further than BRACKET_BELOW_LEVEL_DB under the
+        # band's body (threshold_for_peak_gr, S2-3)
+        floor_db = lvl - BRACKET_BELOW_LEVEL_DB if np.isfinite(lvl) else None
+
         def comp(target, v=v, det=det, k=k, c=c):
             sol = threshold_for_peak_gr(v, fs, target, rat[k, c], att[k, c], rel[k, c],
-                                        knee[k, c], rate_hz, hits)
+                                        knee[k, c], rate_hz, hits, floor_db=floor_db)
             env = comp_envelope(det, sol["threshold_db"], rat[k, c], att[k, c], rel[k, c],
                                 knee[k, c], rate_hz)
             g = np.clip(env.at(n, fs), -MULTIBAND_MAX_GR_DB, 0.0)
             return sol, v * 10.0 ** ((g + makeup_kc[k][c]) / 20.0)
 
-        lvl = meter.rms_1s(v, fs)["loud_section_dbfs"] if np.any(v) else -np.inf
         gated = bool(np.isfinite(full_db) and not lvl >= full_db - GATE_BELOW_INPUT_DB)
         if gated:
             sol, _ = comp(0.0)
@@ -692,7 +726,16 @@ def design_budget(x: np.ndarray, fs: float, plan: MultibandPlan,
                               "needed_db": float(sol["peak_gr_db"] + need),
                               "cap_db": float(comp_max + lim_max)})
         target_now = comp_max if exception else comp_t
-        if sol["peak_gr_db"] < target_now - envelope.AVERAGE_WARN_DB and np.any(v):
+        if sol.get("bound") is not None and np.any(v):
+            # S2-3: the average target is out of reach within the threshold floor; the
+            # band renders at the floor and the report says so ("target unreachable")
+            warns_avg.append({"stage": "multiband", "band": k, "channel": "MS"[c],
+                              "kind": "unreachable", "target_db": float(target_now),
+                              "achieved_db": float(sol["peak_gr_db"]),
+                              "threshold_db": float(sol["threshold_db"]),
+                              "floor_db": sol.get("floor_db"), "bound": sol["bound"],
+                              "level_db": float(lvl) if np.isfinite(lvl) else None})
+        elif sol["peak_gr_db"] < target_now - envelope.AVERAGE_WARN_DB and np.any(v):
             warns_avg.append({"stage": "multiband", "band": k, "channel": "MS"[c],
                               "kind": "average", "target_db": float(target_now),
                               "achieved_db": float(sol["peak_gr_db"])})
@@ -708,6 +751,8 @@ def design_budget(x: np.ndarray, fs: float, plan: MultibandPlan,
                  "comp_target_db": comp_max if exception else comp_t,
                  "limit_need_db": float(need), "limit_target_db": float(lim_t),
                  "exception": bool(exception),
+                 "level_db": float(lvl) if np.isfinite(lvl) else None,
+                 "threshold_floor_db": sol.get("floor_db"), "bound": sol.get("bound"),
                  "budget_db": float(comp_max + lim_max if exception else normal)},
                 gate, warns, warns_avg)
 

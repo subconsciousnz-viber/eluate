@@ -176,7 +176,10 @@ engine's own units until the Saturn calibration is done
 ## 7. Character presets
 
 Transparent, Slow, Moderate, Fast, Aggressive. Auto picks by tempo: under
-70 BPM Slow, 70 to 140 Moderate, above 140 Fast. Draft values for the maintainer
+70 BPM Slow, 70 to 140 Moderate, above 140 Fast; a tempo within 1 % of either
+boundary reads Moderate (`planner.AUTO_BPM_TOL`, 2026-11-10: a true 140 BPM track
+was detected at 140.09 and flipped to Fast), and a detected tempo never reads Slow
+(that needs `--bpm`). Draft values for the maintainer
 to correct (bands low to high; ms):
 
 | Preset | Multiband attack | Multiband release | MB knee | Glue attack / release | Clipper knee | Limiter attack / release | Band lookahead |
@@ -284,8 +287,13 @@ What landed (§2 item 1, §3 "Ceiling" and "Loudness target", §4, §9):
   123.5 / 493.9 / 1976 / 7902). Without `--xover` the analysis finds the key
   first (chroma weighted by momentary loudness, which reads no band split) and
   runs every band-dependent feature on the key-locked crossovers. With
-  `--xover` the given ones are used. `plan_record.json` keeps the crossovers,
-  the rule, the tonic, p and a one-line reason. `source.json` keeps the
+  `--xover` the given ones are used. Since 2026-11-10 the lock is gated on the
+  key's confidence (`planner.key_gate`, `KEY_CONFIDENCE_MIN` = 0.5 on the
+  profile-correlation scale: pink noise read Cm at 0.29 and moved every band
+  split; a clear progression reads above 0.7): below it, or unknown, the default
+  crossovers stay and `meta["crossover_gate"]` records the decision.
+  `plan_record.json` keeps the crossovers,
+  the rule, the tonic, p, the gate and a one-line reason. `source.json` keeps the
   crossovers used, the ones requested (null = key-locked) and R_ref. The
   analysis cache is reused when the request matches, so key-derived
   crossovers do not break reuse.
@@ -298,9 +306,24 @@ What landed (§2 item 1, §3 "Ceiling" and "Loudness target", §4, §9):
   measures the premaster, gains it to R_ref and analyses the gained audio.
   `Plan.input` (`InputPlan`: gain, R_ref, measured value) is the first stage
   (`stages/gain.py`, also run by `solver.render_pre` and `planner.realise`).
-  It is in plan.json and in the report ("0. Input"). A premaster rendered at
-  0 and -17 dB gives the same pre-limiter audio to 1e-9 and the same master
-  to one 24-bit step (`tests/test_gain_staging.py`).
+  It is in plan.json and in the report ("0. Input"). One float64 premaster
+  scaled exactly to 0 and -17 dB gives the same pre-limiter audio to 1e-9 and
+  the same master to one 24-bit step (`tests/test_gain_staging.py`). Two
+  separately written float32 files of one premaster are a weaker case
+  (audit 2026-11-10 S4-5): their independent roundings put the LTAS nodes
+  about 5e-8 dB apart, which was enough to move a top-shelf corner whose cost is
+  flat by one 10 Hz rounding step (11370 against 11380 Hz) and the masters by
+  -82 dBFS on 99 % of the samples. Since then the input EQ fit's inputs (LTAS
+  nodes, residuals, sub shelf, noise floor to 0.01 dB; the slope to 0.001 dB/oct,
+  `planner.inputeq_design`) are quantised, so such files get the identical EQ
+  unless a value sits within that rounding noise of a quantisation boundary
+  (rare, and then one rounding step of one section); the rest of the plan
+  differs by the files' rounding noise alone (measured: unrealised thresholds
+  within 7e-7 dB, the limiter's starting gain identical;
+  `test_written_files_at_two_levels_get_the_same_plan`). An input with no
+  gated 1 s window (shorter than 1 s, silent) is refused by `eluate master` /
+  `analyse` before the analysis (`cli.check_input`, `cli.check_audio`); the
+  plan's `measured_dbfs` is None, not NaN, for such a measurement.
 - **Ceiling and export.** -0.3 dBTP by default (`planner.CEILING_DBTP`,
   `LimiterPlan`, `Targets`). `Plan.output` (`OutputPlan`) is the last stage
   (`stages/output.py`): 24-bit PCM, rounded, by default. `--streaming` gives

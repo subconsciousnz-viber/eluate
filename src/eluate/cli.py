@@ -35,9 +35,19 @@ Contract:
   eluate.memory's estimate and the free memory), and
   out/limiter.json / limiter_gr.npz, and out/process-log.md / .html (processlog: the
   render's decisions in plain language). solve.json and run.json carry the
-  solver's target misses and budget warnings (the loudness shortfall included).
-  run.json is the completion marker (report 3.1): the previous run's run.json and
-  process log are removed before anything else, run.json is written after the master
+  solver's target misses and budget warnings (the loudness shortfall included, and the
+  planner's "tempo" warning when a --bpm disagrees with the detected grid by more than
+  planner.TEMPO_DISAGREE_PCT; the same line goes to the log).
+  Before anything is touched the input is checked (`check_input`: it exists and reads,
+  it is at least MIN_INPUT_S long, and it is not inside the output folder, where the
+  run writes master.wav and the A/B files; hygiene F3 / F4), then the memory guard
+  runs, then the output folder is probed (`probe_output`: writable, no product locked
+  or read-only; hygiene F5). Only then is the previous run cleared: run.json, the
+  completion marker (report 3.1), and the process log first, then every other product
+  (`clear_run`: RUN_PRODUCTS, the ab/ and passes/ dirs and the pass dirs; S4-9), the
+  analysis cache staying. An input with no 1 s window above meter.RMS_GATE_DBFS
+  (silence, near silence) is refused once read (`check_audio`, before the analysis).
+  run.json is written after the master
   and the report, and it carries the run id (uuid4 hex) that plan.json / plan.npz
   carry too; a run without a limiter GR estimate removes the previous limiter_gr.npz.
 - `eluate master --stems a.wav b.wav ... [--mix mix.wav] -o out/ [controls]` (stems,
@@ -56,7 +66,10 @@ Contract:
 - `eluate report out/` rebuilds the report from out/ (source.json,
   master.wav, plan.json, targets.json, plan_record.json, solve.json, and the
   limiter.json / limiter_gr.npz that `master` writes, so the limiter data and
-  GR plot survive), and the process log with it.
+  GR plot survive), and the process log with it. It refuses a work dir without
+  run.json or whose run.json and plan.json carry different run ids (an unfinished
+  master; `check_run_files`), and a premaster whose SHA-256 no longer matches
+  source.json (`check_source`, hygiene F1).
 - Controls flags (spec 3.6 draft 0.5): --crest-mode loss|report|floor,
   --crest-floor a,b,c,d,e (floor mode), --side-band0-exempt, --tp-meter
   worst|8x; --streaming (docs/gain-staging.md 3: -1 dBTP ceiling, 16-bit
@@ -94,6 +107,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import os
 import shutil
 import sys
@@ -105,7 +119,7 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 
-from eluate import evaluate, io, memory, parallel, planner, processlog, solver, stems
+from eluate import evaluate, io, memory, meter, parallel, planner, processlog, solver, stems
 from eluate.plan import MAKEUP_MODES
 from eluate.plan import Plan
 
@@ -152,7 +166,9 @@ def _requested(crossovers) -> list | None:
 # change to planner.analyse or eluate.features alters what the analysis holds (a value,
 # a field added or removed), so every cached features.npz is analysed again once.
 # 1: first versioned cache (S2 tempo octave decision, noise_floor_db).
-ANALYSIS_VERSION = 1
+# 2: the key lock's confidence gate (meta["crossover_gate"]; the crossovers can differ),
+#    measured_dbfs None for an unmeasurable input (2026-11-10).
+ANALYSIS_VERSION = 2
 
 
 def _source_record(path: Path, fs: int, n: int, analysis: dict, crossovers=None,
@@ -173,8 +189,10 @@ def _source_record(path: Path, fs: int, n: int, analysis: dict, crossovers=None,
 
 
 def do_analyse(inp: Path, work: Path, xover=None, log=print, bpm: float | None = None):
+    check_input(inp)
     work.mkdir(parents=True, exist_ok=True)
     x, fs = io.read(inp)
+    check_audio(inp, x, fs)
     (work / "source.json").unlink(missing_ok=True)
     (work / "features.pkl").unlink(missing_ok=True)      # the old pickled cache, never read
     t = time.perf_counter()
@@ -275,7 +293,7 @@ def do_plan(work: Path, controls: planner.Controls, x=None, log=print):
     io.write_json(work / "targets.json", targets.to_dict())
     rec = planner.plan_record(a, controls)
     rec["budget"] = planner.budget_report(plan)
-    rec["warnings"] = rec["budget"]["warnings"]
+    rec["warnings"] = rec["budget"]["warnings"] + _plan_notes(rec, log)
     io.write_json(work / "plan_record.json", evaluate._clean(rec))
     log(f"plan written to {work / 'plan.json'}")
     return plan, targets, a
@@ -352,28 +370,124 @@ def source_hashes() -> dict:
             hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(root.rglob("*.py"))}
 
 
+MIN_INPUT_S = meter.RMS_WINDOW_S     # the shortest input: one gated 1 s RMS window
+# the audio files a run writes, never an input (hygiene F3); the stem sums are the stems
+# flow's own inputs in the work dir and are allowed
+WRITTEN_AUDIO = ("master.wav", "ab/original_matched.wav", "ab/master_matched.wav",
+                 "ab/difference.wav")
+OWN_INPUTS = (STEMS_SUM, "corrected-sum.wav")
+# every other product of a run, removed right after the completion marker (S4-9: a failed
+# run otherwise left the previous master next to this run's plan, and `report` rebuilt
+# from the mix); the analysis cache (features.npz, analysis.json, source.json) stays
+RUN_PRODUCTS = ("plan.json", "plan.npz", "targets.json", "plan_record.json", "solve.json",
+                "master.wav", "limiter.json", "limiter_gr.npz", "report.json", "report.md",
+                "ltas.png", "loudness.png", "gr.png", "stems-report.md", "stems-report.json")
+RUN_PRODUCT_DIRS = ("ab", "passes")
+
+
+def check_input(inp: Path, out: Path | None = None) -> tuple[int, int]:
+    """(frames, fs) of a master's input, checked before anything is touched (hygiene F3,
+    F4): the file exists and soundfile reads its header, it is at least MIN_INPUT_S long
+    (one gated 1 s RMS window: the input normalisation and the loud section need it) and,
+    with `out`, it is not inside the output folder (where the run writes master.wav and
+    the A/B files; the stems flow's own sums, OWN_INPUTS, are the exception). Raises
+    ValueError with one plain line."""
+    inp = Path(inp)
+    if not inp.is_file():
+        raise ValueError(f"{inp}: no such file")
+    if out is not None:
+        r, o = inp.resolve(), Path(out).resolve()
+        inside = r == o or o in r.parents
+        if inside and not (r.parent == o and r.name in OWN_INPUTS):
+            raise ValueError(f"{inp.name} is inside the output folder {out}: the run writes "
+                             f"{', '.join(WRITTEN_AUDIO)} there; choose another output folder")
+    try:
+        info = sf.info(str(inp))
+    except (sf.SoundFileError, RuntimeError) as e:
+        raise ValueError(f"{inp}: not a readable audio file ({e})") from e
+    dur = info.frames / float(info.samplerate)
+    if dur < MIN_INPUT_S:
+        raise ValueError(f"{inp.name}: {dur:.2f} s is too short to master (at least "
+                         f"{MIN_INPUT_S:g} s, one 1 s RMS window)")
+    return int(info.frames), int(info.samplerate)
+
+
+def check_audio(inp: Path, x: np.ndarray, fs: int) -> None:
+    """The read audio has something to master: at least one 1 s RMS window above
+    meter.RMS_GATE_DBFS (S3-1: digital silence or a near-silent file ran the whole
+    analysis and then failed the plan on a NaN level). Raises ValueError."""
+    if x.shape[0] < int(round(MIN_INPUT_S * fs)):
+        raise ValueError(f"{Path(inp).name}: {x.shape[0] / fs:.2f} s is too short to master "
+                         f"(at least {MIN_INPUT_S:g} s)")
+    if not math.isfinite(meter.rms_1s(x, fs)["loud_section_dbfs"]):
+        raise ValueError(f"{Path(inp).name}: no 1 s window above {meter.RMS_GATE_DBFS:g} dBFS "
+                         "(silent or near-silent): nothing to master")
+
+
+def probe_output(out: Path) -> None:
+    """The output folder can be written and none of the run's products is locked or
+    read-only (hygiene F5: a master.wav open in a player failed after the whole solve
+    with a raw WinError). Raises ValueError before anything is removed."""
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    probe = out / f".eluate-probe-{uuid.uuid4().hex[:8]}"
+    try:
+        probe.write_bytes(b"")
+        probe.unlink()
+    except OSError as e:
+        raise ValueError(f"cannot write to the output folder {out}: {e}") from e
+    for name in CLEARED_AT_START + RUN_PRODUCTS + WRITTEN_AUDIO:
+        p = out / name
+        if not p.is_file():
+            continue
+        try:
+            if not os.access(p, os.W_OK):
+                raise PermissionError("read-only")
+            with open(p, "r+b"):
+                pass
+        except OSError as e:
+            raise ValueError(f"cannot replace {p}: is it read-only, or open in another "
+                             f"program? ({e})") from e
+
+
+def clear_run(out: Path) -> None:
+    """Remove the previous run's completion marker and process log first (report 3.1),
+    then every other product (RUN_PRODUCTS, RUN_PRODUCT_DIRS, pass dirs), keeping the
+    analysis cache."""
+    out = Path(out)
+    for name in CLEARED_AT_START + RUN_PRODUCTS:
+        (out / name).unlink(missing_ok=True)
+    for name in RUN_PRODUCT_DIRS:
+        shutil.rmtree(out / name, ignore_errors=True)
+    for d in out.glob(STEM_PASS_DIR.format("*")):
+        if d.is_dir():
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def do_master(inp: Path, out: Path, controls: planner.Controls, master_ref: Path | None = None,
               max_renders: int = solver.MAX_OUTER, log=print, bpm: float | None = None,
               progress=None) -> dict:
     t0 = time.perf_counter()
     step = progress or (lambda *a, **k: None)
-    # the completion marker goes first, so a failed or stopped run is never read as done
-    # with the previous run's files (report 3.1); its process log goes with it
-    for name in CLEARED_AT_START:
-        (out / name).unlink(missing_ok=True)
-    run_id = uuid.uuid4().hex
-    # then the memory guard, before any audio is read: one thread, or a refusal
-    frames = sf.info(str(inp)).frames
+    # the input and the output folder are checked before anything is removed (hygiene F3,
+    # F4, F5): a typo'd path or a refusal leaves the previous run complete
+    frames, _ = check_input(inp, out)
+    # the memory guard, before any audio is read: one thread, or a refusal
     threads, mem = memory.guard(frames, controls.threads, log)
     controls = dataclasses.replace(controls, threads=threads)
     parallel.set_threads(controls.threads)
+    probe_output(out)
+    # the completion marker goes first, so a failed or stopped run is never read as done
+    # with the previous run's files (report 3.1); then every other product (S4-9)
+    clear_run(out)
+    run_id = uuid.uuid4().hex
     code = source_hashes()
-    out.mkdir(parents=True, exist_ok=True)
     phases = {}
     a = _reuse_analysis(out, inp, bpm, controls.crossovers_hz, log)
     step("analyse", frames=frames, threads=threads, reused=a is not None)
     if a is not None:
         x, fs = io.read(inp)
+        check_audio(inp, x, fs)
         phases["analyse_s"] = 0.0
     else:
         a, x, fs, phases["analyse_s"] = do_analyse(inp, out, controls.crossovers_hz, log, bpm)
@@ -382,6 +496,7 @@ def do_master(inp: Path, out: Path, controls: planner.Controls, master_ref: Path
     plan0 = planner.plan_from_analysis(a, controls)
     targets = planner.targets_from(a, controls)
     rec = planner.plan_record(a, controls)
+    notes = _plan_notes(rec, log)
     io.write_json(out / "targets.json", targets.to_dict())
     io.write_json(out / "plan_record.json", evaluate._clean(rec))
     phases["plan_s"] = time.perf_counter() - t
@@ -391,13 +506,15 @@ def do_master(inp: Path, out: Path, controls: planner.Controls, master_ref: Path
     res = solver.solve(x, fs, plan0, targets, max_outer=max_renders, log=log,
                        progress=lambda n: step("render", render=n, renders_max=bound))
     phases["solve_s"] = time.perf_counter() - t
-    # per-stage peak GR against budget and the warnings, from the solved plan (chunk 3)
+    # per-stage peak GR against budget and the warnings, from the solved plan (chunk 3),
+    # plus the planner's own notes (a --bpm that disagrees with the detected grid)
     rec["budget"] = planner.budget_report(res.plan, res.lim_info)
-    rec["warnings"] = rec["budget"]["warnings"]
+    rec["warnings"] = rec["budget"]["warnings"] + notes
     io.write_json(out / "plan_record.json", evaluate._clean(rec))
     res.plan.save(out / "plan.json", run_id)
     io.write(out / "master.wav", res.master, fs, _subtype(res.plan))
     summ = evaluate._clean(res.summary())
+    summ["warnings"] = list(summ.get("warnings") or []) + notes
     io.write_json(out / "solve.json", summ)
     step("report")
     t = time.perf_counter()
@@ -426,7 +543,7 @@ def do_master(inp: Path, out: Path, controls: planner.Controls, master_ref: Path
            "memory": mem,
            "renders": res.renders, "ok": res.ok,
            "misses": [c["name"] for c in res.misses],
-           "warnings": [w.get("stage") for w in res.warnings],
+           "warnings": [w.get("stage") for w in res.warnings] + [w.get("stage") for w in notes],
            "rms_dbfs": res.metrics.get("rms_dbfs"), "s95_lufs": res.metrics.get("s95_lufs"),
            "constraints_met": {c["name"]: c["ok"] for c in res.metrics["constraints"]},
            "source_sha256": code}
@@ -436,9 +553,63 @@ def do_master(inp: Path, out: Path, controls: planner.Controls, master_ref: Path
     return run
 
 
-def do_report(out: Path, master_ref: Path | None = None, log=print,
-              process_log: bool = True) -> dict:
+def _plan_notes(rec: dict, log) -> list[dict]:
+    """The planner's own warnings from a plan record (a user tempo that disagrees with the
+    detected grid, planner.tempo_record), each logged; a clipped --subside is logged too
+    (hygiene F18)."""
+    notes = list((rec.get("tempo") or {}).get("warnings") or [])
+    for w in notes:
+        log(f"warning: {w.get('text') or w}")
+    sc = rec.get("sidestrip") or {}
+    if sc.get("clipped"):
+        lo, hi = sc.get("range_hz") or planner.SUBSIDE_RANGE_HZ
+        log(f"side strip: {sc.get('rule')} asked for {sc.get('rule_hz'):g} Hz, clipped to "
+            f"{sc.get('used_hz'):g} Hz (the {lo:g} to {hi:g} Hz range)")
+    return notes
+
+
+def check_run_files(out: Path) -> None:
+    """A finished master: run.json (the completion marker) exists and its run id is
+    plan.json's (S4-9: after a failed re-render `report` happily paired the previous
+    master with the new plan). Raises ValueError."""
+    out = Path(out)
+    if not (out / "run.json").is_file():
+        raise ValueError(f"{out} has no run.json: the master did not finish there (re-run master)")
+    try:
+        run = json.loads((out / "run.json").read_text(encoding="utf-8"))
+        pl = json.loads((out / "plan.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise ValueError(f"{out}: run.json or plan.json unreadable ({e}); re-run master") from e
+    if not isinstance(run, dict) or not isinstance(pl, dict) or run.get("run_id") is None \
+            or run.get("run_id") != pl.get("run_id"):
+        raise ValueError(f"{out}: run.json and plan.json are from different runs; re-run master")
+
+
+def check_source(out: Path) -> dict:
+    """source.json of a work dir, its premaster unchanged since the analysis (hygiene F1:
+    the SHA-256 it records is compared with the file's; `report` otherwise compares the
+    master with whatever now sits at that path). Returns the record; raises ValueError."""
+    out = Path(out)
     src = json.loads((out / "source.json").read_text(encoding="utf-8"))
+    path = Path(src["path"])
+    if not path.is_file():
+        raise ValueError(f"the premaster {path} is not there any more (source.json)")
+    want = src.get("sha256")
+    if want and file_sha256(path) != want:
+        raise ValueError(f"the premaster at {path} changed since the master was made (its "
+                         "SHA-256 differs from source.json): re-run master")
+    return src
+
+
+def do_report(out: Path, master_ref: Path | None = None, log=print,
+              process_log: bool = True, check_run: bool = True) -> dict:
+    """Rebuild the report from a finished master's work dir (module contract). check_run:
+    require run.json with plan.json's run id (check_run_files; the stems flow's _promote
+    rebuilds before it writes run.json and passes False)."""
+    out = Path(out)
+    if check_run:
+        check_run_files(out)
+    src = check_source(out)
     x, fs = io.read(src["path"])
     y, fy = io.read(out / "master.wav")
     if fy != fs:
@@ -606,7 +777,7 @@ def _promote(src: Path, out: Path, log) -> None:
             shutil.copy2(f, out / f.name)
     if not (src / "limiter_gr.npz").exists():
         (out / "limiter_gr.npz").unlink(missing_ok=True)
-    do_report(out, None, log, process_log=False)
+    do_report(out, None, log, process_log=False, check_run=False)
 
 
 def do_master_stems(paths, out: Path, controls: planner.Controls, mix: Path | None = None,

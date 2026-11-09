@@ -123,22 +123,26 @@ def test_notches_capped_quantised_and_ring_found(ana):
     for n in p.notches:
         v = n.gain_db.values
         assert v.min() >= -NOTCH_MAX_CUT_DB and v.max() <= 0.0
-        q = np.round(-v / planner.NOTCH_QUANT_DB) * planner.NOTCH_QUANT_DB
-        assert np.allclose(-v, q, atol=1e-6)
+        # smooth, not stepped (the 0.5 dB quantisation is gone, 2026-11-10): the 200 ms
+        # triangular smoothing moves the cut by less than 0.1 dB per millisecond
+        assert np.max(np.abs(np.diff(v))) < 0.1
         assert 1.0 <= n.q <= planner.NOTCH_Q_HI   # merging may widen below NOTCH_Q_LO
     assert p.kick_mask is not None
     assert all("rendered" in r and "spans" in r for r in rows)
 
 
-def test_s_only_notch_not_rendered(ana):
+def test_s_only_notch_rendered_on_the_side(ana):
+    """Features audit 2026-11-10 F7: a side-only resonance is cut on S alone (plan.Notch
+    channel "S"), no longer skipped."""
     _, a = ana
     b = copy.deepcopy(a)
     for r in b["plan_inputs"]["notches"]:
         r["channel"] = "S"
     p, rows = planner.plan_notches3(b)
-    assert p.notches == []
-    assert all(not r["rendered"] and "S-only" in r["reason"] for r in rows)
-    assert planner.notch_rendered("M") and planner.notch_rendered("both")
+    assert p.notches and all(n.channel == "S" for n in p.notches)
+    assert any(r["rendered"] for r in rows) and not any("S-only" in r["reason"] for r in rows)
+    assert planner.notch_rendered("M") and planner.notch_rendered("both") \
+        and planner.notch_rendered("S")
 
 
 def test_notch_depth_rule():
@@ -319,7 +323,7 @@ def test_chord_root_guard_is_per_bar(ana):
     v = p.notches[0].gain_db.values
     # guard applied before smoothing: zero well inside the bar, ramps at its edges
     assert np.all(v[1500:2501] == 0.0) and v[3500] < 0.0
-    assert np.max(np.abs(np.diff(v))) <= planner.NOTCH_QUANT_DB + 1e-9
+    assert np.max(np.abs(np.diff(v))) < 0.1            # smoothed ramps, no steps
     b["pitch"] = {"chords": [{"start": 0.0, "end": 60.0, "chord": "A"}]}
     p, rows = planner.plan_notches3(b)
     assert not rows[0]["rendered"] and rows[0]["reason"].startswith("no cut")
