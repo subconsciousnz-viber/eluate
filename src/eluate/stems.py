@@ -3,12 +3,14 @@ stem set with the stems profile's tighter ranges and name the stems responsible 
 limit the sum pass hit. No stem audio is changed.
 
 Contract:
+- `check_paths(paths) -> [Path]`: refuses an empty set, a missing file, one file given
+  twice (resolved paths) and two files sharing a name (fixes and rows go by name).
 - `read_stems(paths, log=None) -> (stems, fs)`: stems (k, n, 2) float64, filled one stem
   at a time into one preallocated array (peak memory the set plus one stem); every file
   must share the sample rate and the length, except a render tail: a stem longer than the
   shortest by at most TRIM_MAX_S, whose extra samples peak below TRIM_TAIL_DB, is cut to it
-  (logged); otherwise ValueError naming the stem. The same file twice (resolved paths) is
-  refused. Mono is duplicated to two channels.
+  (logged); otherwise ValueError naming the stem. The paths pass `check_paths` first.
+  Mono is duplicated to two channels; more than two channels is refused naming the stem.
 - `null_test(mix, total, fs) -> dict`: aligns the stems' sum `total` to the mix by one
   sample offset within +-NULL_MAX_OFFSET_MS (the per-channel cross-correlations over the
   first NULL_XCORR_S of both, summed; the magnitude's peak, so a polarity-inverted mix
@@ -24,7 +26,8 @@ Contract:
   more than NULL_GAIN_NOTE_DB louder or quieter than the sum); "length" (the lengths and
   the extra samples' peak); and when the verdict is not pass, one of "no_alignment" (the
   offset sits at the window's edge), "silent_stems", "subsample" (a half-sample shift
-  of the sum drops the overlap's residual by NULL_SUBSAMPLE_GAIN_DB), "limited" (the
+  of the sum drops the overlap's residual by NULL_SUBSAMPLE_GAIN_DB; a "mismatch" it
+  takes below NULL_PASS_DB is "processed": the stems make the mix), "limited" (the
   residual sits at the mix's peaks: a limited or clipped mix), "tail" (the overlap nulls,
   the extra length is the residual), "processed" or "mismatch". `null_message(t)` is the
   verdict line with the diagnosis appended; a "processed" verdict is a warning the CLI
@@ -40,7 +43,9 @@ Contract:
   from the M ones: the shares sum to 1 and a negative one cancels against the rest; and
   its level there against the sum's, on the same channel: the stem carrying the range is
   the one to brighten or cut; every stem's spectra are read once per attribution,
-  `_Spectra`, and integrated over each section's range);
+  `_Spectra`, and integrated over each section's range; detail "wanted_db", the gain the
+  planner wanted there: the shelves' range_deficit_db, else the median of the fit's node
+  deficits inside the range, "wanted_from" saying which);
   multiband bands at their exception or band limiter at its cap, and speclim cuts past
   SPECLIM_CUT_DB (each stem's band peak at the ATTR_MOMENTS moments of largest GR in that
   band and channel, against the sum's; the band is split around the moments only);
@@ -126,24 +131,41 @@ def _pdb(v):
     return 10.0 * math.log10(v) if v > 0 else -math.inf
 
 
+def check_paths(paths) -> list[Path]:
+    """The stem files as Paths, refused (ValueError, one line) when there are none, when
+    one is missing, when one file is given twice (resolved paths), or when two share a
+    file name (stemfix matches its fixes and the report its rows to stems by name)."""
+    paths = [Path(p) for p in paths]
+    if not paths:
+        raise ValueError("no stems")
+    seen: dict[str, Path] = {}
+    for p in paths:
+        if not p.is_file():
+            raise ValueError(f"stem {p} not found")
+        key = os.path.normcase(os.path.abspath(str(p.resolve())))
+        if key in seen:
+            raise ValueError(f"stem {p.name} is given twice ({seen[key]} and {p})")
+        seen[key] = p
+    names = [p.stem for p in paths]
+    dups = sorted({n for n in names if names.count(n) > 1})
+    if dups:
+        raise ValueError("stems must have distinct file names: " + "; ".join(
+            f"{d} ({', '.join(str(p) for p in paths if p.stem == d)})" for d in dups))
+    return paths
+
+
 def read_stems(paths, log=None) -> tuple[np.ndarray, int]:
     """Lengths may differ by a render tail: every stem is cut to the shortest when what
     is cut is at most TRIM_MAX_S long and peaks below TRIM_TAIL_DB (a DAW export's tail,
     the maintainer's stem set: 481 samples at -94.8 dBFS); anything more is an error.
     The rates and lengths are read from the headers first (soundfile.info), so the set is
     filled into one preallocated (k, n, 2) array, one stem at a time."""
-    paths = [Path(p) for p in paths]
-    if not paths:
-        raise ValueError("no stems")
-    seen: dict[str, Path] = {}
-    for p in paths:
-        key = os.path.normcase(os.path.abspath(str(p)))
-        if key in seen:
-            raise ValueError(f"stem {p.name} is given twice ({seen[key]} and {p})")
-        seen[key] = p
+    paths = check_paths(paths)
     infos = [sf.info(str(p)) for p in paths]
     fs0 = int(infos[0].samplerate)
     for p, inf in zip(paths, infos):
+        if int(inf.channels) > 2:
+            raise ValueError(f"stem {p.name}: {inf.channels} channels, stereo or mono only")
         if int(inf.samplerate) != fs0:
             raise ValueError(f"stem {p.name}: {inf.samplerate} Hz, the first stem is {fs0} Hz")
     n = min(int(inf.frames) for inf in infos)
@@ -200,28 +222,37 @@ def _fit(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
     return g, _pdb(float(np.sum((a - g * b) ** 2))) - _pdb(float(np.sum(a ** 2)))
 
 
-def _frac_shift(x: np.ndarray, d: float) -> np.ndarray:
-    """x delayed by d samples (fractional) through an FFT phase ramp; circular, so the
-    ends wrap (they are near silent in a track)."""
-    n = x.shape[0]
-    w = 2 * np.pi * np.fft.rfftfreq(n)
-    return np.fft.irfft(np.fft.rfft(x, axis=0) * np.exp(-1j * w * d)[:, None], n=n, axis=0)
-
-
 def _subsample(a: np.ndarray, b: np.ndarray, fs: int) -> tuple[float, float, float] | None:
     """A sub-sample offset between the aligned mix a and sum b: the fractional shift d in
     [-0.5, 0.5] of b that minimises the least-squares residual over the first NULL_XCORR_S
-    (a golden-section search on the residual energy, _frac_shift), reported as (d, the
-    residual before, after; dB) when it drops by NULL_SUBSAMPLE_GAIN_DB; else None."""
+    (a golden-section search on the residual energy), reported as (d, the residual
+    before, after; dB) when it drops by NULL_SUBSAMPLE_GAIN_DB; else None. Both are
+    transformed once (zero-padded to a fast length, so the shift does not wrap) and the
+    residual of each trial shift is read in the frequency domain (Parseval): with the
+    least-squares gain, E = E_a - Re<A, B_d>^2 / E_b, |B_d| = |B| for a pure delay."""
+    from scipy import fft as sfft
     m = min(len(a), len(b), int(NULL_XCORR_S * fs))
     if m < 16:
         return None
-    a, b = a[:m], b[:m]
-    before = max(_fit(a, b)[1], NULL_RESIDUAL_FLOOR_DB)
+    L = sfft.next_fast_len(m + 2, real=True)
+    A = sfft.rfft(a[:m], n=L, axis=0)
+    B = sfft.rfft(b[:m], n=L, axis=0)
+    wt = np.full(A.shape[0], 2.0)
+    wt[0] = 1.0
+    if L % 2 == 0:
+        wt[-1] = 1.0
+    ea = float(np.sum(wt[:, None] * np.abs(A) ** 2))
+    eb = float(np.sum(wt[:, None] * np.abs(B) ** 2))
+    if ea <= 0 or eb <= 0:
+        return None
+    cross = A * np.conj(B)
+    w = 2 * np.pi * np.fft.rfftfreq(L)
 
     def e(d):
-        return max(_fit(a, _frac_shift(b, d))[1], NULL_RESIDUAL_FLOOR_DB)
+        ab = float(np.sum(wt[:, None] * np.real(cross * np.exp(1j * w * d)[:, None])))
+        return max(_pdb(max(ea - ab * ab / eb, 0.0)) - _pdb(ea), NULL_RESIDUAL_FLOOR_DB)
 
+    before = e(0.0)
     lo, hi = -0.5, 0.5
     phi = (math.sqrt(5.0) - 1.0) / 2.0
     x1, x2 = hi - phi * (hi - lo), lo + phi * (hi - lo)
@@ -341,6 +372,9 @@ def null_test(mix: np.ndarray, total: np.ndarray, fs: int) -> dict:
             diag.append({"kind": "silent_stems", "text": "the stems are silent"})
         else:
             sub = _subsample(a[:n], b[:n], fs) if n >= 2 else None
+            if sub is not None and verdict == "mismatch" and sub[2] < NULL_PASS_DB:
+                # the shift explains the residual: these stems do make this mix
+                verdict = "processed"
             # the channels: swapped, or at different gains
             swap_db = max(_fit(a[:n], b[:n, ::-1])[1], NULL_RESIDUAL_FLOOR_DB) if n >= 2 else 0.0
             ch_db = [_db(abs(_fit(a[:n, c:c + 1], b[:n, c:c + 1])[0])) for c in range(a.shape[1])] \
@@ -493,11 +527,12 @@ def _loo_rank(names, stems, total, fs: int, times: np.ndarray, top: int = 2) -> 
         own = mean_tp(lambda a, b: s[a:b])
         if not math.isfinite(own):
             continue
-        without = mean_tp(lambda a, b: total[a:b] - s[a:b])
+        # the rest silent there (this stem is the whole peak): the floor, a finite number
+        # that survives JSON (inf would read None)
+        without = max(mean_tp(lambda a, b: total[a:b] - s[a:b]), NULL_RESIDUAL_FLOOR_DB)
         rows.append({"name": nm, "peak_db": own,
                      "below_sum_db": (ref - own) if math.isfinite(ref) else None,
-                     "peak_drop_db": (ref - without) if math.isfinite(ref) and math.isfinite(without)
-                     else (math.inf if math.isfinite(ref) else 0.0)})
+                     "peak_drop_db": (ref - without) if math.isfinite(ref) else 0.0})
     rows.sort(key=lambda r: -r["peak_drop_db"])
     return rows[:top]
 
@@ -525,34 +560,122 @@ def _env_db(plan_env, n_ctrl: int) -> np.ndarray:
     return np.full(n_ctrl, float(v[0])) if v.size == 1 else np.asarray(v[:n_ctrl], dtype=np.float64)
 
 
+SPECTRA_BLOCK = 128            # segments transformed at once (bounded memory at any length)
+
+
+def _seg_fft(x: np.ndarray, nps: int, a: int, b: int) -> np.ndarray:
+    """The rfft of segments a..b-1 of the 1-D x (Hann, nps points, hop nps/2, each
+    segment's mean removed): Welch's segments, scipy.signal.welch's defaults."""
+    hop = nps // 2
+    seg = np.lib.stride_tricks.sliding_window_view(x, nps)[a * hop:(b - 1) * hop + 1:hop]
+    seg = seg - seg.mean(axis=1, keepdims=True)
+    return np.fft.rfft(seg * signal.get_window("hann", nps), axis=1)
+
+
+NOTCH_NPERSEG = 4096           # the notch reading's segments
+
+
+def _notch_rows(names, stems, nts: list, fs: int) -> list[list[dict]]:
+    """Per notch (report.json's rows), each stem's PSD at f0 against its neighbours a
+    third of an octave either side (excess_db), over the Welch segments whose centre lies
+    in the notch's spans, on the notch's channel (M, S, else L and R summed: not a mono
+    fold). One pass per stem: its L and R transformed once (`_seg_fft`, SPECTRA_BLOCK
+    segments at a time) and every notch's bins accumulated from those, not a Welch per
+    stem per notch (the stems audit's run1: 8 notches x 6 stems). Rows ranked by
+    excess."""
+    nps, hop = NOTCH_NPERSEG, NOTCH_NPERSEG // 2
+    n = stems.shape[1]
+    out: list[list[dict]] = [[] for _ in nts]
+    if not nts or n < nps:
+        return out
+    nseg = 1 + (n - nps) // hop
+    f = np.fft.rfftfreq(nps, 1.0 / fs)
+    centre = (np.arange(nseg) * hop + nps / 2) / fs
+    spec = []
+    for nt in nts:
+        f0 = float(nt["f0_hz"])
+        m = np.zeros(nseg, dtype=bool)
+        for a, b in nt["spans"]:
+            m |= (centre >= float(a)) & (centre < float(b))
+        nb = np.nonzero((np.abs(np.log2(np.maximum(f, 1e-9) / f0)) <= 1 / 3)
+                        & (np.abs(f - f0) > f0 * 0.03))[0]
+        ch = nt.get("channel") if nt.get("channel") in ("M", "S") else "LR"
+        spec.append((m, int(np.argmin(np.abs(f - f0))), nb, ch))
+    for nm, x in zip(names, stems):
+        acc = [np.zeros(1 + len(sp[2])) for sp in spec]
+        for a in range(0, nseg, SPECTRA_BLOCK):
+            b = min(nseg, a + SPECTRA_BLOCK)
+            L, R = _seg_fft(x[:, 0], nps, a, b), _seg_fft(x[:, 1], nps, a, b)
+            for j, (m, at, nb, ch) in enumerate(spec):
+                sel = m[a:b]
+                if not np.any(sel):
+                    continue
+                cols = np.concatenate([[at], nb])
+                l, r = L[sel][:, cols], R[sel][:, cols]
+                pw = (np.abs(l) ** 2 + np.abs(r) ** 2 if ch == "LR" else
+                      np.abs(0.5 * (l + r)) ** 2 if ch == "M" else np.abs(0.5 * (l - r)) ** 2)
+                acc[j] += pw.sum(axis=0)
+        for j, (m, at, nb, ch) in enumerate(spec):
+            if not np.any(m) or nb.size == 0 or acc[j][0] <= 0:
+                continue
+            med = float(np.median(acc[j][1:]))
+            out[j].append({"name": nm, "excess_db": _pdb(float(acc[j][0])) - _pdb(med)})
+    for rows in out:
+        rows.sort(key=lambda r: -r["excess_db"])
+    return out
+
+
 class _Spectra:
     """Every stem's spectra, read once per attribution and integrated over each range the
-    sections ask for: the Welch PSDs of its L and R, its L-R cross spectrum, and its
-    cross spectra with the sum's L and R (all four pairings), SPECTRA_NPERSEG points. From
-    those the PSD and the projection on any channel set follow by bilinearity: "LR" sums L
-    and R; "M" reads (L+R)/2, PSD_M = (P_L + P_R + 2 Re C_LR) / 4 and the projection
+    sections ask for: the averaged periodograms of its L and R, its L-R cross spectrum,
+    and its cross spectra with the sum's L and R (all four pairings), SPECTRA_NPERSEG
+    points (Welch's segments, `_seg_fft`). One pass: every channel of the sum and of each
+    stem is transformed once and every product accumulated from those transforms
+    (scipy's csd re-transforms both inputs per pair: five calls a stem, the sum's channels
+    each time; the stems audit measured 29 s for run1's attribution, most of it there),
+    SPECTRA_BLOCK segments at a time. The scale is common to every spectrum, so the shares
+    and the levels re the sum (ratios) are Welch's. From those the PSD and the projection
+    on any channel set follow by bilinearity: "LR" sums L and R; "M" reads (L+R)/2,
+    PSD_M = (P_L + P_R + 2 Re C_LR) / 4 and the projection
     Re<M_s, M_t> = Re(C_LL + C_LR + C_RL + C_RR) / 4; "S" reads (L-R)/2 with the cross
     terms negated. The sum's own PSDs the same way."""
 
     def __init__(self, stems, total, fs: int):
-        self.stems, self.total, self.fs = stems, total, fs
-        self.nps = SPECTRA_NPERSEG if total.shape[0] >= SPECTRA_NPERSEG else 2048
-        self.f, pt = signal.welch(total, fs, nperseg=self.nps, axis=0)
-        _, c = signal.csd(total[:, 0], total[:, 1], fs, nperseg=self.nps)
-        self.t = {"ll": pt[:, 0], "rr": pt[:, 1], "lr": np.real(c)}
-        self._s: dict[int, dict] = {}
+        self.fs = fs
+        n = total.shape[0]
+        self.nps = nps = SPECTRA_NPERSEG if n >= SPECTRA_NPERSEG else 2048
+        self.f = np.fft.rfftfreq(nps, 1.0 / fs)
+        nf = self.f.size
+        k = len(stems)
+        z = lambda: np.zeros(nf)   # noqa: E731
+        self.t = {"ll": z(), "rr": z(), "lr": z()}
+        self._s = [{key: z() for key in ("ll", "rr", "lr", "x_ll", "x_rr", "x_lr", "x_rl")}
+                   for _ in range(k)]
+        nseg = 1 + (n - nps) // (nps // 2) if n >= nps else 0
+        if nseg == 0:                       # shorter than one segment: one zero-padded one
+            pad = np.zeros((nps, total.shape[1]))
+            pad[:n] = total
+            total = pad
+            stems = np.concatenate([stems, np.zeros((k, nps - n, stems.shape[2]))], axis=1)
+            nseg = 1
+        for a in range(0, nseg, SPECTRA_BLOCK):
+            b = min(nseg, a + SPECTRA_BLOCK)
+            tl, tr = _seg_fft(total[:, 0], nps, a, b), _seg_fft(total[:, 1], nps, a, b)
+            self.t["ll"] += np.sum(np.abs(tl) ** 2, axis=0)
+            self.t["rr"] += np.sum(np.abs(tr) ** 2, axis=0)
+            self.t["lr"] += np.sum(np.real(tl * np.conj(tr)), axis=0)
+            for i in range(k):
+                sl, sr = _seg_fft(stems[i][:, 0], nps, a, b), _seg_fft(stems[i][:, 1], nps, a, b)
+                d = self._s[i]
+                d["ll"] += np.sum(np.abs(sl) ** 2, axis=0)
+                d["rr"] += np.sum(np.abs(sr) ** 2, axis=0)
+                d["lr"] += np.sum(np.real(sl * np.conj(sr)), axis=0)
+                d["x_ll"] += np.sum(np.real(sl * np.conj(tl)), axis=0)
+                d["x_rr"] += np.sum(np.real(sr * np.conj(tr)), axis=0)
+                d["x_lr"] += np.sum(np.real(sl * np.conj(tr)), axis=0)
+                d["x_rl"] += np.sum(np.real(sr * np.conj(tl)), axis=0)
 
     def stem(self, i: int) -> dict:
-        if i not in self._s:
-            s, t, fs, nps = self.stems[i], self.total, self.fs, self.nps
-            _, ps = signal.welch(s, fs, nperseg=nps, axis=0)
-            _, c = signal.csd(s[:, 0], s[:, 1], fs, nperseg=nps)
-            _, x = signal.csd(s, t, fs, nperseg=nps, axis=0)           # L_s L_t, R_s R_t
-            _, xlr = signal.csd(s[:, 0], t[:, 1], fs, nperseg=nps)      # L_s R_t
-            _, xrl = signal.csd(s[:, 1], t[:, 0], fs, nperseg=nps)      # R_s L_t
-            self._s[i] = {"ll": ps[:, 0], "rr": ps[:, 1], "lr": np.real(c),
-                          "x_ll": np.real(x[:, 0]), "x_rr": np.real(x[:, 1]),
-                          "x_lr": np.real(xlr), "x_rl": np.real(xrl)}
         return self._s[i]
 
     @staticmethod
@@ -579,7 +702,7 @@ class _Spectra:
         for i, nm in enumerate(names):
             d = self.stem(i)
             e = float(self._psd(d, channel)[sel].sum())
-            if e <= 0:
+            if e <= e_t * 1e-12:          # nothing there on this channel (rounding: -120 dB)
                 continue
             rows.append({"name": nm, "share": float(self._proj(d, channel)[sel].sum()) / e_t,
                          "level_re_sum_db": _pdb(e) - _pdb(e_t)})
@@ -616,6 +739,30 @@ def _eq_bounds() -> dict:
             "hs_side_db": b.get("hs_side_db", 6.0)}
 
 
+def _wanted_db(rep: dict, name: str, lo: float, hi: float) -> tuple[float | None, str | None]:
+    """The gain the planner wanted for an input EQ section, from report.json's planner
+    record: the shelves' range_deficit_db (top_caps / side_caps, "range_deficit"); the low
+    shelf, the bell and the band shelf the median of the fit's node deficits
+    (fit_deficit_db) inside the section's range ("fit_deficit"). (None, None) when the
+    report has neither."""
+    ieq = (rep.get("planner") or {}).get("inputeq") or {}
+    key = "presence" if name.startswith("high_shelf") else "air" if name.startswith("air") else None
+    if key:
+        caps = ieq.get("side_caps" if name.endswith("_side") else "top_caps") or {}
+        v = (caps.get(key) or {}).get("range_deficit_db")
+        if isinstance(v, (int, float)) and math.isfinite(v):
+            return float(v), "range_deficit"
+        return None, None
+    nodes, d = ieq.get("fit_nodes_hz"), ieq.get("fit_deficit_db")
+    if not nodes or not d or len(nodes) != len(d):
+        return None, None
+    nodes, d = np.asarray(nodes, dtype=np.float64), np.asarray(d, dtype=np.float64)
+    sel = (nodes >= lo) & (nodes < hi) & np.isfinite(d)
+    if not np.any(sel):
+        return None, None
+    return float(np.median(d[sel])), "fit_deficit"
+
+
 def attribute(work, stems: np.ndarray, names, fs: int) -> dict:
     work = Path(work)
     rep = json.loads((work / "report.json").read_text(encoding="utf-8"))
@@ -647,14 +794,11 @@ def attribute(work, stems: np.ndarray, names, fs: int) -> dict:
         rows = spectra.rows(names, lo, hi, ch)
         detail = {"gain_db": g, "bound_db": cap, "range_hz": [lo, hi], "section": name,
                   "channel": ch}
-        # the total gain the planner wanted in the range (its range_deficit_db), so stemfix
-        # sizes the stem shelf from the excess over the bound
-        caps = (rep.get("planner") or {}).get("inputeq") or {}
-        caps = caps.get("side_caps" if name.endswith("_side") else "top_caps") or {}
-        key = "presence" if name.startswith("high_shelf") else "air" if name.startswith("air") else None
-        wanted = (caps.get(key) or {}).get("range_deficit_db") if key else None
-        if isinstance(wanted, (int, float)):
-            detail["wanted_db"] = float(wanted)
+        # the total gain the planner wanted in the range, so stemfix sizes the stem fix from
+        # the excess over the bound (and proposes none when it wanted no more than it got)
+        wanted, src = _wanted_db(rep, name, lo, hi)
+        if wanted is not None:
+            detail["wanted_db"], detail["wanted_from"] = wanted, src
         out.append({"kind": "eq",
                     "limit": f"input EQ {name.replace('_', ' ')} {g:+.1f} dB, at its bound",
                     "detail": detail, "stems": rows[:2]})
@@ -757,31 +901,12 @@ def attribute(work, stems: np.ndarray, names, fs: int) -> dict:
         out.append({"kind": "budget", "limit": ", ".join(parts), "detail": detail, "stems": rows})
 
     # notches found, on the notch's channel
-    for nt in rep.get("notches") or []:
-        f0, spans = nt.get("f0_hz"), nt.get("spans") or []
-        if not f0 or not spans:
-            continue
+    nts = [nt for nt in rep.get("notches") or [] if nt.get("f0_hz") and nt.get("spans")]
+    notch_rows = _notch_rows(names, stems, nts, fs)
+    for nt, rows in zip(nts, notch_rows):
+        f0, spans = nt["f0_hz"], nt["spans"]
         ch = nt.get("channel") if nt.get("channel") in ("M", "S") else "LR"
         why = notch_rejected(nt)
-        rows = []
-        for nm, s in zip(names, stems):
-            seg = np.concatenate([s[int(a * fs):int(b * fs)] for a, b in spans]
-                                 or [s[:0]])
-            if len(seg) < 2048:
-                continue
-            nps = 4096 if len(seg) >= 4096 else 2048
-            if ch == "LR":
-                f, p = signal.welch(seg, fs, nperseg=nps, axis=0)
-                p = p.sum(axis=1)                      # L and R, not a mono fold
-            else:
-                v = 0.5 * (seg[:, 0] + seg[:, 1]) if ch == "M" else 0.5 * (seg[:, 0] - seg[:, 1])
-                f, p = signal.welch(v, fs, nperseg=nps)
-            at = p[np.argmin(np.abs(f - f0))]
-            nb = (np.abs(np.log2(np.maximum(f, 1e-9) / f0)) <= 1 / 3) & (np.abs(f - f0) > f0 * 0.03)
-            if at <= 0 or not np.any(nb):
-                continue
-            rows.append({"name": nm, "excess_db": _pdb(at) - _pdb(float(np.median(p[nb])))})
-        rows.sort(key=lambda r: -r["excess_db"])
         label = ("rendered" if nt.get("rendered") else "found" if why is None
                  else f"found, skipped: {why}")
         out.append({"kind": "notch", "limit": f"notch at {f0:.0f} Hz ({label})",

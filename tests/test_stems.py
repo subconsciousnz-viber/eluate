@@ -468,3 +468,270 @@ def test_master_stems_loop_end_to_end(tmp_path, stem_set, monkeypatch):
     assert Path(src["path"]).name == cli.STEMS_SUM
     if rep["kept"]:
         assert (out / "master.wav").read_bytes() == (out / "pass-1" / "master.wav").read_bytes()
+
+
+# ---------------------------------------------------------------- stems audit 2026-11-10
+
+def _kinds(t):
+    return [d["kind"] for d in t["diagnosis"]]
+
+
+def test_null_recognises_polarity_and_large_offsets(stem_set):
+    """Item 6: |argmax| aligns a polarity-inverted mix (it passes, reported); the search
+    reaches +-250 ms (a 12 ms lag was a junk lag and "mismatch")."""
+    st, _ = stem_set
+    tot = st.sum(axis=0)
+    t = stems.null_test(-tot, tot, FS)
+    assert t["verdict"] == "pass" and t["polarity_inverted"] and t["offset_samples"] == 0
+    assert "polarity" in _kinds(t) and "polarity" in stems.null_message(t)
+    for ms in (12.0, 200.0):
+        lag = int(round(ms * 1e-3 * FS))
+        mix = np.concatenate([np.zeros((lag, 2)), tot])[: len(tot)]
+        t = stems.null_test(mix, tot, FS)
+        assert t["offset_samples"] == lag and t["verdict"] == "pass", ms
+    # the inverted and delayed one together
+    lag = int(0.05 * FS)
+    t = stems.null_test(-np.concatenate([np.zeros((lag, 2)), tot])[: len(tot)], tot, FS)
+    assert t["offset_samples"] == lag and t["verdict"] == "pass" and t["polarity_inverted"]
+
+
+def test_null_names_what_differs(stem_set):
+    """Item 6: gain mismatch, length / tail, a sub-sample offset and a limited reference
+    are named, and "processed" says the run continues."""
+    st, _ = stem_set
+    tot = st.sum(axis=0)
+    t = stems.null_test(2.0 * tot, tot, FS)                       # 6 dB louder: passes, said
+    assert t["verdict"] == "pass" and "gain" in _kinds(t) and "6.0 dB louder" in stems.null_message(t)
+    # a mix longer by an audible tail: the overlap nulls, the tail is the difference
+    rng = np.random.default_rng(9)
+    tail = 0.02 * rng.standard_normal((FS // 2, 2)) * np.exp(-np.arange(FS // 2) / (0.1 * FS))[:, None]
+    t = stems.null_test(np.vstack([tot, tail]), tot, FS)
+    assert "length" in _kinds(t) and t["overlap_residual_db"] < -100
+    if t["verdict"] != "pass":
+        assert "tail" in _kinds(t)
+    # half a sample late (a resampled or SRC'd print): processed, named, the shift found
+    n = len(tot)
+    w = 2 * np.pi * np.fft.rfftfreq(n)
+    half = np.fft.irfft(np.fft.rfft(tot, axis=0) * np.exp(-0.5j * w)[:, None], n=n, axis=0)
+    t = stems.null_test(half, tot, FS)
+    # (residual -17 dB, past the mismatch line, on this hat-heavy set: the shift explains
+    # it, so the stems do make the mix: processed, not "do not make this mix")
+    assert t["verdict"] == "processed" and "subsample" in _kinds(t)
+    assert "The run continues" in stems.null_message(t)
+    # through a hard limiter 3 dB up: the residual sits at the peaks
+    pk = np.max(np.abs(tot))
+    lim = np.clip(tot * 10 ** (3 / 20), -pk, pk)
+    t = stems.null_test(lim, tot, FS)
+    assert t["verdict"] in ("processed", "pass") and t["verdict"] != "mismatch"
+    if t["verdict"] == "processed":
+        assert "limited" in _kinds(t)
+
+
+def test_exact_null_serialises_and_the_report_writes(tmp_path, stem_set):
+    """Item 6: an exact null read -inf, became None in the JSON and crashed null_message
+    (`--stems a.wav --mix a.wav`); it is floored at -200 dB."""
+    st, names = stem_set
+    t = stems.null_test(st[0], st[0], FS)
+    assert t["residual_db"] == stems.NULL_RESIDUAL_FLOOR_DB and t["verdict"] == "pass"
+    json.dumps(t, allow_nan=False)
+    stems.write_report(tmp_path, {"stems": ["kick"], "attribution": [], "null_test": t})
+    md = (tmp_path / "stems-report.md").read_text(encoding="utf-8")
+    assert "residual -200.0 dB" in md
+    # a report already cleaned (None residual) still writes
+    t2 = dict(t, residual_db=None, gain_db=None)
+    stems.write_report(tmp_path, {"stems": ["kick"], "attribution": [], "null_test": t2})
+    assert "n/a" in (tmp_path / "stems-report.md").read_text(encoding="utf-8")
+
+
+def test_processed_is_a_warning_mismatch_stops(tmp_path, stem_set):
+    """Item 6: "processed" lets sum_stems continue (logged); "mismatch" stops it."""
+    from eluate import cli
+    st, names = stem_set
+    paths = []
+    for nm, s in zip(names, st):
+        p = tmp_path / f"{nm}.wav"
+        sf.write(p, s, FS, subtype="FLOAT")
+        paths.append(p)
+    tot = st.sum(axis=0)
+    n = len(tot)
+    w = 2 * np.pi * np.fft.rfftfreq(n)
+    half = np.fft.irfft(np.fft.rfft(tot, axis=0) * np.exp(-0.5j * w)[:, None], n=n, axis=0)
+    sf.write(tmp_path / "half.wav", half, FS, subtype="FLOAT")
+    logs = []
+    _, _, nt, sum_path = cli.sum_stems(paths, tmp_path / "w", tmp_path / "half.wav", log=logs.append)
+    assert nt["verdict"] == "processed" and sum_path.exists()
+    assert any(m.startswith("warning:") for m in logs)
+    sf.write(tmp_path / "other.wav", st[0] + st[1], FS, subtype="FLOAT")
+    with pytest.raises(ValueError, match="do not make this mix"):
+        cli.sum_stems(paths, tmp_path / "w2", tmp_path / "other.wav", log=lambda m: None)
+
+
+def test_check_paths_refuses_duplicates_and_missing(tmp_path, stem_set):
+    """Item 9: one basename twice (fixes and rows go by name), the same file twice, a
+    missing file, more than two channels: refused with the stem named."""
+    st, _ = stem_set
+    (tmp_path / "dup").mkdir()
+    for p in (tmp_path / "kick.wav", tmp_path / "dup" / "kick.wav", tmp_path / "bass.wav"):
+        sf.write(p, st[0], FS, subtype="FLOAT")
+    with pytest.raises(ValueError, match="distinct file names: kick"):
+        stems.check_paths([tmp_path / "kick.wav", tmp_path / "dup" / "kick.wav"])
+    with pytest.raises(ValueError, match="given twice"):
+        stems.read_stems([tmp_path / "kick.wav", tmp_path / "." / "kick.wav"])
+    with pytest.raises(ValueError, match="not found"):
+        stems.read_stems([tmp_path / "kick.wav", tmp_path / "nope.wav"])
+    sf.write(tmp_path / "quad.wav", np.zeros((1000, 4)), FS)
+    with pytest.raises(ValueError, match="quad.wav: 4 channels"):
+        stems.read_stems([tmp_path / "kick.wav", tmp_path / "quad.wav"])
+    assert [p.name for p in stems.check_paths([tmp_path / "kick.wav", tmp_path / "bass.wav"])] \
+        == ["kick.wav", "bass.wav"]
+
+
+def test_loo_rank_puts_a_cancelling_stem_last():
+    """Item 7: three stems with 1 kHz bursts, carrier +0.5, in phase +0.3, anti-phase -0.45:
+    by own peak the anti-phase one ranked second; by leave-one-out it cancels."""
+    n = FS * 2
+    t = np.arange(n) / FS
+    burst = np.zeros(n)
+    for c in (0.5, 1.0, 1.5):
+        i = int(c * FS)
+        burst[i:i + 2205] = np.sin(2 * np.pi * 1000 * t[:2205]) * np.hanning(2205)
+    st = np.stack([np.stack([g * burst] * 2, axis=1) for g in (-0.45, 0.3, 0.5)])
+    names = ["anti", "in", "carrier"]
+    rows = stems._loo_rank(names, st, st.sum(axis=0), FS, np.array([0.525, 1.025, 1.525]), top=3)
+    assert rows[-1]["name"] == "anti" and rows[-1]["peak_drop_db"] < 0
+    assert all(r["peak_drop_db"] > 0 for r in rows[:2])
+    assert stems._db(0.45) > stems._db(0.3)              # by its own peak it outranked "in"
+    assert "cancels there" in stems._stem_line({}, rows[-1])
+    # a stem that is the whole peak: a finite drop that survives JSON
+    solo = stems._loo_rank(["only"], st[2:], st[2], FS, np.array([0.525]))
+    assert math.isfinite(solo[0]["peak_drop_db"]) and solo[0]["peak_drop_db"] > 100
+
+
+def _attr_work(tmp_path, monkeypatch, st, names, rep):
+    from types import SimpleNamespace
+    monkeypatch.setattr(stems.Plan, "load", staticmethod(lambda p: SimpleNamespace(multiband=None, speclim=None)))
+    (tmp_path / "plan.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "report.json").write_text(json.dumps(rep), encoding="utf-8")
+    return stems.attribute(tmp_path, st, names, FS)
+
+
+def test_attribution_is_ms_aware_and_counts_the_budget(tmp_path, monkeypatch, stem_set):
+    """Items 4, 5, 7: a side-only stem is present on the S shelf and absent from the M one;
+    a notch on S reads its ring on S; the limiter held by its average budget and the
+    loudness shortfall are one limit, ranked by leave-one-out; rejected notches are not
+    limits; the planner's wanted gain rides on every EQ entry."""
+    st, names = stem_set
+    n = st.shape[1]
+    t = np.arange(n) / FS
+    rng = np.random.default_rng(5)
+    from scipy import signal as sg
+    hs = sg.sosfilt(sg.butter(4, 2000, "highpass", fs=FS, output="sos"), rng.standard_normal(n)) * 0.05
+    wide = np.stack([hs, -hs], axis=1)                     # L = -R: no M at all
+    pad = st[2].copy()
+    ring = 0.05 * np.sin(2 * np.pi * 660.0 * t)
+    pad[:, 0] += ring
+    pad[:, 1] -= ring                                       # an S-only ring in the pad
+    S = np.concatenate([st[:2], pad[None], st[3:], wide[None]])
+    nm = names + ["wide"]
+    gr_t = np.arange(0, n / FS, 0.01)
+    gr = np.where(np.min([np.abs(gr_t - b * BEAT) for b in range(16)], axis=0) < 0.02, -2.0, -0.5)
+    np.savez(tmp_path / "limiter_gr.npz", t=gr_t, gr_db=gr)
+    rep = {"chain": {"inputeq": {"sections": {
+               "high_shelf": {"gain_db": 2.5, "fc_hz": 1340.0},
+               "high_shelf_side": {"gain_db": 3.0, "fc_hz": 1340.0},
+               "bell": {"gain_db": -1.5, "fc_hz": 500.0, "q": 0.7}}}},
+           "planner": {"inputeq": {"top_caps": {"presence": {"range_deficit_db": 0.4}},
+                                   "side_caps": {"presence": {"range_deficit_db": 6.0}},
+                                   "fit_nodes_hz": [250.0, 397.0, 500.0, 630.0, 1000.0],
+                                   "fit_deficit_db": [0.0, -2.0, -3.3, -12.0, 0.0]}},
+           "warnings": [{"stage": "limiter", "bound": "average", "needed_db": 5.3, "cap_db": 2.0},
+                        {"stage": "loudness", "shortfall_db": 3.3, "cause": "limiter budget"}],
+           "notches": [{"f0_hz": 660.0, "spans": [[0.0, n / FS]], "channel": "S", "q": 8.0,
+                        "rendered": False, "reason": "S-only resonance; notch stage is not channel-aware"},
+                       {"f0_hz": 9000.0, "spans": [[0.0, n / FS]], "rendered": False,
+                        "reason": "suspect: spans cover 91 % of the track"},
+                       {"f0_hz": 440.0, "spans": [[0.0, n / FS]], "rendered": False, "flag": "musical",
+                        "max_cut_db": 0.0, "reason": "below the top 5 merged notches by peak excess"}],
+           "loudness": {"target_rms_dbfs": -4.1, "after_rms_dbfs": -7.4}}
+    att = _attr_work(tmp_path, monkeypatch, S, nm, rep)["attribution"]
+    by = {e["detail"].get("section") or e["limit"]: e for e in att}
+    side = [r["name"] for r in stems._range_rows(nm, S, S.sum(axis=0), FS, 1340.0, 20000.0, "S")]
+    mid = [r["name"] for r in stems._range_rows(nm, S, S.sum(axis=0), FS, 1340.0, 20000.0, "M")]
+    assert side[0] == "wide" and "wide" not in mid
+    assert by["high_shelf_side"]["stems"][0]["name"] == "wide"
+    assert by["high_shelf_side"]["detail"]["channel"] == "S"
+    assert by["high_shelf"]["detail"]["wanted_db"] == 0.4
+    assert by["bell"]["detail"]["wanted_db"] == pytest.approx(-3.3)
+    assert by["bell"]["detail"]["wanted_from"] == "fit_deficit"
+    notch = [e for e in att if e["kind"] == "notch"]
+    s_notch = next(e for e in notch if e["detail"]["f0_hz"] == 660.0)
+    assert s_notch["detail"]["read_on"] == "S" and s_notch["stems"][0]["name"] == "pad"
+    assert s_notch["stems"][0]["excess_db"] > 20.0
+    assert stems.is_limit(s_notch) and s_notch["limit"].endswith("(found)")
+    for e in notch:
+        if e is not s_notch:
+            assert not stems.is_limit(e) and "skipped" in e["limit"]
+    budget = next(e for e in att if e["kind"] == "budget")
+    assert budget["detail"]["which"] == "limiter average budget and loudness shortfall"
+    assert "peak_drop_db" in budget["stems"][0] and stems.is_limit(budget)
+    sc = stems.pass_score(rep, att)
+    assert budget["limit"] in sc["limits"] and len(sc["limits"]) == 5    # 3 EQ, budget, S notch
+    assert sc["rms_shortfall_db"] == pytest.approx(3.3) and sc["dominant"] == "rms_shortfall"
+    assert sc["shortfall_cause"] == "limiter budget"
+    from eluate import evaluate
+    json.dumps(evaluate._clean(att), allow_nan=False)
+
+
+def test_spectra_are_read_once_per_attribution(monkeypatch, stem_set):
+    """Item 10: every channel of the sum and of each stem is transformed once (scipy's csd
+    re-transformed both inputs per pair, five calls a stem), and the result is Welch's:
+    the shares and levels match scipy's welch / csd."""
+    from scipy import signal as sg
+    st, names = stem_set
+    tot = st.sum(axis=0)
+    calls = []
+    real = stems._seg_fft
+    monkeypatch.setattr(stems, "_seg_fft", lambda *a: calls.append(a[2:]) or real(*a))
+    sp = stems._Spectra(st, tot, FS)
+    nseg = 1 + (len(tot) - sp.nps) // (sp.nps // 2)
+    blocks = -(-nseg // stems.SPECTRA_BLOCK)
+    assert len(calls) == blocks * 2 * (1 + len(names))
+    for lo, hi, ch in ((20.0, 120.0, "LR"), (350.0, 700.0, "LR"), (1340.0, 20000.0, "M"),
+                       (1340.0, 20000.0, "S")):
+        sp.rows(names, lo, hi, ch)
+    assert len(calls) == blocks * 2 * (1 + len(names))      # the sections read, never recompute
+    # against scipy (the per-pair welch / csd the attribution used before)
+    nps = sp.nps
+    f, pt = sg.welch(tot, FS, nperseg=nps, axis=0)
+    sel = (f >= 350.0) & (f < 700.0)
+    e_t = pt[sel].sum()
+    want = {}
+    for nm, s in zip(names, st):
+        _, x = sg.csd(s, tot, FS, nperseg=nps, axis=0)
+        _, ps = sg.welch(s, FS, nperseg=nps, axis=0)
+        want[nm] = (float(np.real(x[sel]).sum() / e_t), 10 * np.log10(ps[sel].sum() / e_t))
+    for r in sp.rows(names, 350.0, 700.0, "LR"):
+        assert r["share"] == pytest.approx(want[r["name"]][0], abs=1e-9)
+        assert r["level_re_sum_db"] == pytest.approx(want[r["name"]][1], abs=1e-6)
+
+
+def test_notch_rows_read_the_spans_and_the_channel(stem_set):
+    """Item 10: the notch readings, one pass per stem: a ring only inside a notch's spans
+    is read there and not by a notch spanning elsewhere; an S ring is read on S."""
+    st, names = stem_set
+    n = st.shape[1]
+    t = np.arange(n) / FS
+    pad = st[2].copy()
+    half = n // 2
+    ring = np.where(t < half / FS, 0.05 * np.sin(2 * np.pi * 1500.0 * t), 0.0)
+    pad[:, 0] += ring
+    pad[:, 1] -= ring
+    S = np.concatenate([st[:2], pad[None], st[3:]])
+    nts = [{"f0_hz": 1500.0, "spans": [[0.0, half / FS]], "channel": "S"},
+           {"f0_hz": 1500.0, "spans": [[half / FS + 0.1, n / FS]], "channel": "S"},
+           {"f0_hz": 1500.0, "spans": [[0.0, half / FS]]}]
+    on, off, lr = stems._notch_rows(names, S, nts, FS)
+    pad_on = next(r for r in on if r["name"] == "pad")
+    assert on[0]["name"] == "pad" and pad_on["excess_db"] > 20.0
+    assert next(r for r in off if r["name"] == "pad")["excess_db"] < pad_on["excess_db"] - 15.0
+    assert lr[0]["name"] == "pad"
