@@ -97,10 +97,54 @@ def test_key_mode_from_edma_tonic_from_edmm(chords, want):
 
 def test_relative_major_ambiguity_is_reported():
     """Am-F-C-G is a vi-IV-I-V loop in C as much as i-VI-III-VII in A minor: edma
-    reads C major, edmm A minor, and both are in the output."""
+    reads C major, edmm A minor, and both are in the output. The bass holds A and C
+    equally, so the first stable bass root settles it (audit features F3): A, so Am;
+    the same chords from C (I-V-vi-IV) stay C. The key stays low-confidence."""
     x, meta = syn.chord_loop(FS, chords=("Am", "F", "C", "G"), loops=2)
     r = pitch.analyse(x, FS, Context(x, FS), bar_times=meta["bar_times"])
-    assert r["key"]["label"] == "C" and r["key"]["edmm"]["label"] == "Am"
+    k = r["key"]
+    assert k["edma"]["label"] == "C" and k["edmm"]["label"] == "Am"
+    assert k["label"] == "Am" and k["rule"] == "edmm tonic, relative minor by the first bass root"
+    assert k["relative"]["in_play"] and k["relative"]["first_root"] == "A"
+    assert k["confidence"] < 0.5
+    x, _ = syn.chord_loop(FS, chords=("C", "G", "Am", "F"), loops=2)
+    k = pitch.key(Context(x, FS))["key"]
+    assert k["label"] == "C" and k["relative"]["decided"] == "major"
+
+
+@pytest.mark.parametrize("chords,want", [(("Em", "C", "G", "D"), "Em"), (("C#m", "A", "E", "B"), "C#m"),
+                                         (("E", "A", "B", "E"), "E"), (("G", "Em", "C", "D"), "G")])
+def test_relative_minor_tie_break(chords, want):
+    """Audit features F3: i-VI-III-VII loops read as the relative major (Em C G D as G,
+    C#m A E B as E); the bass decides between a key and its relative. Major loops stay."""
+    x, _ = syn.chord_loop(FS, chords=chords, loops=2)
+    assert pitch.key(Context(x, FS))["key"]["label"] == want
+
+
+def _weighted_key(x):
+    from eluate.features import loudness
+    ctx = Context(x, FS)
+    m = loudness.analyse(ctx.x, FS, ctx)["momentary"]
+    return pitch.key(ctx, np.where(np.isfinite(m), 10.0 ** (m / 10.0), 0.0))["key"]
+
+
+def test_key_confidence_separates_keys_from_noise():
+    """Audit features F2: the key lock followed whatever key won (pink noise Cm 0.29,
+    drums only G#m 0.22, DC Gm 0.71); key_confidence (score x margin x profile
+    agreement x chroma contrast, in [0, 1]) is under 0.4 on them and over 0.7 on clear
+    progressions, under features.analyse's loudness weights and without them."""
+    for chords in (("C", "F", "G", "C"), ("Am", "Dm", "E", "Am"), ("D", "G", "A", "D")):
+        x, _ = syn.chord_loop(FS, chords=chords, loops=2)
+        k = _weighted_key(x)
+        assert 0.7 < k["confidence"] <= 1.0 and set(k["confidence_factors"]) == {
+            "score", "margin", "agreement", "contrast"}
+    drums, _ = syn.drum_loop(FS, 128.0, "four", 8.0, sub_hz=None)
+    dc = np.full((5 * FS, 2), 0.25)
+    for x in (syn.pink_noise(8 * FS, FS), drums, dc):
+        assert _weighted_key(x)["confidence"] < 0.4
+        assert pitch.key(Context(x, FS))["key"]["confidence"] < 0.4
+    k = pitch.key(Context(np.zeros((3 * FS, 2)), FS))["key"]
+    assert k["label"] is None and k["confidence"] is None
 
 
 def test_edmm_major_profile_is_flat_so_major_never_wins():

@@ -11,9 +11,10 @@ fcs_from_key=None)`:
   tonic, else "fixed" and None. The key the pitch pass reports later is the
   same one (same chroma, same weights). `meta["key_confidence"]` and
   `plan_inputs["key_confidence"]` carry pitch.key_confidence (a float in
-  [0, 1], None without chroma; audit features F2); a `fcs_from_key` that
-  takes a `key_confidence` parameter receives it, so the planner can refuse
-  the key lock on a weak key.
+  [0, 1], None without chroma; audit features F2). A `fcs_from_key` that
+  takes a `key` parameter receives the whole key record (tonic, mode, label,
+  score, `confidence`), one that takes `key_confidence` receives the float,
+  so the planner can refuse the key lock on a weak key (about 0.5).
 - `bpm`: the user's tempo (spec `--bpm`); when given it overrides tempo
   detection and seeds the beat grid, and structure.metrical reports how far the
   detected pulse was from it (structure.metrical_hypothesis).
@@ -87,17 +88,20 @@ def _frame_power(mom: np.ndarray) -> np.ndarray:
     return np.where(np.isfinite(mom), 10.0 ** (mom / 10.0), 0.0)
 
 
-def _call_fcs_from_key(fn, tonic, key_confidence):
-    """fn(tonic, key_confidence=...) when fn takes a `key_confidence` parameter (or a
-    second positional one), else fn(tonic): planner.key_crossovers may gate the lock
-    on the confidence (audit features F2) without every caller having to."""
+def _fcs_from_key(fn, key: dict):
+    """fn(tonic, key=key) when fn takes a `key` argument, fn(tonic, key_confidence=...)
+    when it takes `key_confidence`, else fn(tonic) (the one-argument form of the
+    contract): planner.key_crossovers may gate the lock on the key's confidence
+    (audit features F2) without every caller having to."""
     try:
         params = inspect.signature(fn).parameters
     except (TypeError, ValueError):
-        return fn(tonic)
+        params = {}
+    if "key" in params:
+        return fn(key.get("tonic"), key=key)
     if "key_confidence" in params:
-        return fn(tonic, key_confidence=key_confidence)
-    return fn(tonic)
+        return fn(key.get("tonic"), key_confidence=key.get("confidence"))
+    return fn(key.get("tonic"))
 
 
 def analyse(x: np.ndarray, fs: float, fcs=_bands.DEFAULT_CROSSOVERS, hop_s: float = HOP_S,
@@ -110,7 +114,7 @@ def analyse(x: np.ndarray, fs: float, fcs=_bands.DEFAULT_CROSSOVERS, hop_s: floa
     if fcs_from_key is not None:
         k0 = pitch.key(ctx, _frame_power(lo["momentary"]))["key"]
         tonic, key_conf = k0.get("tonic"), k0.get("confidence")
-        ctx.fcs = tuple(float(f) for f in _call_fcs_from_key(fcs_from_key, tonic, key_conf))
+        ctx.fcs = tuple(float(f) for f in _fcs_from_key(fcs_from_key, k0))
     out = {"meta": {"fs": ctx.fs, "n": ctx.x.shape[0], "duration_s": ctx.x.shape[0] / ctx.fs,
                     "hop_s": g.hop_s, "frames": g.k, "crossovers": ctx.fcs, "views": VIEWS,
                     "crossover_rule": "fixed" if fcs_from_key is None else "key",
