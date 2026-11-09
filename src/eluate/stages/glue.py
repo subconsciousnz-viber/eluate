@@ -48,7 +48,15 @@ Contract: `apply(x, fs, plan) -> y`, pure, stereo (n, 2) in, float64 (n, 2) out.
   attack time after the detector sees it; the transient passes the wet path
   nearly unreduced. At the 1 ms control rate an attack under 1 ms is a near-
   immediate step after the detector's 1 to 2 ms delay: the presets' 0.1 to 0.8 ms
-  differ little in effect (D3), they are not sub-millisecond attacks. Unlike the multiband and limiter envelopes there is no
+  differ little in effect (D3), they are not sub-millisecond attacks. The applied
+  attack is floored at ATTACK_FLOOR_MS (3 ms = three control samples, 2026-11-10,
+  audio-rate audit F1): below it the one-pole is a one-sample step that PCHIP turns
+  into a 1 ms full-band gain fall of up to 4 dB on the sub as well as the transient
+  (a broadband tick 40 dB under the sub, +21 dB of 1 to 5 kHz energy around each
+  onset, THD -35 dB on a sustained 30 Hz sub at aggressive); at 3 ms the largest 1 ms
+  fall is 1.4 dB and the onset splatter within 4 dB of the input, with the net budget
+  still met. attack_ms records what was asked for (the preset's), GluePlan.
+  attack_applied_ms what the envelope was built with. Unlike the multiband and limiter envelopes there is no
   g <= g_req bound: letting the attack through is the point.
 - makeup_db is explicit (the solver's), default 0, in [0, 6] dB.
 
@@ -107,6 +115,7 @@ VINTAGE_HP_HZ = 20.0
 OVERSAMPLE = 4
 DETECTOR_DELAY = 2  # control segments (see module contract)
 SIDECHAIN_HP_HZ = 120.0         # D3: the detector does not hear the sub
+ATTACK_FLOOR_MS = 3.0           # the applied lagging attack is never shorter (module contract)
 
 
 def gain_computer(level_db, threshold_db: float, ratio: float, knee_db: float) -> np.ndarray:
@@ -165,8 +174,13 @@ def _gain_env(level, threshold_db, ratio, knee_db, attack_ms, release_ms, curve,
                 g_min, 1.0)
     release = release_ms * rate_hz / 1000.0
     h = program_release(u, release)
-    g_db = lagging_attack(20.0 * np.log10(h), attack_ms * rate_hz / 1000.0)
+    g_db = lagging_attack(20.0 * np.log10(h), attack_applied_ms(attack_ms) * rate_hz / 1000.0)
     return to_env32(10.0 ** (g_db / 20.0), rate_hz)
+
+
+def attack_applied_ms(attack_ms: float) -> float:
+    """The attack the envelope is built with: the request floored at ATTACK_FLOOR_MS."""
+    return max(float(attack_ms), ATTACK_FLOOR_MS)
 
 
 def _level(x: np.ndarray, fs: float, rate_hz: float) -> np.ndarray:
@@ -303,6 +317,7 @@ def design(x: np.ndarray, fs: float, threshold_db: float, ratio: float = 2.0,
     env = _gain_env(_level(x, fs, rate_hz), threshold_db, ratio, knee_db, attack_ms, release_ms,
                     curve, rate_hz, floor_db)
     return GluePlan(gain_db=env if np.any(env.values) else Envelope.constant(0.0), mix=mix,
+                    attack_applied_ms=attack_applied_ms(attack_ms),
                     makeup_db=float(makeup_db) + 0.0, curve=curve, threshold_db=threshold_db,
                     ratio=ratio, knee_db=knee_db, attack_ms=attack_ms, release_ms=release_ms)
 

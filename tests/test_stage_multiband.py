@@ -661,6 +661,150 @@ def test_design_span_recorded():
     assert Plan.from_json(Plan(fs=FS, multiband=p).to_json()).multiband.design_span_s == 1.5
 
 
+# ------------------------------------------ 2026-11-10: detector window, ms_link, phase
+
+def test_default_detector_windows_follow_the_crossovers():
+    """One period of the band's lower edge, whole ms, 25 ms for the sub band, at least 2."""
+    assert multiband.default_detector_window_ms([100.0, 400.0, 1600.0, 6400.0]) == [25.0, 10.0, 3.0, 2.0, 2.0]
+    assert multiband.default_detector_window_ms([123.0, 492.0, 1968.0, 7872.0]) == [25.0, 9.0, 3.0, 2.0, 2.0]
+    assert multiband.default_detector_window_ms([80.0]) == [25.0, 13.0]
+    assert multiband.window_samples(None) == 2 and multiband.window_samples(25.0) == 25
+    assert multiband.window_samples(0.5) == 2
+    with pytest.raises(ValueError):
+        multiband.default_detector_window_ms([0.0])
+
+
+def test_detector_window_is_the_trailing_peak_and_never_below_the_two_segments():
+    rng = np.random.default_rng(0)
+    v = rng.standard_normal(FS) * np.exp(-np.arange(FS) / 8000)
+    nc = control_length(FS, FS)
+    pk = multiband._frame_peaks(v, FS, nc, 1000.0)
+    d2 = multiband.detector(v, FS, nc, 1000.0)
+    assert np.array_equal(d2, multiband.detector(v, FS, nc, 1000.0, 2))
+    for w in (3, 10, 25):
+        d = multiband.detector(v, FS, nc, 1000.0, w)
+        ref = np.array([pk[max(0, k - w + 1):k + 1].max() for k in range(nc)])
+        assert np.array_equal(d, ref)
+        assert np.all(d >= d2)
+
+
+def test_detector_window_removes_the_sub_band_ripple():
+    """Audio-rate audit F4: a 40 Hz sine at -6 dBFS through the aggressive sub-band
+    compressor (5 / 80 ms, knee 1 dB) ripples at twice the fundamental with the 2-segment
+    detector; with the 25 ms window the envelope is flat, the bound still holds and the
+    plan records the window. None is the original design, bit for bit."""
+    n = 6 * FS
+    t = np.arange(n) / FS
+    x = np.stack([0.5 * np.sin(2 * np.pi * 40.0 * t)] * 2, axis=1)
+    thr = [[-9.0, 0.0]] + [[0.0, 0.0]] * 4
+    kw = dict(ratio=2.0, attack_ms=5.0, release_ms=80.0, knee_db=1.0, side_makeup_db=0.0)
+    p0 = multiband.design(x, FS, thr, **kw)
+    p1 = multiband.design(x, FS, thr, detector_window_ms=[25.0, 10.0, 3.0, 2.0, 2.0], **kw)
+    assert p0.detector_window_ms is None and p1.detector_window_ms == [25.0, 10.0, 3.0, 2.0, 2.0]
+    g0, g1 = p0.gr_db[0][0].values[1000:-1000], p1.gr_db[0][0].values[1000:-1000]
+    print(f"sub-band envelope p-p: 2-segment {g0.max() - g0.min():.3f} dB, 25 ms window "
+          f"{g1.max() - g1.min():.3f} dB; GR {-g1.mean():.2f} dB")
+    assert g0.max() - g0.min() > 0.05
+    assert g1.max() - g1.min() < 1e-3
+    assert -g1.mean() > 1.0
+    # the bound: g <= g_req at every control point (window reading >= 2-segment reading)
+    nc = control_length(n, FS)
+    b0 = bands.split(bands.to_ms(x), FS, p1.crossovers_hz)[0, :, 0]
+    det = multiband.detector(b0, FS, nc, 1000.0, 25)
+    g_req = 20 * np.log10(np.maximum(10 ** (-9.0 / 20) / np.maximum(det, 1e-12), 10 ** (-6 / 20)) ** 0.5)
+    assert np.all(p1.gr_db[0][0].values <= np.minimum(g_req, 0.0) + 1e-6)
+    # recorded and round-tripped; a scalar window is kept as a scalar
+    q = Plan.from_json(Plan(fs=FS, multiband=p1).to_json()).multiband
+    assert q.detector_window_ms == p1.detector_window_ms
+    assert multiband.design(x, FS, thr, detector_window_ms=4.0, **kw).detector_window_ms == 4.0
+    with pytest.raises(ValueError):
+        MultibandPlan(_flat(), detector_window_ms=[25.0, 10.0])
+    with pytest.raises(ValueError):
+        MultibandPlan(_flat(), detector_window_ms=0.0)
+    # the default (None) is the original design
+    assert all(a == b for pa, pb in zip(p0.gr_db, multiband.design(x, FS, thr, **kw).gr_db)
+               for a, b in zip(pa, pb))
+
+
+def test_detector_window_in_the_budget_solve_and_speclim():
+    """design_budget and design_speclim carry the window into every detector; the solved
+    thresholds move (the window reads more) and the ceilings' bound still holds."""
+    x, _ = band_impulse_train(FS, 0, peak_dbfs=-6.0, seconds=2.0, period_s=0.25)
+    x = x + 0.3 * syn.pink_noise(x.shape[0], FS, rms_dbfs=-30, seed=3)
+    base = MultibandPlan(_flat(), side_makeup_db=0.0, decoherence=[0.0] * NB,
+                         mid_makeup_db=[0.0] * NB, attack_ms=[[5.0, 5.0]] * NB,
+                         release_ms=[[80.0, 80.0]] * NB, budget=multiband.default_budget())
+    win = multiband.default_detector_window_ms(base.crossovers_hz)
+    p0 = multiband.design_budget(x, FS, base)
+    p1 = multiband.design_budget(x, FS, MultibandPlan(**{**base.__dict__, "detector_window_ms": win}))
+    assert p1.detector_window_ms == win and p0.detector_window_ms is None
+    assert p1.threshold_db[0][0] != p0.threshold_db[0][0]
+    y, info = multiband.apply_with_info(x, FS, p1)
+    if p1.ceiling_db is not None and p1.ceiling_db[0][0] is not None:
+        assert info["peak_out_dbfs"][0, 0] <= p1.ceiling_db[0][0] + CEIL_TOL_DB
+    s = multiband.design_speclim(x, FS, base.crossovers_hz, 0.5, 6.0, 6.0, 100.0,
+                                 detector_window_ms=win)
+    assert s is None or s.detector_window_ms == win
+
+
+def _linked_gain_2026_11_09(plan, k, n, fs):
+    """ms_link's audio-rate minimum as _apply_linked computed it before the control-rate
+    minimum (the audit's H3 kinks)."""
+    red = []
+    for c in range(2):
+        r = np.clip(plan.gr_db[k][c].at(n, fs), -MULTIBAND_MAX_GR_DB, 0.0)
+        if plan.ceiling_gr_db is not None:
+            r = r + plan.ceiling_gr_db[k][c].at(n, fs)
+        red.append(r)
+    return np.minimum(red[0], red[1])
+
+
+def test_ms_link_minimum_is_taken_at_the_control_rate():
+    """Audio-rate audit H3 / F7: the linked gain is the control-rate minimum of the two
+    channels' envelopes, interpolated once: no C0 kink at the crossings (the second
+    difference's spikes vanish), the applied gain within 0.3 dB of the old one and the
+    output within -70 dB of the old output."""
+    n = 2 * FS
+    nc = control_length(n, FS)
+    k = np.arange(nc)
+    gm = -3.0 - 2.0 * np.sin(2 * np.pi * k / 400.0)
+    gs = -3.0 - 2.0 * np.cos(2 * np.pi * k / 333.0)
+    gr = _flat()
+    gr[2] = [Envelope(gm), Envelope(gs)]
+    p = MultibandPlan(gr, ms_link=True, side_makeup_db=0.0)
+    new = multiband.linked_reduction_db(p, 2, n, FS)
+    old = _linked_gain_2026_11_09(p, 2, n, FS)
+    assert np.max(np.abs(new - old)) < 0.3
+    assert np.all(new <= 1e-12)
+
+    def kinks(g):
+        d2 = np.abs(np.diff(g, 2)) * (FS / 1000.0) ** 2        # dB/ms^2
+        return int(np.count_nonzero(d2 > 10.0))
+    print(f"ms_link second-difference spikes: audio-rate minimum {kinks(old)}, control-rate "
+          f"{kinks(new)}; max |diff| {np.max(np.abs(new - old)):.4f} dB")
+    assert kinks(old) > 20
+    assert kinks(new) == 0
+    x = syn.pink_noise(n, FS, rms_dbfs=-14, seed=4)
+    y_new = multiband.apply(x, FS, p)
+    b = bands.split(bands.to_ms(x), FS, p.crossovers_hz)
+    b[2] *= (10 ** (old / 20))[:, None]
+    y_old = bands.to_lr(b.sum(axis=0))
+    rel = 20 * np.log10(np.sqrt(np.mean((y_new - y_old) ** 2)) / np.sqrt(np.mean(y_old ** 2)))
+    print(f"ms_link output difference re the signal: {rel:.1f} dB")
+    assert rel < -70.0
+    # the info path takes the same gain, and constant / ceiling envelopes broadcast
+    _, info = multiband.apply_with_info(x, FS, p)
+    assert info["total_gr_min_db"][2, 0] == pytest.approx(new.min(), abs=1e-6)
+    gr2 = _flat()
+    gr2[1] = [Envelope(gm), Envelope.constant(-1.0)]
+    ceil = [[Envelope.constant(0.0)] * 2 for _ in range(NB)]
+    ceil[1] = [Envelope.constant(0.0), Envelope(np.minimum(gs + 2.0, 0.0))]
+    p2 = MultibandPlan(gr2, ms_link=True, side_makeup_db=0.0, ceiling_gr_db=ceil,
+                       ceiling_makeup_db=[[0.0, 0.0]] * NB)
+    lk = multiband.linked_reduction_db(p2, 1, n, FS)
+    assert np.all(lk <= -1.0 + 1e-9) and np.all(np.isfinite(lk))
+
+
 def test_fixture_resplit_is_not_zero_in_other_bands():
     """Audit 06 M14: the band-2 train re-splits into the adjacent bands (documented)."""
     x, _ = band_impulse_train(FS, 2, peak_dbfs=-6.0)

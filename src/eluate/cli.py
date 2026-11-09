@@ -260,7 +260,8 @@ def _controls(args) -> planner.Controls:
                             streaming=args.streaming, character=args.character,
                             bpm=getattr(args, "bpm", None), makeup=args.makeup,
                             glue_mode=args.glue_mode, kick_detective=args.kick_detective,
-                            speclim=args.speclim, profile=args.profile, threads=args.threads)
+                            speclim=args.speclim, profile=args.profile, threads=args.threads,
+                            xover_phase=args.xover_phase)
 
 
 def do_plan(work: Path, controls: planner.Controls, x=None, log=print):
@@ -483,6 +484,9 @@ def _add_controls(p):
                         f"{planner.DEFAULT_TARGET_RMS_DBFS:g})")
     p.add_argument("--preserve", action="store_true")
     p.add_argument("--xover", type=_xover, default=None)
+    p.add_argument("--xover-phase", default="minimum", choices=planner.XOVER_PHASES,
+                   help="the lowest crossover of the multiband and the frequency-dependent "
+                        "limiter: minimum (Linkwitz-Riley, no pre-ring; default) or zero phase")
     p.add_argument("--subside", type=float, default=None)
     p.add_argument("--crest-mode", default="report", choices=planner.CREST_MODES)
     p.add_argument("--profile", default="electronic", choices=planner.USER_PROFILES,

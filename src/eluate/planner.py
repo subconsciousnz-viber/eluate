@@ -448,6 +448,14 @@ AUTO_DEFAULT = "moderate"        # auto without a tempo
 KICK_DETECTIVE_AUTO = ("slow", "transparent")   # presets on which auto turns it on
 LOW_BAND_RELEASE_MIN_MS = 25.0   # one 40 Hz cycle: the lowest band never releases faster
 LIMITER_RELEASE_MIN_MS = 80.0    # D7: faster limiter releases ripple on sustained sub
+# 2026-11-10 (audio-rate audit): the final limiter holds its gain one 40 Hz period past
+# each peak (LimiterPlan.hold_ms); 12.5 ms left 0.1 dB of sub-cycle ripple at 30 Hz, 25
+# removes it (THD -35 -> -78 dB at 3 dB of GR). The band ceilings release per band
+# (sub 100 ms, low 80, the rest 50; speclim keeps SPECLIM_RELEASE_MS), and every band
+# detector reads the peak over one period of its lower edge (multiband.detector_window_ms).
+LIMITER_HOLD_MS = 25.0
+CEILING_RELEASE_MS = (100.0, 80.0, 50.0, 50.0, 50.0)   # band ceilings, low to high
+XOVER_PHASES = ("minimum", "zero")   # Controls.xover_phase: the lowest crossover (xover_phases)
 
 # Input normalisation (docs/gain-staging.md 2 item 1, 9): the corpus median of the
 # premasters' loudest-section 1 s RMS with their peak at -3 dBFS (44 premasters,
@@ -580,6 +588,7 @@ class Controls:
     speclim: bool = True                     # frequency-dependent limiting before the clipper
     profile: str = "electronic"              # PROFILES
     threads: int = parallel.DEFAULT_THREADS  # engine threads (eluate.parallel); no effect on the result
+    xover_phase: str = "minimum"             # the lowest crossover: minimum (LR4) | zero (XOVER_PHASES)
 
     def __post_init__(self):
         self.threads = int(self.threads)
@@ -587,6 +596,8 @@ class Controls:
             raise ValueError("threads must be at least 1")
         if self.profile not in PROFILES:
             raise ValueError(f"profile must be one of {PROFILE_NAMES}")
+        if self.xover_phase not in XOVER_PHASES:
+            raise ValueError(f"xover_phase must be one of {XOVER_PHASES}")
         if self.character not in CHARACTERS:
             raise ValueError(f"character must be one of {CHARACTERS}")
         if self.bpm is not None:
@@ -1791,6 +1802,10 @@ def character_settings(analysis: dict, controls: Controls, nb: int | None = None
             "glue_attack_ms": glue_att, "glue_release_ms": pr["glue_release_ms"],
             "clip_knee_db": pr["clip_knee_db"], "limiter_attack_ms": lim_t["limiter_attack_ms"],
             "limiter_release_ms": max(lim_t["limiter_release_ms"], LIMITER_RELEASE_MIN_MS),
+            "limiter_hold_ms": LIMITER_HOLD_MS,
+            "ceiling_release_ms": _per_band(CEILING_RELEASE_MS, nb),
+            "glue_attack_floor_ms": glue_stage.ATTACK_FLOOR_MS,
+            "glue_attack_applied_ms": max(float(glue_att), glue_stage.ATTACK_FLOOR_MS),
             "kick_detective": kd and clip, "kick_detective_reason": kd_why,
             "clipper": ("off" if not clip else
                         "kick detective (less aggressive)" if kd else "whole signal"),
@@ -1820,6 +1835,9 @@ def plan_multiband_record(analysis: dict, controls: Controls) -> dict:
             "attack_ms": [[a, a] for a in ch["mb_attack_ms"]],
             "release_ms": [[r, r] for r in ch["mb_release_ms"]],
             "knee_db": ch["mb_knee_db"], "ceiling_lookahead_ms": ch["band_lookahead_ms"],
+            "ceiling_release_ms": [[r, r] for r in ch["ceiling_release_ms"]],
+            "detector_window_ms": mb_stage.default_detector_window_ms(xo),
+            "phase": xover_phases(controls.xover_phase, xo),
             "ceiling_db": None, "crossovers_hz": xo,
             "decoherence": dec, "mid_makeup_db": [0.0] * nb,
             "side_makeup_db": controls.prof["side_makeup_db"],
@@ -1827,10 +1845,27 @@ def plan_multiband_record(analysis: dict, controls: Controls) -> dict:
             "ms_link": controls.prof["ms_link"], "character": ch["preset"]}
 
 
+def xover_phases(mode: str, crossovers_hz) -> str | list[str]:
+    """The crossovers' phase modes (bands.split) for a plan: "minimum" makes the lowest
+    crossover Linkwitz-Riley and the rest zero phase (2026-11-10, filter-maths audit F1: the
+    zero-phase lowest crossover pre-rang a kick by -15 dB 6 to 10 ms ahead once the sub band
+    was gained -6 dB; spec 3.1 named minimum "the expected winner"); "zero" keeps every
+    crossover zero phase (the plans made before). The band sum is then the lowest
+    crossover's allpass: flat magnitude, no broadband lag, the sub band's group delay
+    that of an LR4 at the crossover (bands.py)."""
+    if mode not in XOVER_PHASES:
+        raise ValueError(f"xover_phase must be one of {XOVER_PHASES}")
+    n = len(crossovers_hz)
+    if mode == "zero" or n == 0:
+        return "zero"
+    return ["minimum"] + ["zero"] * (n - 1)
+
+
 def multiband_unrealised(rec: dict) -> MultibandPlan:
     nb = len(rec["crossovers_hz"]) + 1
     zero = [[Envelope.constant(0.0), Envelope.constant(0.0)] for _ in range(nb)]
     return MultibandPlan(gr_db=zero, crossovers_hz=list(rec["crossovers_hz"]),
+                         phase=rec.get("phase", MultibandPlan.phase),
                          mid_makeup_db=list(rec["mid_makeup_db"]),
                          side_makeup_db=rec["side_makeup_db"], decoherence=list(rec["decoherence"]),
                          ceiling_gr_db=None, ceiling_db=rec["ceiling_db"],
@@ -1839,6 +1874,9 @@ def multiband_unrealised(rec: dict) -> MultibandPlan:
                          knee_db=rec.get("knee_db", 0.0),
                          ceiling_lookahead_ms=rec.get("ceiling_lookahead_ms",
                                                       MultibandPlan.ceiling_lookahead_ms),
+                         ceiling_release_ms=rec.get("ceiling_release_ms",
+                                                    MultibandPlan.ceiling_release_ms),
+                         detector_window_ms=rec.get("detector_window_ms"),
                          budget=None if rec.get("budget") is None else dict(rec["budget"]),
                          ms_link=bool(rec.get("ms_link", False)))
 
@@ -1908,8 +1946,12 @@ def design_speclim(plan: Plan, y: np.ndarray, fs: float):
     look = SPECLIM_LOOKAHEAD_MS if lp.speclim_lookahead_ms is None else lp.speclim_lookahead_ms
     if np.ndim(look):
         look = _per_band(look, nb)
+    # the multiband's crossovers' phase (one split for both stages) and the per-band
+    # detector windows (2026-11-10); a plan without a multiband gets the zero-phase split
+    phase = plan.multiband.phase if plan.multiband is not None else "zero"
     return mb_stage.design_speclim(y, fs, xo, allow, cut, look, rel,
-                                   hits=stage_hits(plan, y, fs))
+                                   hits=stage_hits(plan, y, fs), phase=phase,
+                                   detector_window_ms=mb_stage.default_detector_window_ms(xo))
 
 
 def stage_hits(plan: Plan, y: np.ndarray, fs: float) -> dict | None:
@@ -2244,7 +2286,8 @@ def plan_from_analysis(analysis: dict, controls: Controls, x: np.ndarray | None 
                       max_outlier_gr_db=prof["limiter_outlier_cap_db"],
                       speclim_allow_db=prof["speclim_allow_db"] if controls.speclim else None,
                       speclim_max_cut_db=prof["speclim_max_cut_db"],
-                      speclim_lookahead_ms=ch["speclim_lookahead_ms"], **clip)
+                      speclim_lookahead_ms=ch["speclim_lookahead_ms"],
+                      hold_ms=ch["limiter_hold_ms"], **clip)
     plan = Plan(fs=fs, preserve_mix=controls.preserve_mix,
                 input=None if inp is None else InputPlan(**inp), inputeq=inputeq, notch=notch,
                 sidestrip=side, multiband=mb, tone=None, saturate=sat,

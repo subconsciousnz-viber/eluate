@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 from scipy import signal
-from scipy.ndimage import maximum_filter1d
+from scipy.ndimage import maximum_filter1d, minimum_filter1d
 
 from fixtures import synthetic as syn
 from eluate import envelope as env
@@ -93,6 +93,106 @@ def test_box_attack_extent_parity(attack):
     assert p - red.min() == 2 * (attack // 2) <= attack
     assert red.max() - p == 2 * (attack // 2)
     assert g[p] == pytest.approx(0.5)
+
+
+# ------------------------------------------------ hold (2026-11-10, audio-rate audit F2)
+
+def _box_smooth_2026_11_09(g_req, attack, release):
+    """box_smooth as it was before the hold: the centred minimum window and the two boxes."""
+    u = env._ceiling(g_req, env.G_MIN)
+    h = env.release_hull(u, release)
+    L = max(1, int(attack) // 2 + 1)
+    if L == 1:
+        return np.clip(h, env.G_MIN, u)
+    m = minimum_filter1d(h, size=2 * L - 1, mode="nearest")
+    return np.clip(env._box(env._box(m, -(L - 1), 0), 0, L - 1), env.G_MIN, u)
+
+
+@pytest.mark.parametrize("attack,release", [(1, 0), (2, 0), (5, 30), (64, 400), (301, 2000),
+                                            (1000, 50)])
+def test_box_hold_zero_is_bit_identical_to_the_original(attack, release):
+    g_req = _dense_greq(n=100000, seed=6)
+    old = _box_smooth_2026_11_09(g_req, attack, release)
+    assert np.array_equal(env.box_smooth(g_req, attack, release), old)
+    assert np.array_equal(env.box_smooth(g_req, attack, release, hold=0), old)
+
+
+def test_running_min_matches_brute_force():
+    rng = np.random.default_rng(0)
+    h = rng.random(300)
+    for left, right in ((0, 0), (2, 2), (5, 2), (2, 5), (30, 1), (0, 7), (7, 0), (4, 3)):
+        ref = np.array([h[max(0, i - left):i + right + 1].min() for i in range(h.size)])
+        assert np.array_equal(env.running_min(h, left, right), ref), (left, right)
+
+
+@pytest.mark.parametrize("hold", [0, 1, 7, 100, 9600])
+@pytest.mark.parametrize("attack,release", [(2, 0), (5, 30), (64, 400), (301, 2000)])
+def test_box_hold_keeps_the_bound(attack, release, hold):
+    """g <= clip(g_req, g_min, 1) everywhere for every hold (kernel-support argument of the
+    module contract); the raw smoother is within cumulative-sum rounding of it."""
+    g_req = 1.2 * _dense_greq(n=100000, seed=7)      # values above 1 as well
+    g_req[:10] = 0.2
+    g_req[-10:] = 0.3
+    g = env.box_smooth(g_req, attack, release, hold=hold)
+    u = np.minimum(g_req, 1.0)
+    assert np.all(g <= u) and np.all(g >= env.G_MIN)
+    raw, uu = env._box_smooth_raw(g_req, attack, release, hold=hold)
+    assert np.max(raw - uu) < 1e-9
+
+
+@pytest.mark.parametrize("hold", [0, 1, 50, 777])
+@pytest.mark.parametrize("attack", [2, 3, 199, 200, 201])
+def test_box_hold_delays_the_recovery_only(attack, hold):
+    """An isolated dip: reduction starts exactly 2 * (attack // 2) samples before it (never
+    earlier than without the hold) and ends exactly `hold` samples later than without."""
+    n, p = 60000, 20000
+    g_req = np.ones(n)
+    g_req[p] = 0.5
+    g0 = env.box_smooth(g_req, attack=attack)
+    g = env.box_smooth(g_req, attack=attack, hold=hold)
+    red0, red = np.flatnonzero(g0 < 1.0), np.flatnonzero(g < 1.0)
+    assert red.min() == red0.min() == p - 2 * (attack // 2)
+    assert red.max() == red0.max() + hold == p + 2 * (attack // 2) + hold
+    assert g[p] == pytest.approx(0.5)
+    # with a release hull the start is still the same and the end is later by at least the hold
+    h0 = env.box_smooth(g_req, attack=attack, release=300)
+    h = env.box_smooth(g_req, attack=attack, release=300, hold=hold)
+    r0, r = np.flatnonzero(h0 < 1.0), np.flatnonzero(h < 1.0)
+    assert r.min() == r0.min() and r.max() >= r0.max() + hold - 1
+
+
+def test_box_hold_holds_the_minimum_on_a_sustained_ripple():
+    """The limiter's case: a required gain that recovers between peaks 12 samples apart
+    (one 40 Hz half cycle at 1 kHz) is held flat by a 25-sample hold."""
+    n = 5000
+    k = np.arange(n)
+    g_req = np.where(k % 12 == 0, 0.7, 1.0)
+    g_req[:100] = 1.0
+    g_req[-100:] = 1.0
+    flat = env.box_smooth(g_req, attack=4, release=80.0, hold=25)[300:-300]
+    rip = env.box_smooth(g_req, attack=4, release=80.0)[300:-300]
+    assert np.max(flat) - np.min(flat) < 1e-12
+    assert np.max(rip) - np.min(rip) > 0.02
+    assert np.allclose(flat, 0.7)
+
+
+def test_box_hold_rejects_negative():
+    with pytest.raises(ValueError):
+        env.box_smooth(np.ones(100), attack=4, hold=-1)
+
+
+def test_qp_hold_keeps_the_bound_and_extends_the_dip():
+    n, p = 6000, 3000
+    g_req = np.ones(n)
+    g_req[p] = 0.4
+    g0, i0 = env.qp_smooth(g_req, attack=100)
+    g, i = env.qp_smooth(g_req, attack=100, hold=300)
+    assert i0["converged"] and i["converged"]
+    assert np.all(g <= np.minimum(g_req, 1.0))
+    r0, r = np.flatnonzero(g0 < 1.0), np.flatnonzero(g < 1.0)
+    assert r.min() >= r0.min()                      # never earlier
+    assert r.max() >= r0.max() + 250                 # held about the hold longer
+    assert np.array_equal(env.qp_smooth(g_req, attack=100, hold=0)[0], g0)
 
 
 @pytest.mark.parametrize("variant", ["box", "qp"])

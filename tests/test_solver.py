@@ -30,14 +30,16 @@ def _hot(fs, seconds=3.0):
 
 
 @pytest.mark.parametrize("fs", [44100, 48000])
-@pytest.mark.parametrize("kind", ["plain", "clip", "clip_slow"])
+@pytest.mark.parametrize("kind", ["plain", "clip", "clip_slow", "hold"])
 def test_blocked_limiter_matches_whole_track(fs, kind):
     x, on = _hot(fs)
     plan = {"plain": LimiterPlan(ceiling_dbtp=-1.0, input_gain_db=6.0),
             "clip": LimiterPlan(ceiling_dbtp=-1.0, input_gain_db=8.0, clip_depth_db=2.5,
                                 clip_onsets_s=on),
             "clip_slow": LimiterPlan(ceiling_dbtp=-1.0, input_gain_db=3.0, clip_depth_db=3.0,
-                                     clip_onsets_s=on, release_ms=200.0)}[kind]
+                                     clip_onsets_s=on, release_ms=200.0),
+            "hold": LimiterPlan(ceiling_dbtp=-1.0, input_gain_db=8.0, clip_depth_db=2.5,
+                                clip_onsets_s=on, hold_ms=25.0)}[kind]
     y0, i0 = lim.apply_with_info(x, fs, plan)
     for blk in (4096, 20000, 1 << 17):
         y1, i1 = solver.limit_blocked(x, fs, plan, block=blk)
@@ -45,6 +47,7 @@ def test_blocked_limiter_matches_whole_track(fs, kind):
         for k in ("max_gain_reduction_db", "clip_max_reduction_db", "clip_spans", "trim_db"):
             assert i1[k] == pytest.approx(i0[k], abs=1e-9), k
         assert len(i1["relimit_passes"]) == len(i0["relimit_passes"])
+        assert i1["relimit"] == i0["relimit"]
         assert max(i1["true_peak_8x_dbtp"], i1["true_peak_32x_dbtp"]) <= plan.ceiling_dbtp + 1e-9
 
 
