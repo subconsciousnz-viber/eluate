@@ -47,7 +47,7 @@ from scipy import signal
 from scipy.interpolate import PchipInterpolator
 from scipy.optimize import brentq, minimize_scalar
 
-from eluate import bands
+from eluate import bands, iir
 from eluate.plan import (CONTROL_RATE_HZ, NOTCH_MAX_CUT_DB, Envelope, Notch, NotchPlan,
                             control_coord, control_length)
 
@@ -104,8 +104,7 @@ def bandpass_zp(x: np.ndarray, sos: np.ndarray, fs: float) -> np.ndarray:
     a2 = float(sos[0, 5])
     alpha = (1.0 - a2) / (1.0 + a2)
     pl = bands.padlen(None, fs, fs * math.atanh(alpha) / (2.0 * math.pi))
-    xp = np.pad(x, ((pl, pl), (0, 0)))
-    return signal.sosfiltfilt(sos, xp, axis=0, padtype=None)[pl:pl + x.shape[0]]
+    return iir.sosfiltfilt_zero(sos, x, pl)      # blocked, subnormal flush (iir.py)
 
 
 def kick_mask(onsets_s, duration_s: float, half_ms: float = 20.0, ramp_ms: float = 5.0,

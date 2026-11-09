@@ -44,7 +44,11 @@ Contract:
   only zero-phase crossovers it holds just the current band and the residual.
   `split` fills a preallocated output from it in that case. Zero-phase
   filtering runs one column at a time (sosfilt treats columns independently,
-  so the result is unchanged) to hold one padded column, not all.
+  so the result is unchanged) to hold one padded column, not all. The edge "zero"
+  pass is iir.sosfiltfilt_zero (2026-11-10, filter-maths audit F5): blocked, with
+  filter state below 1e-150 flushed to 0 and silent blocks skipped, so digital
+  silence no longer runs the tails in the subnormal range (10x slower); identical to
+  scipy's sosfiltfilt bit for bit unless a flush happens, within 1e-12 when it does.
 - `to_ms` / `to_lr`: M = (L + R) / sqrt(2), S = (L - R) / sqrt(2), and the
   inverse with the same factor. Orthonormal: energy-preserving and exactly
   self-inverse up to rounding.
@@ -58,6 +62,8 @@ from collections.abc import Sequence
 
 import numpy as np
 from scipy import signal
+
+from eluate import iir
 
 # x4 spacing (docs/gain-staging.md 4); planner.key_crossovers moves the lowest with the key
 DEFAULT_CROSSOVERS: tuple[float, ...] = (100.0, 400.0, 1600.0, 6400.0)
@@ -142,12 +148,12 @@ def _zero_low(r: np.ndarray, lp: np.ndarray, pl: int, edge: str) -> np.ndarray:
     """Zero-phase low part of r, one column at a time (sosfilt treats columns
     independently, so this is bit-identical to filtering (n, ch) at once and
     holds one padded column instead of all of them)."""
-    n = r.shape[0]
     lo = np.empty_like(r)
     for c in range(r.shape[1]):
         if edge == "zero":
-            rp = np.pad(r[:, c], (pl, pl))
-            lo[:, c] = signal.sosfiltfilt(lp, rp, padtype=None)[pl:pl + n]
+            # blocked with the subnormal flush (iir.py): scipy's sosfiltfilt of the
+            # zero-padded column bit for bit unless digital silence lets the tail flush
+            lo[:, c] = iir.sosfiltfilt_zero(lp, r[:, c], pl)
         else:
             lo[:, c] = signal.sosfiltfilt(lp, r[:, c], padtype="odd", padlen=pl)
     return lo
