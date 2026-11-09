@@ -47,6 +47,35 @@ def short_planner_analysis(fs: int = 44100, bars_per_section: int = 2, level_db:
     return x, planner.analyse(x, fs)
 
 
+def features_with_key_confidence(monkeypatch, conf: float = 0.9) -> None:
+    """features.analyse as the features branch has it (audit features F2, 2026-11-10):
+    the key's confidence goes to a fcs_from_key taking `key_confidence` and to
+    plan_inputs["key_confidence"], so planner.analyse's key gate can pass. That branch
+    has landed (features.analyse passes pitch.key's own confidence); this pins the value
+    so a test does not depend on what pitch.key reads from a synthetic track."""
+    from eluate import features
+    real = features.analyse
+
+    def analyse(x, fs, *a, fcs_from_key=None, **kw):
+        fn = None if fcs_from_key is None else (
+            lambda tonic: fcs_from_key(tonic, key_confidence=conf))
+        out = real(x, fs, *a, fcs_from_key=fn, **kw)
+        out["plan_inputs"]["key_confidence"] = conf
+        out["meta"]["key_confidence"] = conf
+        return out
+    monkeypatch.setattr(features, "analyse", analyse)
+
+
+@lru_cache(maxsize=2)
+def keyed_planner_analysis(fs: int = 44100, bars_per_section: int = 2):
+    """short_planner_analysis with a confident key (features_with_key_confidence): the
+    key-locked crossovers."""
+    import pytest
+    with pytest.MonkeyPatch.context() as mp:
+        features_with_key_confidence(mp)
+        return short_planner_analysis.__wrapped__(fs, bars_per_section)
+
+
 def dense_track(fs: int = 44100, seconds: float = 8.0, seed: int = 5):
     """A dense, low-crest stereo track (a harmonic stack on 55 Hz plus pink noise, through
     a tanh), sample peak -6 dBFS: material whose budgets reach the -7.7 dBFS RMS target."""

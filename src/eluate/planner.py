@@ -21,8 +21,16 @@ Contract:
   the base's ratios to its lowest (x4, x16, x64 for the default). An unknown
   or unparsable tonic gives the base. For E, F, F# and G the clip binds (p / 2^(1/3)
   is 65 to 78 Hz), so the crossover sits at 80 Hz, less than a third of an
-  octave below p. `crossover_choice` is the record (crossovers, rule, tonic,
-  p) in plan_record["crossovers"].
+  octave below p. The lock is gated on the key's confidence (`key_gate`;
+  KEY_CONFIDENCE_MIN = 0.5, features audit 2026-11-10 F2: pink noise read Cm and
+  locked the crossovers to it): the confidence is the features' key_confidence (a
+  float in [0, 1]), which features.analyse passes to a `fcs_from_key` taking a
+  `key_confidence` keyword before the first band split and records in
+  plan_inputs["key_confidence"] (`analysis_key_confidence`). Below the gate, or
+  unknown (an analysis without the field), bands.DEFAULT_CROSSOVERS are used and
+  meta["crossover_gate"] records the decision.
+  `crossover_choice` is the record (crossovers, rule, tonic, p, key_gate, reason)
+  in plan_record["crossovers"].
 - `plan_from_analysis(analysis, controls, x=None) -> Plan`. `analysis` is the
   full dict returned by `analyse` or `features.analyse` (its `plan_inputs`,
   plus `meta` for fs / length / crossovers / input gain and `crest` for
@@ -43,9 +51,20 @@ Contract:
   with the RMS target (chunk 4); the timing comes from the character preset
   (character_settings, the per-band lookahead of the band ceilings and of the
   frequency-dependent limiter included; auto by tempo, `character_choice`: a detected tempo, already
-  octave-checked by the analysis, never resolves to slow). `realise` solves them in
+  octave-checked by the analysis, never resolves to slow, and a tempo within AUTO_BPM_TOL
+  (1 %) of a boundary reads moderate; the tempo is `plan_tempo`'s: the user's, given now
+  or at `eluate analyse --bpm`, else the detected one). `realise` solves them in
   chain order on each stage's real input (multiband.design_budget, design_glue, design_limiter);
-  `budget_report` collects per-stage peak GR against budget and the warnings.
+  `budget_report` collects per-stage peak GR against budget and the warnings (a
+  multiband row whose threshold search stopped at its floor short of the target reads
+  status "target unreachable", S2-3; the clipper row's planned_track_db and rendered_db
+  are both the full signal's track-peak fall, like with like when clip_split_hz is set,
+  S2-4: the solve records the full signal's 8x input peak next to the part above the
+  split; the limiter row carries the base-rate re-limit's passes, largest reduction and
+  share of samples touched, `relimit_summary`, S4-6; no loud hit adds a "hits" warning). plan_record also carries "tempo"
+  (`tempo_record`: the tempo used, its source and, for a user tempo, the detected one
+  with a "disagreement" warning past TEMPO_DISAGREE_PCT) and "sidestrip"
+  (`sidestrip_choice`: the request, the rule and the clip to SUBSIDE_RANGE_HZ).
   Average-peak reading (maintainer, 2026-10-19): Plan.hits (`plan_hits`: the analysis
   beat grid, which follows the user's --bpm, when it is informative or the user gave a
   tempo, one hit per beat at the plan's octave-checked tempo; else 400 ms frames) gives
@@ -83,23 +102,24 @@ Contract:
   (1 resonance, 0.5 from 80 to 150 Hz, 0.25 musical). On the real premasters
   the median excess of a detection is 8 to 17 dB, so half the raw excess
   would pin nearly every notch at the -6 dB cap. excess(t) lives on the 100 ms analysis grid; it is linearly
-  interpolated to 1 ms, smoothed by a triangular kernel of 2 x
-  NOTCH_SMOOTH_MS, then quantised to NOTCH_QUANT_DB steps (each step is a
-  1 ms PCHIP ramp of 0.5 dB). The quantisation, and kick onsets snapped to
-  the 1 ms grid with the hold widened to KICK_HALF_MS, keep the number of
-  distinct control rows the notch stage's composite clamp evaluates small: with
-  smooth unquantised envelopes every 1 ms row is distinct and a 10 s excerpt
-  with 8 notches did not finish in 2 minutes. Q: the measured Q is used only
+  interpolated to 1 ms and smoothed by a triangular kernel of 2 x
+  NOTCH_SMOOTH_MS; it is not quantised (2026-11-10: 0.5 dB steps at 1 ms raised
+  the notch's modulation sidebands from -64 to -47 dB; the notch stage's
+  composite clamp now rounds its own bound rows, so a smooth envelope costs it
+  nothing). Kick onsets are snapped to the 1 ms grid with the hold widened to
+  KICK_HALF_MS. Q: the measured Q is used only
   when the analyser's own fit test holds (`q_fit_ok`: finite, uncertainty below
   half the Q, features/resonance.py), else NOTCH_Q_DEFAULT; then clipped to
   [NOTCH_Q_LO, NOTCH_Q_HI] (the analysis reads Q high, workstream C hand-over).
-  Channel awareness: the plan's Notch has no channel field and the notch stage
-  cuts L and R identically, i.e. M and S together. A channel "both" or "M"
-  notch is rendered (an M-only notch also cuts S at f0: S carries less energy
-  there by construction of the attribution); a channel "S" notch is not
-  rendered (cutting M where only S rings is the error audit 04 A4 was about)
-  and is listed in `notch_report` with rendered False. This policy is
-  `notch_rendered()`, the one place to change when Notch gains a channel.
+  Channel (features audit 2026-11-10 F7): plan.Notch carries a channel. An
+  analysis notch on "both" or "M" is rendered on L and R alike (channel "both";
+  an M-only notch also cuts S at f0: S carries less energy there by construction
+  of the attribution); an "S" notch is rendered on the side channel alone
+  (channel "S", stages/notch.py applies it in M/S), so cutting M where only S
+  rings (audit 04 A4) does not happen either way. `notch_rendered()` /
+  `notch_channel()` hold the mapping. Notches merge within a channel; an S notch
+  whose half-cut band overlaps a rendered stereo notch's is left out with its
+  reason (the stereo notch already cuts S there, and the two clamps are separate).
   Defensive rules (NOTCH_SUSPECT_*, NOTCH_MUSICAL_GUARD_CENTS, NOTCH_MAX,
   KICK_MIN_RATE_HZ, in one block of constants, to relax when the analysis is
   fixed): a candidate whose peak excess exceeds 20 dB or whose spans cover
@@ -146,7 +166,10 @@ Contract:
 - Input EQ (docs/gain-staging.md section 2 item 2 and section 10, chunk 2):
   the stages/inputeq.py sections fitted to the same whole-track target. Fit
   nodes: the stereo LTAS 1/3-octave centres from 30 Hz to 18 kHz (nodes more
-  than EQ_GATE_DB below the loudest are left out). Deficit D = the tone
+  than EQ_GATE_DB below the loudest are left out); the fit's inputs are rounded to
+  EQ_INPUT_QUANT_DB / EQ_INPUT_QUANT_SLOPE first (`inputeq_design`), so two float32
+  files of one premaster at different levels get the identical EQ (S4-5; see
+  docs/gain-staging.md 11 for what is and is not level-invariant). Deficit D = the tone
   deficit (`deficit_curve`: rotation onto the target slope about 1 kHz plus
   the solver's rotation, sub held and pulled into +-SUB_SHELF_MAX_DB) minus,
   from 100 Hz up, the node's residual from the measured OLS line (so the
@@ -297,6 +320,13 @@ SUB_CENTRE_HZ = 50.0            # representative sub frequency (30 to 90 Hz shel
 
 EQ_FIT_RANGE_HZ = (30.0, 18000.0)   # 1/3-octave LTAS nodes the input EQ is fitted on
 EQ_GATE_DB = 60.0                   # nodes this far below the loudest are left out
+# the fit's inputs (LTAS nodes, residuals, sub shelf, noise floor; the slope; the top
+# band's decoherence) are rounded
+# to these before the fit (inputeq_design), so independent float32 roundings of one
+# premaster (about 1e-6 dB apart) give the identical EQ (S4-5)
+EQ_INPUT_QUANT_DB = 0.01
+EQ_INPUT_QUANT_SLOPE = 0.001        # dB/oct
+EQ_INPUT_QUANT_DECOHERENCE = 0.001  # the top band's decoherence (the M/S top-end switch)
 EQ_HPF_Q_BUTTERWORTH = 0.707
 EQ_HPF_Q_SPAN_DB = 6.0              # sub excess (deficit) beyond SUB_SHELF_MAX_DB at which
                                     # Q hits 0.5 (1.0)
@@ -350,7 +380,6 @@ LIMITER_REQUEST_OVER_DB = 6.0
 
 NOTCH_FRACTION = 0.5
 NOTCH_SMOOTH_MS = 200.0
-NOTCH_QUANT_DB = 0.5
 KICK_HALF_MS = 20.5            # onsets snapped to the 1 ms grid: +-0.5 ms of hold restored
 NOTCH_Q_DEFAULT = 8.0
 NOTCH_Q_LO = 2.0
@@ -449,7 +478,12 @@ CHARACTER_PRESETS = {
                    "band_lookahead_ms": (6.0, 4.0, 2.0, 2.0, 2.0)},
 }
 AUTO_BPM_SLOW, AUTO_BPM_FAST = 70.0, 140.0
+AUTO_BPM_TOL = 0.01              # a tempo within 1 % of a boundary reads moderate (character_choice)
 AUTO_DEFAULT = "moderate"        # auto without a tempo
+# a user tempo that disagrees with the detected grid by more than this is reported
+# (tempo_record: plan_record["tempo"], a "tempo" warning, the process log); the grid used
+# is the user's whatever the disagreement (spec 3.2a)
+TEMPO_DISAGREE_PCT = 3.0
 KICK_DETECTIVE_AUTO = ("slow", "transparent")   # presets on which auto turns it on
 LOW_BAND_RELEASE_MIN_MS = 25.0   # one 40 Hz cycle: the lowest band never releases faster
 LIMITER_RELEASE_MIN_MS = 80.0    # D7: faster limiter releases ripple on sustained sub
@@ -463,6 +497,12 @@ R_REF_DBFS = -18.0
 KEY_PARTIAL_MIN_HZ = 80.0        # the tonic partial is the lowest one at or above this
 KEY_MARGIN_OCT = 1.0 / 3.0       # crossover this far below it (maintainer, 2026-10-18)
 KEY_XOVER_RANGE_HZ = (80.0, 160.0)
+# the key lock's confidence gate (features audit 2026-11-10 F2; `key_gate`): below this
+# the crossovers stay at bands.DEFAULT_CROSSOVERS, as they do when the confidence is
+# unknown. The value is the features' key_confidence in [0, 1]; 0.5 is a starting
+# point to calibrate on real material (the audit's raw profile scores: pink noise 0.29,
+# drums alone 0.22, a clear progression above 0.7).
+KEY_CONFIDENCE_MIN = 0.5
 
 CREST_MODES = ("loss", "report", "floor")   # spec 3.6 draft 0.5, maintainer ruling pending
 TP_METERS = ("worst", "8x")
@@ -717,12 +757,13 @@ def _check_floors(floors, crossovers_hz) -> None:
 
 # ---------------------------------------------------------------- input and crossovers
 
-def input_gain(x: np.ndarray, fs: float) -> tuple[float, float]:
+def input_gain(x: np.ndarray, fs: float) -> tuple[float, float | None]:
     """(gain dB, measured loudest-section 1 s RMS dBFS): the gain that brings the
-    premaster's loudest-section 1 s RMS to R_REF_DBFS; 0 dB when it is not finite
-    (input shorter than 1 s, or silent)."""
+    premaster's loudest-section 1 s RMS to R_REF_DBFS; 0 dB and a measured value of None
+    (not NaN, so InputPlan validates; audit 2026-11-10 S3-1) when there is no gated 1 s
+    window (input shorter than 1 s, or silent)."""
     m = float(meter.rms_1s(x, fs)["loud_section_dbfs"])
-    return (R_REF_DBFS - m if math.isfinite(m) else 0.0), m
+    return (R_REF_DBFS - m, m) if math.isfinite(m) else (0.0, None)
 
 
 def tonic_partial_hz(tonic) -> float | None:
@@ -745,8 +786,43 @@ def key_crossovers(tonic, base=bands.DEFAULT_CROSSOVERS) -> tuple[float, ...]:
     return tuple(fc1 * f / base[0] for f in base)
 
 
+def _confidence(v) -> float | None:
+    """A key confidence as a float in [0, 1], None when absent or not finite."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return float(np.clip(f, 0.0, 1.0)) if math.isfinite(f) else None
+
+
+def analysis_key_confidence(analysis: dict) -> float | None:
+    """The analysis's key confidence (module contract, key gate): plan_inputs["key_confidence"]
+    (the features' pitch.key_confidence, in [0, 1]), else meta["key_confidence"]; None
+    when the analysis predates it (unknown: no key lock)."""
+    pi = analysis.get("plan_inputs") or {}
+    v = _confidence(pi.get("key_confidence"))
+    return v if v is not None else _confidence((analysis.get("meta") or {}).get("key_confidence"))
+
+
+def key_gate(tonic, confidence) -> dict:
+    """The key-lock decision: {"tonic", "confidence", "min", "passed", "reason"}; passed
+    when there is a tonic and its confidence is known and at least KEY_CONFIDENCE_MIN."""
+    conf = _confidence(confidence)
+    out = {"tonic": tonic, "confidence": conf, "min": KEY_CONFIDENCE_MIN, "passed": False}
+    if tonic is None:
+        return dict(out, reason="no key found")
+    if conf is None:
+        return dict(out, reason="key confidence unknown")
+    ok = conf >= KEY_CONFIDENCE_MIN
+    return dict(out, passed=ok, reason=(f"key {tonic} confidence {conf:.2f} "
+                                        f"{'>=' if ok else '<'} {KEY_CONFIDENCE_MIN:g}"))
+
+
 def crossover_choice(analysis: dict, controls: Controls) -> dict:
-    """Record of the crossovers the plan uses and why (plan_record["crossovers"])."""
+    """Record of the crossovers the plan uses and why (plan_record["crossovers"]), the
+    key gate's decision included (`key_gate`: meta["crossover_gate"], written by `analyse`;
+    an analysis without it reads the gate from `analysis_key_confidence` for the record
+    only, "applied" False)."""
     meta = analysis["meta"]
     xo = [float(f) for f in meta["crossovers"]]
     rule = meta.get("crossover_rule", "fixed")
@@ -754,9 +830,16 @@ def crossover_choice(analysis: dict, controls: Controls) -> dict:
     rec = {"hz": xo, "rule": rule, "tonic": tonic, "tonic_partial_hz": None,
            "requested": None if controls.crossovers_hz is None else list(controls.crossovers_hz)}
     if rule == "key":
+        gate = meta.get("crossover_gate")
+        if gate is None:
+            gate = dict(key_gate(tonic, analysis_key_confidence(analysis)), applied=False)
+        rec["key_gate"] = gate
         p = tonic_partial_hz(tonic)
         rec["tonic_partial_hz"] = p
-        if p is None:
+        if gate.get("applied", True) and not gate.get("passed"):
+            rec["reason"] = (f"key not locked ({gate.get('reason')}): the default crossovers "
+                             f"{list(bands.DEFAULT_CROSSOVERS)}")
+        elif p is None:
             rec["reason"] = "no key found: the default crossovers"
         else:
             fc = p / 2.0 ** KEY_MARGIN_OCT
@@ -773,38 +856,63 @@ def crossover_choice(analysis: dict, controls: Controls) -> dict:
 
 def analyse(x: np.ndarray, fs: float, crossovers=None, bpm: float | None = None) -> dict:
     """The planner's analysis: input normalisation, then features.analyse with the given
-    or the key-locked crossovers (module contract)."""
+    or the key-locked crossovers (module contract). Without `crossovers` the key lock is
+    gated (`key_gate`, KEY_CONFIDENCE_MIN): a key whose confidence is unknown or below
+    the gate gives bands.DEFAULT_CROSSOVERS, and meta["crossover_gate"] records the
+    decision (applied True). meta["input"]["measured_dbfs"] is None when the premaster has
+    no gated 1 s window (shorter than 1 s, or silent): the plan then validates and the
+    gain is 0 dB; cli.do_master refuses such an input before the analysis."""
     from eluate import features
     g, m = input_gain(x, fs)
     xn = np.asarray(x, dtype=np.float64) * 10.0 ** (g / 20.0)
     kw = {} if bpm is None else {"bpm": float(bpm)}
+    gate: dict = {}
     if crossovers is None:
-        a = features.analyse(xn, fs, fcs_from_key=key_crossovers, **kw)
+        def fcs_from_key(tonic, key_confidence=None):
+            # features.analyse passes key_confidence to a callback that takes it; without
+            # it (an older features) the confidence is unknown and the lock is refused
+            gate.clear()
+            gate.update(key_gate(tonic, key_confidence), applied=True)
+            return key_crossovers(tonic if gate["passed"] else None)
+        a = features.analyse(xn, fs, fcs_from_key=fcs_from_key, **kw)
+        a["meta"]["crossover_gate"] = gate
     else:
         a = features.analyse(xn, fs, fcs=tuple(float(f) for f in crossovers), **kw)
     a["meta"]["input"] = {"gain_db": float(g), "r_ref_dbfs": R_REF_DBFS,
-                          "measured_dbfs": float(m)}
+                          "measured_dbfs": m}
     from eluate import noise
     fl = noise.floor(xn, fs)["db"]
     a["plan_inputs"]["noise_floor_db"] = float(fl) if math.isfinite(fl) else None
     return a
 
 
+def sidestrip_choice(analysis: dict, controls: Controls) -> dict:
+    """The side strip's corner and where it came from (plan_record["sidestrip"]):
+    {"requested_hz" (controls.subside_hz, None when not given), "rule_hz" (the value before
+    the clip), "used_hz" (clipped to SUBSIDE_RANGE_HZ), "clipped", "rule"}. A clipped
+    request is reported, never silently replaced (hygiene F18)."""
+    pi = analysis["plan_inputs"]
+    if controls.subside_hz is not None:
+        fc, rule = float(controls.subside_hz), "--subside"
+    elif controls.prof["sidestrip_hz"] is not None:
+        fc, rule = float(controls.prof["sidestrip_hz"]), f"{controls.profile} profile"
+    elif float(pi["band_decoherence"][0]) < SUBSIDE_DECOHERENCE_MIN:
+        fc, rule = SUBSIDE_DEFAULT_HZ, "default (sub band not decoherent)"
+    else:
+        fc, rule = float(pi["side_strip_hz"]), "analysis suggestion"
+    used = float(np.clip(fc, *SUBSIDE_RANGE_HZ))
+    return {"requested_hz": controls.subside_hz, "rule_hz": fc, "used_hz": used,
+            "clipped": bool(abs(used - fc) > 1e-9), "rule": rule,
+            "range_hz": list(SUBSIDE_RANGE_HZ)}
+
+
 def subside_hz(analysis: dict, controls: Controls) -> float:
     """controls.subside_hz, else the profile's (live: 60 Hz), else the analysis suggestion,
     except SUBSIDE_DEFAULT_HZ when
     the sub band's decoherence is below SUBSIDE_DECOHERENCE_MIN (the suggestion read
-    150 Hz on every real track); clipped to SUBSIDE_RANGE_HZ."""
-    pi = analysis["plan_inputs"]
-    if controls.subside_hz is not None:
-        fc = controls.subside_hz
-    elif controls.prof["sidestrip_hz"] is not None:
-        fc = controls.prof["sidestrip_hz"]
-    elif float(pi["band_decoherence"][0]) < SUBSIDE_DECOHERENCE_MIN:
-        fc = SUBSIDE_DEFAULT_HZ
-    else:
-        fc = float(pi["side_strip_hz"])
-    return float(np.clip(fc, *SUBSIDE_RANGE_HZ))
+    150 Hz on every real track); clipped to SUBSIDE_RANGE_HZ (`sidestrip_choice` records
+    the request and the clip)."""
+    return sidestrip_choice(analysis, controls)["used_hz"]
 
 
 def crest_exempt(crossovers_hz, fc_sub: float) -> list[list[int]]:
@@ -842,8 +950,15 @@ def targets_from(analysis: dict, controls: Controls) -> Targets:
 # ---------------------------------------------------------------- notches
 
 def notch_rendered(channel: str) -> bool:
-    """Channel policy while plan.Notch has no channel (see module contract)."""
-    return channel in ("both", "M")
+    """Every analysis channel is rendered since plan.Notch has a channel (module
+    contract): "both" and "M" on L and R alike, "S" on the side alone."""
+    return channel in ("both", "M", "S")
+
+
+def notch_channel(channel: str) -> str:
+    """The plan.Notch channel for an analysis notch's channel: "S" stays side-only, "M" and
+    "both" cut L and R alike ("both")."""
+    return "S" if channel == "S" else "both"
 
 
 def _notch_envelope(excess_db, hop_s: float, depth_scale: float, n: int, fs: float,
@@ -881,8 +996,10 @@ def _notch_envelope(excess_db, hop_s: float, depth_scale: float, n: int, fs: flo
         c = np.convolve(np.convolve(c, k)[:nc], k)[:nc]      # trailing ramps
     else:
         c = np.convolve(np.convolve(c, k, mode="same"), k, mode="same")
-    c = np.clip(np.round(c / NOTCH_QUANT_DB) * NOTCH_QUANT_DB, 0.0, NOTCH_MAX_CUT_DB)
-    return -c
+    # no quantisation (audio-rate audit 2026-11-10): 0.5 dB steps at 1 ms raised the notch's
+    # modulation sidebands from -64 to -47 dB; the composite clamp now rounds its own
+    # bound rows (stages/notch.py composite_scale), so a smooth envelope costs nothing
+    return -np.clip(c, 0.0, NOTCH_MAX_CUT_DB)
 
 
 def _analysis_smooth_s(r: dict, fs: float) -> float:
@@ -971,19 +1088,27 @@ def _guard_frames(analysis: dict, f0: float) -> np.ndarray:
 
 def _merge_groups(items: list[tuple]) -> list[list[tuple]]:
     """Group (notch, ...) items whose half-cut bands overlap, chained in order of the lower
-    edge: the grouping notch.merge_candidates uses."""
-    srt = sorted(items, key=lambda it: notch_stage.band_edges(it[0].f0_hz, it[0].q)[0])
+    edge, within each notch channel: the grouping notch.merge_candidates uses."""
     groups: list[list[tuple]] = []
-    hi_run = -math.inf
-    for it in srt:
-        lo, hi = notch_stage.band_edges(it[0].f0_hz, it[0].q)
-        if groups and lo <= hi_run:
-            groups[-1].append(it)
-            hi_run = max(hi_run, hi)
-        else:
-            groups.append([it])
-            hi_run = hi
+    for ch in sorted({it[0].channel for it in items}):
+        srt = sorted((it for it in items if it[0].channel == ch),
+                     key=lambda it: notch_stage.band_edges(it[0].f0_hz, it[0].q)[0])
+        hi_run = -math.inf
+        first = len(groups)
+        for it in srt:
+            lo, hi = notch_stage.band_edges(it[0].f0_hz, it[0].q)
+            if len(groups) > first and lo <= hi_run:
+                groups[-1].append(it)
+                hi_run = max(hi_run, hi)
+            else:
+                groups.append([it])
+                hi_run = hi
     return groups
+
+
+def _group_edges(grp: list[tuple]) -> tuple[float, float]:
+    e = [notch_stage.band_edges(it[0].f0_hz, it[0].q) for it in grp]
+    return min(a for a, _ in e), max(b for _, b in e)
 
 
 def plan_notches(analysis: dict, kick: bool = True) -> tuple[NotchPlan, list[dict], list[dict]]:
@@ -1024,18 +1149,31 @@ def plan_notches(analysis: dict, kick: bool = True) -> tuple[NotchPlan, list[dic
             row["reason"] = (f"within {NOTCH_MUSICAL_GUARD_CENTS:.0f} cents of the key's tonic "
                              f"or fifth (pitch class {sorted(near)})")
         elif not notch_rendered(r["channel"]):
-            row["reason"] = "S-only resonance; notch stage is not channel-aware"
+            row["reason"] = f"channel {r['channel']!r} is not rendered"
         elif integ <= 0.0 or not f0 < fs / 2:
             row["reason"] = "no cut" + (" (every active bar's chord root is within the guard)"
                                         if gmask.any() else "")
         else:
-            cands.append((Notch(f0, q, Envelope(g)), i, peak))
+            cands.append((Notch(f0, q, Envelope(g), notch_channel(r["channel"])), i, peak))
         if row["reason"].startswith("suspect"):
             log.info("notch candidate %.1f Hz skipped, %s", f0, row["reason"])
         rows.append(row)
     # merge first, then cap (audit 07 A10): a merged notch ranks by its members' peak
     groups = _merge_groups(cands)
-    ranked = sorted(groups, key=lambda grp: (-max(it[2] for it in grp), min(it[1] for it in grp)))
+    # an S-only group inside a stereo group's band would stack its cut on S past the cap
+    # (the two sets are clamped separately): the stereo notch already cuts S there
+    stereo = [_group_edges(grp) for grp in groups if grp[0][0].channel != "S"]
+    kept_groups = []
+    for grp in groups:
+        lo, hi = _group_edges(grp)
+        if grp[0][0].channel == "S" and any(lo <= b and a <= hi for a, b in stereo):
+            for _, i, _ in grp:
+                rows[i]["reason"] = ("side-only resonance inside a stereo notch's band: that "
+                                     "notch already cuts S there")
+            continue
+        kept_groups.append(grp)
+    ranked = sorted(kept_groups,
+                    key=lambda grp: (-max(it[2] for it in grp), min(it[1] for it in grp)))
     keep, merged = ranked[:NOTCH_MAX], []
     for grp in ranked[NOTCH_MAX:]:
         for _, i, _ in grp:
@@ -1049,7 +1187,7 @@ def plan_notches(analysis: dict, kick: bool = True) -> tuple[NotchPlan, list[dic
         for _, i, _ in grp:
             rows[i]["rendered"] = True
             rows[i]["merged_into"] = m_i
-        merged.append({"f0_hz": nt[0].f0_hz, "q": nt[0].q,
+        merged.append({"f0_hz": nt[0].f0_hz, "q": nt[0].q, "channel": nt[0].channel,
                        "members": [it[1] for it in sorted(grp, key=lambda it: it[1])],
                        "peak_excess_unguarded_db": max(it[2] for it in grp),
                        "max_cut_db": float(-nt[0].gain_db.values.min())})
@@ -1139,24 +1277,31 @@ def inputeq_design(analysis: dict, controls: Controls) -> dict:
     from eluate.features import tilt as tilt_feature
     pi = analysis["plan_inputs"]
     c = np.asarray(pi["ltas_centres_hz"], dtype=np.float64)
-    L = np.asarray(pi["ltas_stereo_db"], dtype=np.float64)
+    # the fit inputs are quantised (EQ_INPUT_QUANT_DB, EQ_INPUT_QUANT_SLOPE): two float32
+    # files of one premaster at different levels differ by about 1e-6 dB, enough to move a
+    # corner whose cost is flat by a 10 Hz rounding step (audit 2026-11-10 S4-5); on the
+    # quantised inputs they get the identical EQ unless a value sits within that noise of
+    # a quantisation boundary
+    L = _quant(np.asarray(pi["ltas_stereo_db"], dtype=np.float64), EQ_INPUT_QUANT_DB)
     slope, icpt = tilt_feature.fit_slope(c, L)
     r = L - (icpt + slope * np.log2(c))
     lo, hi = EQ_FIT_RANGE_HZ
     sel = (c >= lo - 1e-9) & (c <= hi + 1e-9) & (L > np.max(L) - EQ_GATE_DB)
-    out = {"nodes_hz": c[sel].tolist(), "residual_db": r[sel].tolist(),
-           "measured_slope": float(pi["tilt_slope_db_oct"]["stereo"]),
+    out = {"nodes_hz": c[sel].tolist(), "residual_db": _quant(r[sel], EQ_INPUT_QUANT_DB).tolist(),
+           "measured_slope": float(_quant(pi["tilt_slope_db_oct"]["stereo"], EQ_INPUT_QUANT_SLOPE)),
            "target_slope": target_slope(analysis, controls),
            "sub_pull": controls.prof["slope"] != "report",
-           "sub_shelf_db": float(pi["sub_shelf_db"]["stereo"]), "rotation": 0.0,
-           "side_residual_db": None}
+           "sub_shelf_db": float(_quant(pi["sub_shelf_db"]["stereo"], EQ_INPUT_QUANT_DB)),
+           "rotation": 0.0, "side_residual_db": None}
     # T4: the quiet-passage floor (None when the analysis predates it or the track has no
     # quiet passage) and the master's predicted gain over the normalised audio
     fl = pi.get("noise_floor_db")
-    out["noise"] = {"floor_db": None if fl is None or not math.isfinite(fl) else float(fl),
+    out["noise"] = {"floor_db": (None if fl is None or not math.isfinite(fl)
+                                 else float(_quant(fl, EQ_INPUT_QUANT_DB))),
                     "gain_db": quiet_gain_db(controls)}
     dec = pi.get("band_decoherence")
-    out["top_decoherence"] = float(dec[-1]) if dec is not None and len(dec) else None
+    out["top_decoherence"] = (float(_quant(dec[-1], EQ_INPUT_QUANT_DECOHERENCE))
+                              if dec is not None and len(dec) else None)
     if controls.prof["eq_bounds"] is not None:
         out["bounds"] = dict(controls.prof["eq_bounds"])
     if controls.prof["eq_hpf"] is not None:
@@ -1171,16 +1316,23 @@ def inputeq_design(analysis: dict, controls: Controls) -> dict:
     # is near silent there.
     S = pi.get("ltas_side_db")
     if S is not None:
-        S = np.asarray(S, dtype=np.float64)
+        S = _quant(np.asarray(S, dtype=np.float64), EQ_INPUT_QUANT_DB)
         al = (c >= EQ_SIDE_ALIGN_HZ[0]) & (c <= EQ_SIDE_ALIGN_HZ[1]) & np.isfinite(S)
         if np.any(al):
             off = float(np.median(S[al] - L[al]))
             if off > -EQ_SIDE_SILENT_DB:
-                rs = S - off - (icpt + slope * np.log2(c))
+                rs = _quant(S - off - (icpt + slope * np.log2(c)), EQ_INPUT_QUANT_DB)
                 ok = np.isfinite(rs) & (S > np.max(S[np.isfinite(S)]) - EQ_GATE_DB)
                 out["side_residual_db"] = [float(v) if o else None
                                            for v, o in zip(rs[sel], ok[sel])]
     return out
+
+
+def _quant(v, step: float):
+    """v rounded to the nearest step (NaN / Inf pass through)."""
+    a = np.asarray(v, dtype=np.float64)
+    out = np.where(np.isfinite(a), np.round(a / step) * step, a)
+    return out + 0.0 if out.ndim else float(out) + 0.0
 
 
 def _eq_from_params(hp_q: float, p: dict, fs: float,
@@ -1326,8 +1478,15 @@ def top_caps(design: dict, nodes, D, fs: float, mid: dict | None = None,
 
 
 def _corner_range(rng, fs: float) -> tuple[float, float]:
+    """A top shelf's corner range at fs: its upper end at most EQ_HS_MAX_FS_SHARE fs. At a
+    low sample rate (0.45 fs at or below the range's bottom, 22.05 kHz for the air shelf)
+    the range would collapse to one point and scipy refuses the bound (S3-2); it then
+    spans the third of an octave below the top instead."""
     top = min(rng[1], EQ_HS_MAX_FS_SHARE * fs)
-    return min(rng[0], top), top
+    lo = min(rng[0], top)
+    if lo >= top:
+        lo = top / 2.0 ** (1.0 / 3.0)
+    return lo, top
 
 
 def _top_fc(v) -> float:
@@ -1562,6 +1721,9 @@ def _fit_side_shelves(design: dict, dc: dict, nodes: np.ndarray, hp_q: float, hp
     cp, ca = caps["presence"]["cap_db"], caps["air"]["cap_db"]
     lo = [-G, math.log2(pr[0]), -G, math.log2(ar[0])]
     hi = [max(cp, -G + 1e-6), math.log2(pr[1]), max(ca, -G + 1e-6), math.log2(ar[1])]
+    for a in range(len(lo)):                      # the mid fit's guard (S3-2): no inverted bound
+        if hi[a] <= lo[a]:
+            hi[a] = lo[a] + 1e-6
     best = None
     for t0 in _top_starts(0.5 * cp, 0.5 * ca, pr, ar):
         t0 = np.clip(t0, np.array(lo) + 1e-9, np.array(hi) - 1e-9)
@@ -1746,14 +1908,22 @@ def character_choice(name: str, bpm: float | None, source: str = "user",
     if bpm is None or not math.isfinite(bpm):
         return AUTO_DEFAULT, "auto, no tempo"
     note = _octave_note(octave) if source == "analysis" else ""
-    if bpm < AUTO_BPM_SLOW:
+    who = "detected" if source == "analysis" else "given"
+    # the boundaries carry a tolerance of AUTO_BPM_TOL (1 %) that resolves to moderate: a
+    # true 140 BPM track read 140.09 and flipped to fast (features audit 2026-11-10 F4)
+    slow_edge, fast_edge = AUTO_BPM_SLOW * (1.0 - AUTO_BPM_TOL), AUTO_BPM_FAST * (1.0 + AUTO_BPM_TOL)
+    if bpm < slow_edge:
         if source == "analysis":
             return "moderate", (f"auto, detected {bpm:g} BPM < {AUTO_BPM_SLOW:g}: moderate, "
                                 f"slow needs a given tempo (--bpm){note}")
-        return "slow", f"auto, {bpm:g} BPM < {AUTO_BPM_SLOW:g}"
-    if bpm > AUTO_BPM_FAST:
-        return "fast", f"auto, {bpm:g} BPM > {AUTO_BPM_FAST:g}{note}"
-    return "moderate", f"auto, {AUTO_BPM_SLOW:g} <= {bpm:g} BPM <= {AUTO_BPM_FAST:g}{note}"
+        return "slow", f"auto, given {bpm:g} BPM < {AUTO_BPM_SLOW:g}"
+    if bpm > fast_edge:
+        return "fast", f"auto, {who} {bpm:g} BPM > {AUTO_BPM_FAST:g}{note}"
+    if bpm < AUTO_BPM_SLOW or bpm > AUTO_BPM_FAST:
+        edge = AUTO_BPM_SLOW if bpm < AUTO_BPM_SLOW else AUTO_BPM_FAST
+        return "moderate", (f"auto, {who} {bpm:g} BPM within {100 * AUTO_BPM_TOL:g} % of the "
+                            f"{edge:g} BPM boundary: moderate{note}")
+    return "moderate", f"auto, {who} {bpm:g} BPM in {AUTO_BPM_SLOW:g} to {AUTO_BPM_FAST:g}{note}"
 
 
 def kick_detective_choice(requested: bool | None, preset: str) -> tuple[bool, str]:
@@ -1766,10 +1936,79 @@ def kick_detective_choice(requested: bool | None, preset: str) -> tuple[bool, st
     return on, f"auto: character {preset}" + (" (slow or transparent)" if on else "")
 
 
+def analysis_user_bpm(pi: dict) -> float | None:
+    """The user's tempo the analysis was made with (`eluate analyse --bpm`: structure
+    records tempo_octave "user" and metrical rule "user"), else None (features audit F21:
+    without this, `eluate plan` read a user tempo as detected and a 65 BPM track
+    resolved to moderate instead of slow)."""
+    mh = pi.get("metrical") or {}
+    if pi.get("tempo_octave") == "user" or mh.get("rule") == "user":
+        t = mh.get("user_bpm", pi.get("tempo_bpm"))
+        if t is not None and math.isfinite(float(t)) and float(t) > 0:
+            return float(t)
+    return None
+
+
+def plan_tempo(analysis: dict, controls: Controls) -> tuple[float | None, str | None]:
+    """(bpm, source) the plan works at: the user's tempo (controls.bpm, else the one the
+    analysis was made with, `analysis_user_bpm`; source "user"), else the analysis's
+    detected, octave-checked tempo ("analysis"), else (None, None)."""
+    pi = analysis.get("plan_inputs") or {}
+    if controls.bpm is not None:
+        return float(controls.bpm), "user"
+    u = analysis_user_bpm(pi)
+    if u is not None:
+        return u, "user"
+    t = pi.get("tempo_bpm")
+    if t is not None and math.isfinite(float(t)) and float(t) > 0:
+        return float(t), "analysis"
+    return None, None
+
+
+def tempo_record(analysis: dict, controls: Controls) -> dict:
+    """plan_record["tempo"]: the tempo the plan uses and its source (`plan_tempo`), the
+    detected tempo and, with a user tempo, how far it was from the detected grid
+    (structure.metrical_hypothesis: detected_bpm, deviation_pct, detected_relation, read
+    when the analysis was made with that tempo; else the analysis's own tempo). A user
+    tempo more than TEMPO_DISAGREE_PCT off the detected one gives one warning
+    {"stage": "tempo", "kind": "disagreement", "given_bpm", "detected_bpm", "ratio" (given
+    over detected), "relation", "deviation_pct", "text"} in "warnings" (S2-4b / S4-7: an octave-doubled
+    --bpm halves every budget's hits and turns the frequency-dependent limiter onto the
+    kick band, and nothing said so). The grid used stays the user's (spec 3.2a)."""
+    pi = analysis.get("plan_inputs") or {}
+    mh = pi.get("metrical") or {}
+    bpm, src = plan_tempo(analysis, controls)
+    rec = {"bpm": bpm, "source": src, "detected_bpm": None, "deviation_pct": None,
+           "relation": None, "tolerance_pct": TEMPO_DISAGREE_PCT, "warnings": []}
+    if src != "user" or bpm is None:
+        return rec
+    if "user_bpm" in mh and abs(float(mh["user_bpm"]) - bpm) < 1e-6:
+        det, rel = mh.get("detected_bpm"), mh.get("detected_relation")
+    else:
+        det, rel = pi.get("tempo_bpm"), None        # an analysis made without this tempo
+        if analysis_user_bpm(pi) is not None:
+            det = None                               # ... but with another user tempo
+    if det is None or not math.isfinite(float(det)) or float(det) <= 0:
+        return rec
+    det = float(det)
+    dev = 100.0 * (det / bpm - 1.0)
+    rec.update(detected_bpm=det, deviation_pct=dev, relation=rel)
+    if abs(dev) > TEMPO_DISAGREE_PCT:
+        ratio = bpm / det                             # given over detected: 2.0 = an octave up
+        text = (f"tempo given {bpm:g} BPM; detected {det:.1f} BPM, ratio {ratio:.2f}"
+                + (f" ({rel})" if rel else "")
+                + "; the given tempo sets every budget's hits: check --bpm")
+        rec["warnings"] = [{"stage": "tempo", "kind": "disagreement", "given_bpm": bpm,
+                            "detected_bpm": det, "ratio": ratio, "relation": rel,
+                            "deviation_pct": dev, "text": text}]
+    return rec
+
+
 def character_settings(analysis: dict, controls: Controls, nb: int | None = None) -> dict:
     """The character preset's settings for nb bands (the analysis's crossovers when nb is
     None), the low band's release held at LOW_BAND_RELEASE_MIN_MS or more. The tempo is
-    the user's (controls.bpm) if given, else the analysis's (octave-checked; its octave
+    `plan_tempo`'s: the user's (controls.bpm, or the tempo the analysis was made with) if
+    given, else the analysis's (octave-checked; its octave
     decision goes to character_choice and `tempo_octave` records the analysis's note).
     band_lookahead_ms (per band) is the band ceilings' lookahead, from the character like
     the rest of the multiband timing; speclim_lookahead_ms the frequency-dependent
@@ -1777,12 +2016,8 @@ def character_settings(analysis: dict, controls: Controls, nb: int | None = None
     one, the live profile's transparent, else the character's)."""
     if nb is None:
         nb = len(resolve(analysis, controls).crossovers_hz) + 1
-    bpm, src = controls.bpm, "user"
     pi = analysis.get("plan_inputs") or {}
-    if bpm is None:
-        t = pi.get("tempo_bpm")
-        bpm, src = (float(t), "analysis") if t is not None and math.isfinite(float(t)) \
-            else (None, None)
+    bpm, src = plan_tempo(analysis, controls)
     octave = (pi.get("metrical") or {}).get("octave")
     name, why = character_choice(controls.character, bpm, src or "analysis", octave)
     pr = CHARACTER_PRESETS[name]
@@ -1884,11 +2119,10 @@ def plan_hits(analysis: dict, controls: "Controls") -> HitsPlan:
     beats = pi.get("beat_times")
     if beats is not None:
         beats = [b for b in np.asarray(beats, dtype=np.float64).ravel() if math.isfinite(b)]
-    if beats is not None and len(beats) >= 2 and (controls.bpm is not None
-                                                 or pi.get("grid_informative")):
-        src = "user bpm" if controls.bpm is not None else "analysis beat grid"
+    tempo, t_src = plan_tempo(analysis, controls)
+    if beats is not None and len(beats) >= 2 and (t_src == "user" or pi.get("grid_informative")):
+        src = "user bpm" if t_src == "user" else "analysis beat grid"
         b = np.asarray(beats)
-        tempo = controls.bpm if controls.bpm is not None else pi.get("tempo_bpm")
         if tempo is not None and math.isfinite(float(tempo)) and tempo > 0:
             r = float(np.median(np.diff(b))) * float(tempo) / 60.0
             k = int(round(r))
@@ -1907,7 +2141,7 @@ def plan_hits(analysis: dict, controls: "Controls") -> HitsPlan:
 def design_speclim(plan: Plan, y: np.ndarray, fs: float):
     """The frequency-dependent limiter on y, the glue's output (multiband.design_speclim on
     the multiband's crossovers, over the stage's hits), or None when the limiter section
-    does not ask for it or no band needs a ceiling."""
+    does not ask for it, no band needs a ceiling or there is no loud hit."""
     lp = plan.limiter
     if lp is None or lp.speclim_allow_db is None:
         return None
@@ -1922,8 +2156,10 @@ def design_speclim(plan: Plan, y: np.ndarray, fs: float):
     look = SPECLIM_LOOKAHEAD_MS if lp.speclim_lookahead_ms is None else lp.speclim_lookahead_ms
     if np.ndim(look):
         look = _per_band(look, nb)
-    return mb_stage.design_speclim(y, fs, xo, allow, cut, look, rel,
-                                   hits=stage_hits(plan, y, fs))
+    hits = stage_hits(plan, y, fs)
+    if not envelope.has_loud(hits):
+        return None                   # no loud hit: no typical peak to hold the bands to
+    return mb_stage.design_speclim(y, fs, xo, allow, cut, look, rel, hits=hits)
 
 
 def stage_hits(plan: Plan, y: np.ndarray, fs: float) -> dict | None:
@@ -1948,7 +2184,10 @@ def freeze_hits(plan: Plan, pre: np.ndarray, fs: float) -> Plan:
 
 def design_glue(y: np.ndarray, fs: float, g: GluePlan, hits: dict | None = None) -> GluePlan:
     """The glue section realised on its input y: the budget solve (glue.design_budget,
-    over hits) when g has a budget, else the threshold rule at g's mix."""
+    over hits) when g has a budget, else the threshold rule at g's mix. Hits with no loud
+    hit (envelope.has_loud) give a glue that does not compress (`_glue_off`)."""
+    if g.budget is not None and not envelope.has_loud(hits):
+        return _glue_off(y, fs, g)
     if g.budget is not None:
         return glue_stage.design_budget(y, fs, g.budget["mode"], ratio=g.ratio,
                                         knee_db=g.knee_db, attack_ms=g.attack_ms,
@@ -1959,6 +2198,26 @@ def design_glue(y: np.ndarray, fs: float, g: GluePlan, hits: dict | None = None)
     return glue_stage.design(y, fs, thr, ratio=g.ratio, knee_db=g.knee_db,
                              attack_ms=g.attack_ms, release_ms=g.release_ms, curve=g.curve,
                              mix=g.mix, makeup_db=g.makeup_db)
+
+
+def _glue_off(y: np.ndarray, fs: float, g: GluePlan) -> GluePlan:
+    """The budget glue with no loud hit to read (audit 2026-11-10 S3-2b): its threshold
+    above the signal's peak plus the knee, so it never compresses; the budget record
+    reads zero GR and "no_loud_hits" True."""
+    pk = float(np.max(np.abs(y))) if np.size(y) else 0.0
+    top = 20.0 * math.log10(pk) if pk > 0.0 else 0.0
+    serial = g.budget["mode"] == "serial"
+    p = glue_stage.design(y, fs, top + g.knee_db / 2.0 + 1.0, ratio=g.ratio, knee_db=g.knee_db,
+                          attack_ms=g.attack_ms, release_ms=g.release_ms, curve=g.curve,
+                          mix=1.0 if serial else g.mix)
+    net = float(g.budget.get("net_db", glue_stage.SERIAL_GR_DB))
+    p.budget = {"mode": g.budget["mode"], "net_target_db": net,
+                "wet_target_db": net if serial else glue_stage.WET_GR_DB, "wet_db": 0.0,
+                "wet_outlier_db": 0.0, "net_db": 0.0, "net_outlier_db": 0.0,
+                "net_cap_db": glue_stage.OUTLIER_CAP_DB, "wet_floor_db": None,
+                "mix": float(p.mix), "reading": "average", "no_loud_hits": True,
+                "warnings": []}
+    return p
 
 
 GLUE_FRAME_S = 0.4
@@ -2015,6 +2274,11 @@ def solve_clipper(y: np.ndarray, fs: float, lp: LimiterPlan,
                       "outlier_gr_db": sol["outlier_gr_db"], "capped": sol["capped"],
                       "curve_gr_db": sol["curve_gr_db"], "threshold_db": sol["threshold_db"],
                       "knee_db": lp.clip_knee_db, "input_peak_8x_dbfs": sol["peak_8x_dbfs"],
+                      # the full signal's 8x input peak (S2-4: with a split the solve reads
+                      # the part above it; the render's detector reads the full signal)
+                      "input_peak_8x_full_dbfs": (
+                          sol["peak_8x_dbfs"] if lp.clip_split_hz is None
+                          else _peak_8x_db(y)),
                       "budget_db": CLIP_MAX_GR_DB, "outlier_cap_db": ocap,
                       "sample_cap_db": lp.clip_max_gr_db,
                       "bound": sol.get("bound"),
@@ -2023,6 +2287,11 @@ def solve_clipper(y: np.ndarray, fs: float, lp: LimiterPlan,
                                       else f"output peak above {lp.clip_split_hz:g} Hz"),
                       "reading": "max" if hits is None else "average", "warnings": warn}
     return replace(lp, clip_threshold_db=sol["threshold_db"], budget=rec)
+
+
+def _peak_8x_db(y: np.ndarray) -> float:
+    from eluate.stages import limiter as lim
+    return float(lim.peak_8x_db(y))
 
 
 def limiter_peak(y: np.ndarray, fs: float, lp: LimiterPlan,
@@ -2124,14 +2393,99 @@ def design_limiter(y: np.ndarray, fs: float, lp: LimiterPlan,
     return lp
 
 
-def _status(avg, target, outlier, cap) -> str:
-    """"over" when the average passes its target or the outlier its cap, "under" when the
-    average is more than envelope.AVERAGE_WARN_DB below its target, else "ok"."""
+UNREACHABLE_BOUNDS = ("level floor", "bracket floor")   # multiband.threshold_for_peak_gr
+
+
+def _clipper_rendered(cs: dict, c: dict, lp: LimiterPlan, lim_info: dict | None) -> None:
+    """The clipper row's planned and rendered track-peak falls, like with like (S2-4):
+    both on the full signal, the clipper's full-signal 8x input peak (input_peak_8x_full_dbfs;
+    with no split the solve's own input_peak_8x_dbfs) minus the limiter detector's peak
+    after the clipper and band-limit, planned_track_db from the solve
+    (limiter.clipped_peak_dbfs, 0 dB gain) and rendered_db from the render (at the
+    rendered input gain). rendered_curve_db is the render's curve reduction at its 8x
+    peak (the part above the split with one), like for like with curve_db. A plan from
+    before the full-signal peak was recorded, with a split, gets rendered_db None and a
+    note (input_peak_8x_dbfs is then the part above the split)."""
+    split = c.get("split_hz")
+    p_full = c.get("input_peak_8x_full_dbfs")
+    if p_full is None and split is None:
+        p_full = c.get("input_peak_8x_dbfs")
+    ok = p_full is not None and math.isfinite(p_full)
+    lr = (lp.budget or {}).get("limiter") or {}
+    if ok and lr.get("clipped_peak_dbfs") is not None:
+        cs["planned_track_db"] = float(p_full - lr["clipped_peak_dbfs"])
+    det = (lim_info or {}).get("detector_peak_dbfs")
+    if det is None:
+        return
+    if ok:
+        cs["rendered_db"] = float(p_full + lp.input_gain_db - det)
+        cs["rendered_on"] = "track peak, full signal"
+    else:
+        cs["rendered_db"] = None
+        cs["rendered_note"] = (f"not measured: the clipper acts above {split:g} Hz and this "
+                               "plan has no full-signal input peak to compare the render's "
+                               "detector peak with")
+    rc = (lim_info or {}).get("clip_max_reduction_db")
+    if rc is not None:
+        cs["rendered_curve_db"] = float(rc)
+
+
+def relimit_summary(lim_info: dict | None) -> dict | None:
+    """The base-rate re-limit's figures from a render's limiter info (S4-6): {"passes",
+    "max_db" (the largest reduction), "samples" (the most samples one pass touched),
+    "fraction" (of the track; None when the info has no sample count), "trim_db"}. Read
+    from lim_info["relimit"] when the limiter reports it (a dict with "passes" as a count or
+    a list of passes, "max_db" or "max_reduction_db", "samples", "fraction"), else from
+    "relimit_passes"; None when the info has neither (no re-limit figures to report)."""
+    if not lim_info:
+        return None
+    rl, n_s = lim_info.get("relimit"), lim_info.get("samples")
+
+    def num(v):
+        return float(v) if isinstance(v, (int, float)) and math.isfinite(float(v)) else None
+
+    if isinstance(rl, dict):
+        ps = rl.get("passes")
+        plist = ps if isinstance(ps, list) else []
+        mx = num(rl.get("max_db", rl.get("max_reduction_db")))
+        if mx is None:
+            mx = max((num(p.get("max_reduction_db")) or 0.0 for p in plist), default=0.0)
+        smp = rl.get("samples")
+        if smp is None:
+            smp = max((int(p.get("samples") or 0) for p in plist), default=0)
+        n_s = rl.get("n", n_s)
+        frac = num(rl.get("fraction"))
+        if frac is None and n_s:
+            frac = int(smp) / float(n_s)
+        return {"passes": len(plist) if isinstance(ps, list) else int(ps or 0),
+                "max_db": float(mx), "samples": int(smp), "fraction": frac,
+                "trim_db": rl.get("trim_db", lim_info.get("trim_db"))}
+    if isinstance(rl, list):
+        passes = rl
+    elif "relimit_passes" in lim_info:
+        passes = lim_info.get("relimit_passes") or []
+    else:
+        return None
+    touched = max((int(p.get("samples") or 0) for p in passes), default=0)
+    return {"passes": len(passes),
+            "max_db": max((float(p.get("max_reduction_db") or 0.0) for p in passes),
+                          default=0.0),
+            "samples": touched, "fraction": (touched / n_s) if n_s else None,
+            "trim_db": lim_info.get("trim_db")}
+
+
+def _status(avg, target, outlier, cap, bound=None) -> str:
+    """"over" when the average passes its target or the outlier its cap, "target
+    unreachable" when the solve stopped at its threshold floor short of the target
+    (bound in UNREACHABLE_BOUNDS, S2-3), "under" when the average is more than
+    envelope.AVERAGE_WARN_DB below its target, else "ok"."""
     if avg is None:
         return "n/a"
     if (target is not None and avg > target + 0.05) or (
             outlier is not None and cap is not None and outlier > cap + 0.05):
         return "over"
+    if bound in UNREACHABLE_BOUNDS:
+        return "target unreachable"
     if target is not None and avg < target - envelope.AVERAGE_WARN_DB:
         return "under"
     return "ok"
@@ -2145,6 +2499,13 @@ def budget_report(plan: Plan, lim_info: dict | None = None) -> dict:
     out: dict = {"stages": {}, "warnings": [],
                  "reading": "max" if plan.hits is None else plan.hits.reading,
                  "hits": None if plan.hits is None else plan.hits.source}
+    if plan.hits is not None and plan.hits.loud and not any(plan.hits.loud):
+        # audit 2026-11-10 S3-2b: every hit is below the -70 dBFS gate; the budget stages
+        # were left uncompressed (envelope.has_loud)
+        out["warnings"].append({"stage": "hits", "kind": "no loud hits",
+                                "text": "no hit reaches the loud section above "
+                                        f"{meter.RMS_GATE_DBFS:g} dBFS: the multiband, glue, "
+                                        "clipper and band limits do not compress"})
     mb = plan.multiband
     if mb is not None and mb.budget is not None and mb.budget.get("result") is not None:
         rows = []
@@ -2155,10 +2516,11 @@ def budget_report(plan: Plan, lim_info: dict | None = None) -> dict:
                                            "limit_outlier_db", "total_db", "total_outlier_db",
                                            "budget_db", "comp_target_db", "comp_cap_db",
                                            "limit_cap_db", "exception", "ratio", "makeup_db",
-                                           "gated")}
+                                           "gated", "threshold_db", "threshold_floor_db",
+                                           "level_db", "bound")}
                 comp_cap = r.get("comp_cap_db")
                 st = _status(r.get("comp_db"), r.get("comp_target_db"),
-                             r.get("comp_outlier_db"), comp_cap)
+                             r.get("comp_outlier_db"), comp_cap, r.get("bound"))
                 if st != "over" and (r.get("limit_outlier_db") or 0.0) > \
                         (r.get("limit_cap_db") or math.inf) + 0.05:
                     st = "over"
@@ -2193,11 +2555,7 @@ def budget_report(plan: Plan, lim_info: dict | None = None) -> dict:
                                         "curve_db": c.get("curve_gr_db"),
                                         "bound": c.get("bound"),
                                         "measured_on": c.get("measured_on", "output peak")}
-            p_in, det = c.get("input_peak_8x_dbfs"), (lim_info or {}).get("detector_peak_dbfs")
-            if det is not None and p_in is not None and math.isfinite(p_in):
-                # the track peak's fall: the clipper's 8x input peak at the rendered gain
-                # minus the limiter detector's peak (after the clipper and band-limit)
-                out["stages"]["clipper"]["rendered_db"] = float(p_in + lp.input_gain_db - det)
+            _clipper_rendered(out["stages"]["clipper"], c, lp, lim_info)
             cs = out["stages"]["clipper"]
             cs["status"] = _status(cs["planned_db"], c["target_db"], cs["outlier_db"],
                                    cs["outlier_cap_db"])
@@ -2213,6 +2571,14 @@ def budget_report(plan: Plan, lim_info: dict | None = None) -> dict:
             if lim_info:
                 st["rendered_db"] = lim_info.get("max_gain_reduction_db")
                 st["outlier_db"] = st["rendered_db"]
+                # S4-6: the base-rate re-limit (limiter contract steps 6-7) is a second
+                # reduction on the decimated output; its passes, largest reduction and the
+                # share of samples it touched are reported next to the 8x figure, and
+                # rendered_total_max_db bounds the two together at any sample
+                rl = relimit_summary(lim_info)
+                st["relimit"] = rl
+                if rl is not None and st["rendered_db"] is not None:
+                    st["rendered_total_max_db"] = float(st["rendered_db"]) + rl["max_db"]
             # the limiter's target is the loudness: its budget is a ceiling, never "under"
             st["status"] = _status(st["planned_db"], None, st["outlier_db"], st["outlier_cap_db"])
             if st["planned_db"] is not None and st["budget_db"] is not None \
@@ -2336,8 +2702,9 @@ def plan_record(analysis: dict, controls: Controls) -> dict:
             "output": asdict(controls.output_plan()), "ceiling_dbtp": controls.ceiling_dbtp,
             "notches": rows, "merged_notches": merged,
             "tone": tone, "inputeq": eq, "saturation": sat,
+            "sidestrip": sidestrip_choice(analysis, controls),
             "multiband": plan_multiband_record(analysis, controls),
-            "character": ch,
+            "character": ch, "tempo": tempo_record(analysis, controls),
             "glue": {"mode": controls.glue_mode, "ratio": GLUE_RATIO,
                      "net_target_db": net,
                      "wet_target_db": (net if controls.glue_mode == "serial"

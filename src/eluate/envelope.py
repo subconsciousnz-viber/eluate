@@ -58,7 +58,18 @@ stage and the report:
   chunk 1's meter) of x, the audio entering the stage, at the window centred nearest
   the hit's centre is within LOUD_WITHIN_DB (3 dB) of x's loudest-section value (the
   p95 of the gated 1 s RMS). Fewer than LOUD_MIN_HITS (16) qualifying: the 16 loudest
-  hits (every hit when there are fewer).
+  of the hits whose window is above meter.RMS_GATE_DBFS and whose own RMS over the hit is
+  too (every such hit when there are fewer). A hit below the gate is never loud
+  (2026-11-10: the old fallback took near-silent hits, an HPF's DC residue at -540 dBFS,
+  and every budget was then solved on them; a silent hit next to a burst passes the
+  window test, so the hit's own level is checked as well). When no hit passes the gate
+  the mask is all False: there are no loud hits, and every budget solve then leaves its
+  stage uncompressed (`has_loud`: multiband.design_budget, the glue, the clipper and the
+  limiter's average term, the frequency-dependent limiter; planner.budget_report warns
+  {"stage": "hits", "kind": "no loud hits"}). A track with no gated 1 s window at all
+  keeps every hit (the whole-track reading; the CLI refuses such an input upstream).
+- `has_loud(hits)`: False only for hits whose loud mask has no True (None, the maximum
+  reading, counts as loud).
 - `hit_values(gr_db, fs_env, edges_s)`: per hit, the maximum of a GR curve sampled at
   fs_env (sample i at i / fs_env s); hits with no sample are NaN. A curve of one value
   is constant over every hit.
@@ -417,11 +428,45 @@ def loud_hits(x: np.ndarray, fs: float, edges_s) -> np.ndarray:
     gated = db[db > meter.RMS_GATE_DBFS]
     if gated.size == 0:
         return np.ones(nh, dtype=bool)
-    mask = lv >= float(np.percentile(gated, 95.0)) - LOUD_WITHIN_DB
-    if mask.sum() < min(LOUD_MIN_HITS, nh):
+    # a hit whose window sits below the gate, or that is itself silent inside (a loud
+    # neighbour's 1 s window reaching into it), is never loud (audit 2026-11-10 S3-2b: the
+    # 16-loudest fallback took near-silent hits, an HPF's DC residue at -540 dBFS, and
+    # every budget was then solved on them); when no hit passes there are no loud hits
+    # (an all-False mask: has_loud, and every budget solve leaves its stage alone)
+    cand = (lv > meter.RMS_GATE_DBFS) & (_hit_rms_db(x, fs, e) > meter.RMS_GATE_DBFS)
+    if not np.any(cand):
+        return np.zeros(nh, dtype=bool)
+    mask = cand & (lv >= float(np.percentile(gated, 95.0)) - LOUD_WITHIN_DB)
+    if mask.sum() < min(LOUD_MIN_HITS, int(cand.sum())):
+        order = np.argsort(-np.where(cand, lv, -np.inf), kind="stable")
         mask = np.zeros(nh, dtype=bool)
-        mask[np.argsort(-lv, kind="stable")[:LOUD_MIN_HITS]] = True
+        mask[order[:min(LOUD_MIN_HITS, int(cand.sum()))]] = True
     return mask
+
+
+def has_loud(hits: dict | None) -> bool:
+    """False only when hits carries a loud mask with no True (module contract): the budget
+    solves then compress nothing. None (the maximum reading) counts as loud."""
+    if hits is None:
+        return True
+    m = hits.get("loud") if isinstance(hits, dict) else None
+    return m is None or bool(np.any(np.asarray(m, dtype=bool)))
+
+
+def _hit_rms_db(x: np.ndarray, fs: float, e: np.ndarray) -> np.ndarray:
+    """Each hit's own RMS (dBFS, the mean of the channels' squares over its samples; -inf
+    for an empty or silent hit)."""
+    xa = np.asarray(x, dtype=np.float64)
+    if xa.ndim == 1:
+        xa = xa[:, None]
+    n = xa.shape[0]
+    c = np.empty(n + 1)
+    c[0] = 0.0
+    np.cumsum(np.mean(xa * xa, axis=1), out=c[1:])
+    idx = np.clip(np.round(e * fs).astype(np.int64), 0, n)
+    cnt = np.maximum(idx[1:] - idx[:-1], 1)
+    with np.errstate(divide="ignore"):
+        return 10.0 * np.log10((c[idx[1:]] - c[idx[:-1]]) / cnt)
 
 
 def hit_values(gr_db, fs_env: float, edges_s) -> np.ndarray:

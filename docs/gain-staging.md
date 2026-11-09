@@ -69,7 +69,9 @@ and channel where that applies):
    maximum GR inside it.
 2. **Loud section**: the hits whose 1 s RMS of the audio *entering the stage* is
    within 3 dB of that signal's loudest-section value (the p95 of the 1 s RMS,
-   chunk 1's meter). If fewer than 16 hits qualify, the 16 loudest.
+   chunk 1's meter). If fewer than 16 hits qualify, the 16 loudest of the hits above
+   the -70 dBFS gate (window and hit alike); a hit below the gate is never loud, and
+   with no loud hit at all the budget stages do not compress (2026-11-10).
 3. **Average peak GR**: the median of the hit values over the loud section.
 4. **Outlier peak GR**: the maximum over the whole track.
 
@@ -179,7 +181,10 @@ engine's own units until the Saturn calibration is done
 ## 7. Character presets
 
 Transparent, Slow, Moderate, Fast, Aggressive. Auto picks by tempo: under
-70 BPM Slow, 70 to 140 Moderate, above 140 Fast. Draft values for the maintainer
+70 BPM Slow, 70 to 140 Moderate, above 140 Fast; a tempo within 1 % of either
+boundary reads Moderate (`planner.AUTO_BPM_TOL`, 2026-11-10: a true 140 BPM track
+was detected at 140.09 and flipped to Fast), and a detected tempo never reads Slow
+(that needs `--bpm`). Draft values for the maintainer
 to correct (bands low to high; ms):
 
 | Preset | Multiband attack | Multiband release | MB knee | Glue attack / release | Clipper knee | Limiter attack / release | Band lookahead |
@@ -287,8 +292,17 @@ What landed (§2 item 1, §3 "Ceiling" and "Loudness target", §4, §9):
   123.5 / 493.9 / 1976 / 7902). Without `--xover` the analysis finds the key
   first (chroma weighted by momentary loudness, which reads no band split) and
   runs every band-dependent feature on the key-locked crossovers. With
-  `--xover` the given ones are used. `plan_record.json` keeps the crossovers,
-  the rule, the tonic, p and a one-line reason. `source.json` keeps the
+  `--xover` the given ones are used. Since 2026-11-10 the lock is gated on the
+  key's confidence (`planner.key_gate`, `KEY_CONFIDENCE_MIN` = 0.5, a starting
+  value to calibrate; features audit F2: pink noise read Cm and moved every band
+  split): the confidence is the features' `key_confidence` in [0, 1], which
+  `features.analyse` hands to the planner's key callback before the first split
+  and records in `plan_inputs["key_confidence"]`. Below the gate, or unknown (an
+  analysis without that field, which includes every analysis made before the
+  features change lands), the default crossovers stay and
+  `meta["crossover_gate"]` records the decision.
+  `plan_record.json` keeps the crossovers,
+  the rule, the tonic, p, the gate and a one-line reason. `source.json` keeps the
   crossovers used, the ones requested (null = key-locked) and R_ref. The
   analysis cache is reused when the request matches, so key-derived
   crossovers do not break reuse.
@@ -301,9 +315,31 @@ What landed (§2 item 1, §3 "Ceiling" and "Loudness target", §4, §9):
   measures the premaster, gains it to R_ref and analyses the gained audio.
   `Plan.input` (`InputPlan`: gain, R_ref, measured value) is the first stage
   (`stages/gain.py`, also run by `solver.render_pre` and `planner.realise`).
-  It is in plan.json and in the report ("0. Input"). A premaster rendered at
-  0 and -17 dB gives the same pre-limiter audio to 1e-9 and the same master
-  to one 24-bit step (`tests/test_gain_staging.py`).
+  It is in plan.json and in the report ("0. Input"). One float64 premaster
+  scaled exactly to 0 and -17 dB gives the same pre-limiter audio to 1e-9 and
+  the same master to one 24-bit step (`tests/test_gain_staging.py`). Two
+  separately written float32 files of one premaster are a weaker case
+  (audit 2026-11-10 S4-5): their independent roundings put the LTAS nodes
+  about 5e-8 dB apart, which was enough to move a top-shelf corner whose cost is
+  flat by one 10 Hz rounding step (11370 against 11380 Hz) and the masters by
+  -82 dBFS on 99 % of the samples (658 24-bit steps). Since then the input EQ
+  fit's inputs (LTAS nodes, residuals, sub shelf, noise floor to 0.01 dB; the
+  slope to 0.001 dB/oct; the top band's decoherence to 0.001,
+  `planner.inputeq_design`) are quantised, so such files get the identical EQ
+  unless a value sits within that rounding noise of a quantisation boundary
+  (rare, and then one rounding step of one section). The rest of the plan
+  differs by the files' rounding noise alone. Measured 2026-11-10 on the audit's
+  30 s loop written as float32 at 0, -20 and +6 dB and mastered through the CLI:
+  identical EQ sections, multiband thresholds within 1.1e-6 dB, limiter gain
+  within 4e-8 dB, clipper threshold within 1.2e-7 dB, and masters that differ by
+  at most one 24-bit step on 5 % of the samples (RMS difference -151.5 dB). So
+  the guarantee is "the same master to one 24-bit step" for one array scaled
+  exactly, and "to one 24-bit step on a few percent of samples" for separately
+  rounded files (`test_written_files_at_two_levels_get_the_same_plan` checks the
+  plan; the full master comparison is too slow for the test suite). An input with no
+  gated 1 s window (shorter than 1 s, silent) is refused by `eluate master` /
+  `analyse` before the analysis (`cli.check_input`, `cli.check_audio`); the
+  plan's `measured_dbfs` is None, not NaN, for such a measurement.
 - **Ceiling and export.** -0.3 dBTP by default (`planner.CEILING_DBTP`,
   `LimiterPlan`, `Targets`). `Plan.output` (`OutputPlan`) is the last stage
   (`stages/output.py`): 24-bit PCM, rounded, by default. `--streaming` gives
@@ -629,7 +665,11 @@ The §3 reading as built, in every dynamics stage and the report:
 - **One shared reading.** `envelope.hit_edges` (beats from the analysis grid, which
   follows `--bpm`; 400 ms frames without a usable grid), `envelope.loud_hits` (the
   loud section on the audio entering the stage: the 1 s RMS window centred nearest
-  each hit's centre within 3 dB of the p95; at least the 16 loudest),
+  each hit's centre within 3 dB of the p95; at least the 16 loudest above the
+  -70 dBFS gate, never a hit below it: audit 2026-11-10 S3-2b, where an HPF's DC
+  residue at -540 dBFS was budgeted on; with none, `envelope.has_loud` is False and
+  the multiband, glue, clipper, frequency-dependent limiter and the limiter's average
+  term leave the audio alone, with a "hits" warning),
   `envelope.average_peak_gr` (median of the per-hit maxima over the loud hits, and
   the track's maximum) and `envelope.summarise_hits`. `envelope.hits_for(x, fs,
   beats)` is the form every stage takes as `hits`; `hits=None` is the whole track
@@ -684,6 +724,17 @@ Deviations and assumptions, with reasons:
 5. **PEAK makeup** follows the new reading (+ the average peak GR, not the
    outlier), so the typical loud hit is restored to unity, as "GR hits -3, band
    gets +3" did on the meter's reading.
+6. **The threshold search has a floor** (2026-11-10, audit S2-3): the multiband
+   compressor's threshold never goes more than `multiband.BRACKET_BELOW_LEVEL_DB`
+   (12 dB) below the band channel's body, the median of its gated 1 s RMS
+   (`multiband.body_level_db`; at 2:1 that already takes the 6 dB clamp off the
+   body). Not the loudest-section p95: in a 16 s loop one +12 dB hit lifts the p95
+   by 9 dB and the median by 0.1, and the p95 floor stopped an ordinary 3 dB target
+   at 2.84 dB. A sparse band whose meter-smoothed
+   average cannot read its target was driven 48 dB down into its leakage floor
+   (GR on 100 % of the time, every hit at the clamp) and reported "ok"; it now
+   stops at the floor, warns `kind: "unreachable"` and reads "target unreachable"
+   in the budget table.
 
 ## 16. Built: audible maxima (docs/dynamics-macros.md step 1, 2026-10-19)
 
@@ -835,6 +886,11 @@ clipper's work). A 1 to 2 dB soft clip on a sine is -27 to -21 dB THD where the 
   threshold is solved on that part's per-hit output peak (`solver.clip_threshold_for_average_peak`
   runs on the high part); the proxy limiter clips the high part too. The record and the
   process log say "output peak above N Hz". Plans without the field render as before.
+  The budget table's planned and rendered track-peak falls (`planned_track_db`,
+  `rendered_db`) are both read on the full signal: the record keeps the full signal's
+  8x input peak next to the high part's (2026-11-10, audit S2-4: the render's figure
+  had mixed the high part's input peak with the full detector peak, -0.59 dB against
+  a planned 1.0). On the synthetic loop they agree to 1e-9 dB.
 - Measured on the saved plans' drop excerpts, re-solving the clipper only (same limiter gain):
 
 | track | clipped time (20 s) | span p90 / max (ms) | full-signal per-hit fall | clipper's change below 150 Hz, re signal | limiter GR max |

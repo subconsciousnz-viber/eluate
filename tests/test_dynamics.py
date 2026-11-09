@@ -88,7 +88,8 @@ def test_multiband_ceiling_hits_peak_gr(target):
 
 def test_silent_band_threshold():
     assert mb.threshold_for_peak_gr(np.zeros(FS), FS, 2.5, 2.0, 10, 100) == \
-        {"threshold_db": 0.0, "peak_gr_db": 0.0, "outlier_gr_db": 0.0}
+        {"threshold_db": 0.0, "peak_gr_db": 0.0, "outlier_gr_db": 0.0, "floor_db": None,
+         "bound": None}
     # the per-sample clamp (6 dB since D5, sprint 2026-10-21); the outlier cap is 4.5 on
     # the meter reading
     assert mb.MULTIBAND_MAX_GR_DB == 6.0 and mb.MULTIBAND_OUTLIER_CAP_DB == 4.5
@@ -411,10 +412,13 @@ def test_blocked_whole_clipper_matches_whole_track(fs):
 
 # ------------------------------------------------------------ character presets
 
-@pytest.mark.parametrize("bpm,name", [(60.0, "slow"), (69.9, "slow"), (70.0, "moderate"),
-                                      (120.0, "moderate"), (140.0, "moderate"),
-                                      (140.1, "fast"), (174.0, "fast"), (None, "moderate")])
+@pytest.mark.parametrize("bpm,name", [(60.0, "slow"), (69.2, "slow"), (69.9, "moderate"),
+                                      (70.0, "moderate"), (120.0, "moderate"), (140.0, "moderate"),
+                                      (140.1, "moderate"), (141.5, "fast"), (174.0, "fast"),
+                                      (None, "moderate")])
 def test_auto_character_by_tempo(bpm, name):
+    """The boundaries carry +-1 % (planner.AUTO_BPM_TOL) that resolves to moderate
+    (features audit 2026-11-10 F4: a true 140 BPM track read 140.09 and flipped to fast)."""
     assert planner.character_choice("auto", bpm)[0] == name
     assert planner.character_choice("aggressive", bpm)[0] == "aggressive"
 
