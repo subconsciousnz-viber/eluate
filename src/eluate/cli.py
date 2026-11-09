@@ -593,7 +593,7 @@ def _pass_line(p: dict) -> str:
             s += f" ({p['shortfall_cause']})"
     dom = p.get("dominant")
     if dom:
-        s += "; the " + ("shortfall" if dom == "rms_shortfall" else "limits") + " dominate the score"
+        s += "; the " + ("shortfall dominates" if dom == "rms_shortfall" else "limits dominate") + " the score"
     return s
 
 
