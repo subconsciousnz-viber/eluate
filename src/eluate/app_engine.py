@@ -166,10 +166,15 @@ def _master(args) -> None:
 def _stems_sum(args) -> None:
     from eluate import cli
     emit("stage", stage="Summing stems")
+    from eluate import stems
     _, fs, nt, sum_path = cli.sum_stems(args.stems, args.work, args.mix,
                                         log=lambda m: emit("log", msg=str(m)))
+    # a "processed" verdict is a warning (cli.sum_stems): the message says what differed
     emit("data", ui={"kind": "stems", "sum": str(sum_path.resolve()), "fs": fs,
-                     "stems": len(args.stems), "null": nt})
+                     "stems": len(args.stems), "null": nt,
+                     "null_message": stems.null_message(nt) if nt else None,
+                     "warning": (stems.null_message(nt)
+                                 if nt and nt.get("verdict") == "processed" else None)})
 
 
 def _analyse(args) -> None:

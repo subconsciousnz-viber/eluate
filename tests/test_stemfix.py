@@ -281,3 +281,140 @@ def test_a_moved_shelf_corner_deepens_the_same_fix(S):
     assert len(eq1) == len(eq2) == 1
     assert eq2[0]["params"]["fc_hz"] == eq1[0]["params"]["fc_hz"] == 1340.0
     assert eq2[0]["params"]["gain_db"] > eq1[0]["params"]["gain_db"]
+
+
+# ---------------------------------------------------------------- stems audit 2026-11-10
+
+def _notch(**detail):
+    return {"kind": "notch", "limit": "notch at 660 Hz (found)",
+            "detail": {"f0_hz": 660.0, "spans": [[0.0, 2.0]], **detail},
+            "stems": [{"name": "three", "excess_db": 8.0}]}
+
+
+def test_a_zero_cap_or_rejected_notch_is_never_cut(S):
+    """Item 1: a 0.0 dB musical cap is a cap (it read as "none", then 3 dB); a notch the
+    planner held back on (suspect timbre, chord-tone guard, no cut) is not cut on a stem."""
+    assert stemfix._notch_cap({"flag": "musical", "max_cut_db": 0.0}) == 0.0
+    for det in ({"flag": "musical", "max_cut_db": 0.0},
+                {"reason": "suspect: spans cover 80 % of the track", "max_cut_db": 2.0},
+                {"reason": "within 50 cents of the key's tonic or fifth (pitch class [9])"},
+                {"reason": "no cut"}):
+        rep = {"attribution": [_notch(**det)]}
+        p1 = stemfix.plan(rep, S, NAMES, FS)
+        assert p1 == [], det
+        assert stemfix.plan(rep, S, NAMES, FS, prior=p1) == []
+    # ran out of room ("below the top N"): the stem may take it
+    ok = stemfix.plan({"attribution": [_notch(reason="below the top 5 merged notches by peak excess")]},
+                      S, NAMES, FS)
+    assert len(ok) == 1 and ok[0]["params"]["gain_db"] == pytest.approx(-stemfix.NOTCH_STEP_DB)
+    # the attribution's label for a rejected notch is not "(found)": no fix by text either
+    lab = {"limit": "notch at 660 Hz (found, skipped: suspect: spans cover 80 % of the track)",
+           "detail": {"f0_hz": 660.0}, "stems": [{"name": "three", "excess_db": 8.0}]}
+    assert stemfix.plan({"attribution": [lab]}, S, NAMES, FS) == []
+
+
+def _music_set(S):
+    """drums (the kick), music (the sustained sub with the pad on top), a hat stem."""
+    return np.stack([S[0], S[1] + 3.0 * S[2], S[3]])
+
+
+def test_music_stem_with_the_sub_takes_no_bass_role(S):
+    """Item 2: a 3-stem delivery's music stem (sub + pads) is not the bass: no duck, the
+    limiter entry compresses instead. A named or a plain sub bass still takes the role."""
+    M = _music_set(S)
+    names = ["drums", "music", "vox"]
+    assert stemfix.roles(M, names, FS) == (0, None)
+    assert stemfix.roles(M, ["a", "b", "c"], FS)[1] is None
+    rep = {"attribution": [{"limit": "limiter on its outlier cap",
+                            "detail": {"moments_s": list(ONSETS + 0.02)},
+                            "stems": [{"name": "music", "peak_db": -6.0}]}]}
+    fixes = stemfix.plan(rep, M, names, FS, bpm=BPM)
+    assert [(f["stem"], f["kind"]) for f in fixes] == [("music", "comp")]
+    # the name is evidence: a stem called "bass" with the same content may be ducked
+    assert stemfix.roles(M, ["drums", "bass", "vox"], FS) == (0, 1)
+    # the plain sustained sub: tonal, its low band far over the rest
+    assert stemfix.roles(S, NAMES, FS) == (0, 1)
+
+
+def _sidechained(S, depth_db=6.0, tau_s=0.1):
+    g = np.ones(N)
+    a = 10 ** (-depth_db / 20)
+    r = np.arange(int(0.2 * FS))
+    for o in ONSETS:
+        i = int(round(o * FS))
+        m = min(r.size, N - i)
+        g[i:i + m] = np.minimum(g[i:i + m], (a + (1 - a) * (1 - np.exp(-r / (tau_s * FS))))[:m])
+    return S[1] * g[:, None]
+
+
+def test_an_already_ducked_bass_is_not_ducked_again(S):
+    """Item 3: the audit's pre-sidechained bass (6 dB, 100 ms) took a further 2.2 dB; the
+    existing dip (before / after the kick against under it) comes off the planned depth."""
+    g0, _ = stemfix.duck_gain_db(S[0], S[1], FS, 3.0, 117.0)
+    assert g0.min() == pytest.approx(-3.0, abs=0.05)
+    g6, _ = stemfix.duck_gain_db(S[0], _sidechained(S, 6.0), FS, 3.0, 117.0)
+    assert g6.min() > -0.1
+    # a shallower one reduces the duck by about its own depth; a light one (under
+    # DUCK_EXISTING_MIN_DB once the note's attack is past) leaves it whole
+    g3, _ = stemfix.duck_gain_db(S[0], _sidechained(S, 3.0, 0.06), FS, 3.0, 117.0)
+    assert -2.2 < g3.min() < -0.8
+    g1, _ = stemfix.duck_gain_db(S[0], _sidechained(S, 1.5, 0.03), FS, 3.0, 117.0)
+    assert g1.min() == pytest.approx(-3.0, abs=0.05)
+    i = int(round(ONSETS[2] * 1000))
+    assert stemfix.existing_dip_db(stemfix._low_mono(_sidechained(S, 6.0), FS), FS, i) > 3.0
+    assert stemfix.existing_dip_db(stemfix._low_mono(S[1], FS), FS, i) < 0.5
+
+
+def test_budget_and_shortfall_limits_compress_the_peak_stem(S):
+    """Item 4: the limiter held by its average budget / the loudness shortfall reaches
+    stemfix as a peak limit, ranked by the leave-one-out drop (item 7)."""
+    ent = {"kind": "budget",
+           "limit": "limiter held by its average budget (5.3 dB needed, cap 2.0 dB), "
+                    "loudness 3.3 dB short of the target",
+           "detail": {"moments_s": [1.1, 2.1], "which": "limiter average budget and loudness shortfall"},
+           "stems": [{"name": "three", "peak_db": -9.0, "peak_drop_db": 2.0},
+                     {"name": "four", "peak_db": -3.0, "peak_drop_db": -1.0}]}
+    fixes = stemfix.plan({"attribution": [ent]}, S, NAMES, FS, bpm=BPM)
+    # "four" is louder on its own but cancels at the peaks: only "three" is compressed
+    assert [(f["stem"], f["kind"]) for f in fixes] == [("three", "comp")]
+    short = dict(ent, limit="loudness 3.3 dB short of the target (limiter budget)")
+    assert [(f["stem"], f["kind"]) for f in stemfix.plan({"attribution": [short]}, S, NAMES, FS)] \
+        == [("three", "comp")]
+
+
+def test_eq_step_only_when_the_planner_wanted_more_than_the_bound(S):
+    """Item 5: wanted at or under the applied bound (run1's air shelf: +2.5 applied, 0.42
+    wanted) proposes nothing; over it, the step is sized from the excess, both directions."""
+    for wanted in (0.42, 2.5, -1.0):
+        rep = _eq_rep(gain=2.5)
+        rep["attribution"][0]["detail"]["wanted_db"] = wanted
+        assert stemfix.plan(rep, S, NAMES, FS) == [], wanted
+    rep = _eq_rep("bell", -1.5, 354.0, 707.0, rows=[{"name": "three", "share": 0.8}])
+    rep["attribution"][0]["detail"].update(section="bell", wanted_db=-3.3)
+    g = stemfix.plan(rep, S, NAMES, FS)[0]["params"]["gain_db"]
+    assert g == pytest.approx(20 * np.log10(1 + (10 ** (-1.8 / 20) - 1) / 0.8), abs=0.01)
+    rep["attribution"][0]["detail"]["wanted_db"] = -1.2          # wanted less cut than it got
+    assert stemfix.plan(rep, S, NAMES, FS) == []
+
+
+def test_compressor_detector_holds_on_a_sub():
+    """Item 8: bare 1 ms frame peaks of a 41 Hz sine rippled the gain at 2 f0 (0.25 dB,
+    harmonics from -124 to -43 dB); the held detector keeps the gain flat."""
+    t = np.arange(N) / FS
+    x = _stereo(0.5 * np.sin(2 * np.pi * 41.2 * t))
+    p = {"threshold_db": 0.0, "ratio": stemfix.COMP_RATIO, "max_gr_db": 2.0,
+         "lookahead_ms": stemfix.COMP_LOOKAHEAD_MS, "release_ms": stemfix.COMP_RELEASE_MS,
+         "moments_s": None}
+    p["threshold_db"] = stemfix._comp_threshold(x, FS, 2.0, None)
+    g, st = stemfix._comp_gain_db(x, FS, p)
+    mid = g[1000:3000]
+    assert mid.min() < -0.5                              # it does reduce
+    assert mid.max() - mid.min() < 0.01                  # without ripple
+    y = x[:, 0] * stemfix._to_audio(g, st, N)
+    f, pw = signal.periodogram(y[FS:3 * FS], FS, window="blackmanharris", nfft=1 << 19)
+
+    def band(fc):
+        k = int(np.argmin(np.abs(f - fc)))
+        return pw[k - 3:k + 4].sum()
+    harm = sum(band(h * 41.2) for h in (2, 3, 4, 5))
+    assert 10 * np.log10(harm / band(41.2)) < -90

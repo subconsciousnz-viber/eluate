@@ -31,10 +31,14 @@ Mapping (limit -> fix):
   projection share there is at least EQ_SHARE_MIN (a stem cancelling against the rest is
   never boosted to fix the sum). The section is detail["section"], else parsed from the
   limit text. Sizing: when the entry's detail carries "wanted_db" (the total gain the
-  sum's section wanted, the planner's range_deficit_db), excess = wanted_db - gain_db (the
+  sum's section wanted: the planner's range_deficit_db for the shelves, the median of its
+  fit's node deficits in the range for the low shelf, bell and band shelf; stems.attribute),
+  excess = wanted_db - gain_db (the
   applied bound) and the per-stem gain g solves 1 + (g - 1) S = 10^(excess / 20), S the
   chosen stems' summed share (a stem's projection moves the sum's level in the range by its share);
-  else EQ_STEP_DB. Shapes: high and air shelves the inputeq first-order high shelf (the
+  a known excess of 0 or less (the section sits at its bound for the slope target, having
+  wanted less than it got in the range) proposes nothing; EQ_STEP_DB only when wanted_db
+  is unknown (a report without the planner's record). Shapes: high and air shelves the inputeq first-order high shelf (the
   _side ones on the stem's S only), low shelf the RBJ low shelf at Q EQ_LOW_SHELF_Q, bell
   and band shelf an RBJ peak at the range's geometric centre (Q = centre / width; the
   band shelf's flat cut approximated). All zero phase, forward-backward at half the dB
@@ -46,11 +50,16 @@ Mapping (limit -> fix):
   detail["q"] (else the planner's unmeasured default: planner.NOTCH_Q_DEFAULT, at most
   NOTCH_LOW_Q_MAX below NOTCH_LOW_HZ), NOTCH_STEP_DB per pass, the total capped at
   NOTCH_MAX_DB, or at detail["max_cut_db"] when detail["flag"] is "musical" (the cap is
-  kept in the fix's params so later passes hold it). A rendered notch already took it out of the sum: no fix.
-- Limiter on its outlier cap, clipper short of its target, a multiband band at its
+  kept in the fix's params so later passes hold it; a cap of 0.0 is a cap, never "no
+  cap"). No fix for a notch the planner itself held back on (stems.notch_rejected: a
+  "suspect" reason, a chord-tone guard, no cut, or a 0 dB cap); a rendered notch already
+  took it out of the sum: no fix.
+- Limiter on its outlier cap, clipper short of its target, the limiter held by its
+  average budget or the loudness shortfall (PEAK_LIMITS), a multiband band at its
   exception or its band limiter at its cap, a frequency-dependent limiter cut: peak
   compression on the first stem the entry names (its peaks at the moments of largest GR)
-  and on the second when its peak is within COMP_SECOND_DB of the first's. When the
+  and on the second when it is within COMP_SECOND_DB of the first on the entry's ranking
+  (the leave-one-out drop of the sum's peak, "peak_drop_db", else its own peak). When the
   entry is full band or band 0 (the lowest) and names the bass (or the kick and the bass
   as its two rows), and the kick and bass stems are identified, and at least
   DUCK_MOMENT_SHARE of the entry's moments fall on a kick onset (or it lists none), the
@@ -63,7 +72,9 @@ Mapping (limit -> fix):
   e.g. crest n/a) never gets a fix.
 
 Compression (offline, a lookahead peak compressor): detector = per 1 ms control frame the
-peak of |x| over both channels; required gain from glue.gain_computer (hard knee, ratio
+peak of |x| over both channels, peak-held over ENV_HOLD_MS (_held: a 1 ms frame of a sub
+falls between its peaks, and the bare frame peaks would ripple the gain at twice the
+fundamental); required gain from glue.gain_computer (hard knee, ratio
 COMP_RATIO), clipped to the fix's max_gr_db; held over +-1 frame (so the linear
 interpolation between control points keeps the full reduction at every frame's peak),
 then envelope.release_hull forward with COMP_RELEASE_MS and backward (time reversed) with
@@ -76,9 +87,17 @@ COMP_STEP_DB and is capped at COMP_MAX_DB.
 Ducking (whole-track knowledge, offline): kick and bass found by content (`roles`): stems
 whose energy below ROLE_LOW_HZ is at least ROLE_LOW_SHARE of their own and within
 ROLE_LOW_RANGE_DB of the loudest such band; the kick has the highest low-band crest, the
-bass the most low-band energy among the rest; a name token (KICK_HINTS, BASS_HINTS)
-adds ROLE_HINT_CREST_DB to a kick's crest or ROLE_HINT_ENERGY_DB to a bass's energy (a
-tiebreak); without both hints the kick's crest must beat the bass's by ROLE_CREST_GAP_DB.
+bass the most low-band energy among the rest that may take the role (`bass_ok`: a
+BASS_HINTS token in its name, else its low band ROLE_BASS_LOW_OVER_HI_DB over the rest of
+its own energy, a tonal low band (`_tonal`: ROLE_TONAL_MIN of its power in a few lines)
+and under ROLE_BROADBAND_SHARE of the set's energy above ROLE_LOW_HZ, so a "music" stem
+carrying the sub with its pads and leads is never ducked full band); a name token
+(KICK_HINTS, BASS_HINTS) adds ROLE_HINT_CREST_DB to a kick's crest or ROLE_HINT_ENERGY_DB
+to a bass's energy (a tiebreak); without both hints the kick's crest must beat the bass's
+by ROLE_CREST_GAP_DB. No bass that passes: no duck (the entry's stems are compressed).
+A bass already dipping under the kick (a sidechain in the mix) is not ducked again: per
+onset `existing_dip_db` (its low-band RMS before and after the kick against its RMS
+DUCK_DURING_MS under it, when at least DUCK_EXISTING_MIN_DB) comes off the depth.
 Kick onsets: the kick's low-band 1 ms envelope (peak held over ENV_HOLD_MS) rising ONSET_RISE_DB above its minimum
 over the previous ONSET_RISE_MS, within ONSET_RANGE_DB of its loud level (99.5th
 percentile), at least ONSET_GAP_MS apart. Per onset the bass gain dips by depth x w on a
@@ -106,7 +125,7 @@ from scipy.ndimage import minimum_filter1d
 
 from eluate import envelope
 from eluate.plan import CONTROL_RATE_HZ
-from eluate.stems import ATTR_WINDOW_S
+from eluate.stems import ATTR_WINDOW_S, notch_rejected
 from eluate.stages import glue, inputeq, notch
 
 EQ_STEP_DB = 1.5            # per pass when the sum's wanted gain is unknown: two passes reach the cap
@@ -139,8 +158,23 @@ ROLE_LOW_RANGE_DB = 20.0    # ... and a low band within this of the loudest stem
 ROLE_CREST_GAP_DB = 3.0     # the kick's low-band crest above the bass's (content alone)
 ROLE_HINT_CREST_DB = 3.0    # a kick-named stem's crest bonus (tiebreak)
 ROLE_HINT_ENERGY_DB = 6.0   # a bass-named stem's low-band energy bonus (tiebreak)
-KICK_HINTS = ("kick", "kik", "kck", "bd", "bassdrum")
+ROLE_BASS_LOW_OVER_HI_DB = 15.0  # an unnamed bass: its low band this far over the rest of its energy
+                                 # (measured: sub / bass stems 21 to 32 dB, a sub + pads + lead
+                                 # "music" stem 12 dB, kicks 10 to 23 dB)
+ROLE_TONAL_MIN = 0.4        # ... and tonal: this share of its low-band power in a few lines
+ROLE_TONAL_RES_HZ = 5.0     # the line test's resolution (a 128 bpm kick train's lines merge)
+ROLE_TONAL_BINS = 3         # the lines counted: a root, its octave, one note change
+ROLE_BROADBAND_SHARE = 0.5  # ... and not the set's dominant broadband stem (its share of the
+                            # set's energy above ROLE_LOW_HZ under this)
+KICK_HINTS = ("kick", "kik", "kck", "bd", "bassdrum", "drum", "drums")
 BASS_HINTS = ("bass", "sub", "808")
+DUCK_PRE_MS = (55, 5)       # existing_dip_db: the bass before an onset, [i - 55 ms, i - 5 ms]
+DUCK_DURING_MS = (10, 60)   # ... under the kick, [i + 10 ms, i + 60 ms]: two 41 Hz periods
+                            # where a sidechain's dip is deepest, past a note's own attack and
+                            # the lowpass's delay (a note starting with the kick reads 0.6 dB
+                            # from i on, 0.1 dB from i + 10 ms)
+DUCK_EXISTING_MIN_DB = 1.0  # an existing dip under this is a note's envelope, not a sidechain
+DUCK_POST_MS = (100, 200)   # ... and after it, [i + 100 ms, i + 200 ms]
 ENV_HOLD_MS = 25            # the low-band envelope's peak hold: one period at 40 Hz
 ONSET_RISE_DB = 9.0         # a kick's attack rises at least this within ONSET_RISE_MS (real kicks
 ONSET_RISE_MS = 10          # rise 30 dB or more from their own decayed tail or silence)
@@ -150,6 +184,9 @@ SILENT_DB = -100.0          # a stem peaking below this is silent: never fixed
 
 _EQ_RE = re.compile(r"^input EQ (.+?) [+-]?\d+(?:\.\d+)? dB, at its bound$")
 _MB_RE = re.compile(r"^(?:multiband|frequency-dependent limiter) band (\d+) ")
+# full-band peak limits (stems.attribute's texts): peak compression, or the duck
+PEAK_LIMITS = ("limiter on its outlier cap", "clipper short of its target",
+               "limiter held by its average budget", "loudness ")
 _RATE = CONTROL_RATE_HZ
 
 
@@ -190,12 +227,15 @@ def _held(pk: np.ndarray) -> np.ndarray:
     return sliding_window_view(np.concatenate([np.full(h - 1, pk[0]), pk]), h).max(axis=1)
 
 
+def _low_mono(x: np.ndarray, fs: int) -> np.ndarray:
+    """(L + R) / 2 through the 4th-order ROLE_LOW_HZ lowpass the roles and the duck read."""
+    sos = signal.butter(4, ROLE_LOW_HZ, "lowpass", fs=fs, output="sos")
+    return signal.sosfilt(sos, 0.5 * (x[:, 0] + x[:, 1]))
+
+
 def _env_db(x: np.ndarray, fs: int, lowpass: bool) -> tuple[np.ndarray, np.ndarray]:
     """Mono (L + R) / 2 envelope in dB at the 1 ms frame starts, held (_held)."""
-    m = 0.5 * (x[:, 0] + x[:, 1])
-    if lowpass:
-        sos = signal.butter(4, ROLE_LOW_HZ, "lowpass", fs=fs, output="sos")
-        m = signal.sosfilt(sos, m)
+    m = _low_mono(x, fs) if lowpass else 0.5 * (x[:, 0] + x[:, 1])
     pk, st = _frame_peaks(np.abs(m), fs)
     pk = _held(pk)
     with np.errstate(divide="ignore"):
@@ -213,8 +253,35 @@ def _hint(name: str, hints) -> bool:
                for t in _tokens(name))
 
 
+def _tonal(lo: np.ndarray, fs: int) -> float:
+    """How much of the low band's power sits in its ROLE_TONAL_BINS largest ROLE_TONAL_RES_HZ
+    bins (20 Hz to ROLE_LOW_HZ): a sustained bass root reads as a few lines (0.7 to 1.0), a
+    kick's sweep and tail as a continuum (about 0.3)."""
+    nps = int(fs / ROLE_TONAL_RES_HZ)
+    if lo.size < nps:
+        return 0.0
+    f, p = signal.welch(lo, fs, nperseg=nps)
+    sel = (f >= 20.0) & (f <= ROLE_LOW_HZ)
+    p = p[sel]
+    tot = float(p.sum())
+    return float(np.sort(p)[-ROLE_TONAL_BINS:].sum() / tot) if tot > 0 else 0.0
+
+
+def bass_ok(f: dict, name: str) -> bool:
+    """Whether a low-band candidate may take the bass role (module docstring, Ducking): a
+    BASS_HINTS token in its name, else its low band ROLE_BASS_LOW_OVER_HI_DB over the rest
+    of its own energy, tonal (_tonal >= ROLE_TONAL_MIN) and not the set's dominant
+    broadband stem (under ROLE_BROADBAND_SHARE of the set's energy above ROLE_LOW_HZ)."""
+    if _hint(name, BASS_HINTS):
+        return True
+    return (f["low_db"] - f["hi_db"] >= ROLE_BASS_LOW_OVER_HI_DB and f["tonal"] >= ROLE_TONAL_MIN
+            and f["hi_share"] < ROLE_BROADBAND_SHARE)
+
+
 def roles(stems: np.ndarray, names, fs: int) -> tuple[int | None, int | None]:
-    """(kick index, bass index) by content, name tokens as a tiebreak; None when unsure."""
+    """(kick index, bass index) by content, name tokens as a tiebreak; None when unsure.
+    The bass index is None when no stem passes `bass_ok` (a music stem that carries the
+    sub with its pads and leads is not ducked)."""
     sos = signal.butter(4, ROLE_LOW_HZ, "lowpass", fs=fs, output="sos")
     feats = []
     for i, s in enumerate(stems):
@@ -231,16 +298,23 @@ def roles(stems: np.ndarray, names, fs: int) -> tuple[int | None, int | None]:
         loud = float(np.percentile(pk_db, 99.5))
         act = pk_db > loud - 40.0
         rms_db = 10.0 * math.log10(float(np.mean(pk[act] ** 2))) if np.any(act) else -math.inf
+        hi = max(e - el, 0.0)
         feats.append({"i": i, "share": el / e, "low_db": 10.0 * math.log10(el),
-                      "crest": loud - rms_db})
+                      "hi_db": 10.0 * math.log10(hi) if hi > 0 else -math.inf, "hi": hi,
+                      "crest": loud - rms_db, "tonal": _tonal(lo, fs)})
     if not feats:
         return None, None
+    hi_tot = sum(f["hi"] for f in feats)
+    for f in feats:
+        f["hi_share"] = f["hi"] / hi_tot if hi_tot > 0 else 0.0
     top = max(f["low_db"] for f in feats)
     cand = [f for f in feats if f["share"] >= ROLE_LOW_SHARE and f["low_db"] >= top - ROLE_LOW_RANGE_DB]
     if len(cand) < 2:
         return None, None
     kick = max(cand, key=lambda f: (f["crest"] + (ROLE_HINT_CREST_DB if _hint(names[f["i"]], KICK_HINTS) else 0.0), -f["i"]))
-    rest = [f for f in cand if f is not kick]
+    rest = [f for f in cand if f is not kick and bass_ok(f, names[f["i"]])]
+    if not rest:
+        return kick["i"], None
     bass = max(rest, key=lambda f: (f["low_db"] + (ROLE_HINT_ENERGY_DB if _hint(names[f["i"]], BASS_HINTS) else 0.0), -f["i"]))
     named = _hint(names[kick["i"]], KICK_HINTS) and _hint(names[bass["i"]], BASS_HINTS)
     if not named and kick["crest"] - bass["crest"] < ROLE_CREST_GAP_DB:
@@ -278,11 +352,46 @@ def _release_ms(bpm) -> float:
     return DUCK_RELEASE_DEFAULT_MS
 
 
+def existing_dip_db(lo: np.ndarray, fs: int, onset_frame: int) -> float:
+    """How far the bass's low band (lo, its lowpassed mono) already dips under a kick at
+    this onset (1 ms frames): its level outside the dip, the louder of its RMS over the
+    DUCK_PRE_MS window before the onset and the DUCK_POST_MS window after (a slow
+    sidechain release still holds the bass down 100 ms on; a note starting at the kick has
+    no level before it and reads its own level after), minus its RMS over DUCK_DURING_MS
+    after the onset (a note ending at the kick, silent there: 0, and its overlap weight is
+    0 anyway); under DUCK_EXISTING_MIN_DB it reads 0. On a sub sidechained 6 dB with a 100 ms
+    release it reads about 3.8 dB, so a 3 dB duck adds none; 3 dB / 60 ms reads 1.5 (the
+    duck adds 1.5); 1.5 dB / 30 ms and an unducked sub read 0."""
+    spf = fs / _RATE
+    n = lo.shape[0]
+
+    def rms_db(a_ms, b_ms):
+        a, b = int(round(a_ms * spf)), int(round(b_ms * spf))
+        a, b = max(0, min(n, a)), max(0, min(n, b))
+        if b - a < 2:
+            return None
+        v = float(np.mean(lo[a:b] ** 2))
+        return 10.0 * math.log10(v) if v > 0 else -math.inf
+
+    i = onset_frame
+    pre = rms_db(i - DUCK_PRE_MS[0], i - DUCK_PRE_MS[1])
+    post = rms_db(i + DUCK_POST_MS[0], i + DUCK_POST_MS[1])
+    during = rms_db(i + DUCK_DURING_MS[0], i + DUCK_DURING_MS[1])
+    ref = max((v for v in (pre, post) if v is not None), default=None)
+    if ref is None or during is None or not math.isfinite(during):
+        return 0.0
+    d = ref - during
+    return d if d >= DUCK_EXISTING_MIN_DB else 0.0
+
+
 def duck_gain_db(kick: np.ndarray, bass: np.ndarray, fs: int, depth_db: float,
                  release_ms: float, lookahead_ms: float = DUCK_LOOKAHEAD_MS) -> tuple[np.ndarray, np.ndarray]:
     """(the bass's duck gain, dB <= 0, at its 1 ms frame starts; those starts, samples)."""
     on, holds = kick_onsets(kick, fs)
-    benv, st = _env_db(bass, fs, lowpass=True)
+    lo = _low_mono(bass, fs)
+    pk, st = _frame_peaks(np.abs(lo), fs)
+    with np.errstate(divide="ignore"):
+        benv = 20.0 * np.log10(np.maximum(_held(pk), 1e-12))
     nf = st.size
     g = np.zeros(nf)
     act = benv > float(np.max(benv)) - 60.0
@@ -297,7 +406,9 @@ def duck_gain_db(kick: np.ndarray, bass: np.ndarray, fs: int, depth_db: float,
         w = float(np.clip((b - (ref - OVERLAP_RANGE_DB)) / OVERLAP_RANGE_DB, 0.0, 1.0))
         if w <= 0.0:
             continue
-        d = depth_db * w
+        d = max(0.0, depth_db * w - existing_dip_db(lo, fs, i))
+        if d <= 1e-9:
+            continue
         a0 = max(0, i - la)
         t = np.arange(a0, i)
         shape = [(t, 0.5 * (1.0 - np.cos(np.pi * (t - (i - la)) / max(la, 1))))]
@@ -315,6 +426,7 @@ def duck_gain_db(kick: np.ndarray, bass: np.ndarray, fs: int, depth_db: float,
 
 def _comp_gain_db(x: np.ndarray, fs: int, p: dict) -> tuple[np.ndarray, np.ndarray]:
     pk, st = _frame_peaks(np.max(np.abs(x), axis=1), fs)
+    pk = _held(pk)      # a 1 ms frame of a sub falls between its peaks: no gain ripple at 2 f0
     with np.errstate(divide="ignore"):
         lv = 20.0 * np.log10(np.maximum(pk, 1e-12))
     gr = np.maximum(glue.gain_computer(lv, p["threshold_db"], p["ratio"], 0.0), -p["max_gr_db"])
@@ -528,7 +640,11 @@ def plan(rep: dict, stems: np.ndarray, names, fs: int, prior: list[dict] | None 
             sign = 1.0 if g > 0 else -1.0
             chosen = [r for r in rows if (_num(r.get("share")) or 0.0) >= EQ_SHARE_MIN]
             wanted = _num(det.get("wanted_db"))
-            if wanted is not None and (wanted - g) * sign > 0 and chosen:
+            if wanted is not None:
+                if (wanted - g) * sign <= 0 or not chosen:
+                    # the sum's section sits at its bound for the slope target, not for
+                    # this range (it wanted less than it got): no stem fix moves that
+                    continue
                 S = sum(r["share"] for r in chosen)
                 lin = 1.0 + (10.0 ** ((wanted - g) / 20.0) - 1.0) / S
                 step = _db(lin) if lin > 0 else -EQ_MAX_DB
@@ -539,26 +655,37 @@ def plan(rep: dict, stems: np.ndarray, names, fs: int, prior: list[dict] | None 
                 propose({"stem": r["name"], "kind": "eq", "params": {**shape, "section": sec, "gain_db": 0.0}},
                         step, limit)
             continue
-        if limit.startswith("notch at ") and limit.endswith("(found)"):
-            f0 = _num(det.get("f0_hz"))
-            if f0 and rows and 0 < f0 < fs / 2:
+        if limit.startswith("notch at "):
+            f0, cap = _num(det.get("f0_hz")), _notch_cap(det)
+            # a notch the planner itself held back on (suspect timbre, a chord tone, a 0 dB
+            # cap) is not cut on a stem either; a rendered one is already out of the sum
+            if (limit.endswith("(found)") and notch_rejected(det) is None and cap > 0
+                    and f0 and rows and 0 < f0 < fs / 2):
                 propose({"stem": rows[0]["name"], "kind": "eq",
                          "params": {"shape": "notch", "fc_hz": float(f0),
                                     "q": _num(det.get("q")) or _notch_q(f0),
                                     "channel": det.get("channel") if det.get("channel") in ("M", "S") else "LR",
-                                    "max_cut_db": _notch_cap(det), "gain_db": 0.0}},
+                                    "max_cut_db": cap, "gain_db": 0.0}},
                         -NOTCH_STEP_DB, limit)
             continue
-        peaky = ("limiter on its outlier cap" in limit or "clipper short of its target" in limit)
+        peaky = any(s in limit for s in PEAK_LIMITS)
         mb = _MB_RE.match(limit)
         if not (peaky or mb) or not rows:
             continue
         low = peaky or int(mb.group(1)) == 0
         top = [r["name"] for r in rows[:2]]
-        p0 = _num(rows[0].get("peak_db"))
+        # the second stem is compressed too when it is within COMP_SECOND_DB of the first
+        # on the entry's ranking: its leave-one-out drop of the sum's peak where it is
+        # given (stems.attribute, limiter moments), else its own peak. A stem whose removal
+        # does not lower the sum's peak (it cancels there) is never compressed for it.
+        loo = any(r.get("peak_drop_db") is not None for r in rows[:2])
+        pkey = "peak_drop_db" if loo else "peak_db"
+        p0 = _num(rows[0].get(pkey))
         named = [rows[0]["name"]] + [r["name"] for r in rows[1:2]
-                                     if p0 is not None and _num(r.get("peak_db")) is not None
-                                     and p0 - r["peak_db"] <= COMP_SECOND_DB]
+                                     if p0 is not None and _num(r.get(pkey)) is not None
+                                     and p0 - r[pkey] <= COMP_SECOND_DB]
+        if loo:
+            named = [nm for nm, r in zip(named, rows) if (_num(r.get(pkey)) or 0.0) > 0.0]
         moments = det.get("moments_s")
         if low:
             k, b, on = role()
@@ -586,7 +713,8 @@ def plan(rep: dict, stems: np.ndarray, names, fs: int, prior: list[dict] | None 
     for k, (fix, delta, reason) in steps.items():
         cap = {"duck": DUCK_MAX_DB, "comp": COMP_MAX_DB}.get(fix["kind"])
         if fix["kind"] == "eq":
-            cap = (fix["params"].get("max_cut_db") or NOTCH_MAX_DB) if fix["params"]["shape"] == "notch" else EQ_MAX_DB
+            mc = _num(fix["params"].get("max_cut_db"))     # 0.0 is a cap (the planner's), not "none"
+            cap = (NOTCH_MAX_DB if mc is None else abs(mc)) if fix["params"]["shape"] == "notch" else EQ_MAX_DB
         field = {"eq": "gain_db", "duck": "depth_db", "comp": "max_gr_db"}[fix["kind"]]
         cur = out[idx[k]]["params"][field] if k in idx else 0.0
         new = round(float(np.clip(cur + delta, -cap, cap)), 2)

@@ -371,3 +371,67 @@ def test_cd_is_refused_with_stems(tmp_path):
     with pytest.raises(ValueError, match="--cd"):
         cli.do_master_stems([tmp_path / "a.wav"], tmp_path / "w", cli.planner.Controls(cd=True),
                             log=lambda m: None)
+
+
+# ---------------------------------------------------------------- stems (audit 2026-11-10)
+
+def _fake_stems_master(monkeypatch, short=0.0, limits=()):
+    """do_master and the attribution replaced: the stems flow's own wiring only."""
+    def fake_master(inp, out, controls, log=print, bpm=None, progress=None, **k):
+        out.mkdir(parents=True, exist_ok=True)
+        io.write_json(out / "report.json", {"loudness": {"target_rms_dbfs": -4.1,
+                                                         "after_rms_dbfs": -4.1 - short}})
+        (out / "master.wav").write_text("m", encoding="utf-8")
+        io.write_json(out / "run.json", {"run_id": "r0", "controls": {"profile": controls.profile}})
+        return {"run_id": "r0", "controls": {"profile": controls.profile}}
+    monkeypatch.setattr(cli, "do_master", fake_master)
+    monkeypatch.setattr(cli.stems, "attribute", lambda work, st, names, fs: {
+        "stems": list(names), "attribution": [{"limit": lim, "detail": {}, "stems": []} for lim in limits]})
+
+
+def test_stems_one_file_as_its_own_mix(tmp_path, monkeypatch):
+    """`--stems a.wav --mix a.wav`: an exact null (-inf) crashed write_report after the
+    whole master (TypeError, exit 1, no run.json); it clamps at -200 dB."""
+    _fake_stems_master(monkeypatch)
+    x, _ = short_track(FS)
+    a = tmp_path / "a.wav"
+    io.write(a, x, FS)
+    out = tmp_path / "out"
+    assert cli.main(["master", "--stems", str(a), "--mix", str(a), "-o", str(out)]) == 0
+    rep = json.loads((out / "stems-report.json").read_text(encoding="utf-8"))
+    assert rep["null_test"]["residual_db"] == -200.0 and rep["null_test"]["verdict"] == "pass"
+    assert "residual -200.0 dB" in (out / "stems-report.md").read_text(encoding="utf-8")
+    run = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    assert run["stems"]["kept"] == 0 and "memory" in run["stems"]
+
+
+def test_stems_refuse_duplicate_names_before_reading(tmp_path, monkeypatch, capsys):
+    """Two files with one basename got one set of fixes (matched by name): refused."""
+    _fake_stems_master(monkeypatch)
+    x, _ = short_track(FS)
+    (tmp_path / "b").mkdir()
+    for p in (tmp_path / "kick.wav", tmp_path / "b" / "kick.wav"):
+        io.write(p, x, FS)
+    monkeypatch.setattr(cli.memory, "guard", lambda *a, **k: pytest.fail("guard before the names"))
+    assert cli.main(["master", "--stems", str(tmp_path / "kick.wav"), str(tmp_path / "b" / "kick.wav"),
+                     "-o", str(tmp_path / "out")]) == 2
+    assert "distinct file names: kick" in capsys.readouterr().err
+    assert cli.main(["master", "--stems", str(tmp_path / "kick.wav"), str(tmp_path / "gone.wav"),
+                     "-o", str(tmp_path / "out")]) == 2
+    assert "gone.wav not found" in capsys.readouterr().err
+
+
+def test_stems_profile_override_is_logged(tmp_path, monkeypatch):
+    _fake_stems_master(monkeypatch)
+    x, _ = short_track(FS)
+    paths = []
+    for nm in ("kick", "bass"):
+        p = tmp_path / f"{nm}.wav"
+        io.write(p, 0.5 * x, FS)
+        paths.append(p)
+    logs = []
+    run = cli.do_master_stems(paths, tmp_path / "out", cli.planner.Controls(profile="live"),
+                              log=logs.append)
+    assert run["controls"]["profile"] == "stems"
+    assert any("profile live set aside" in m for m in logs)
+    assert any(m.startswith("stems pass 0: score") for m in logs)

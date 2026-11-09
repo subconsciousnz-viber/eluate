@@ -140,6 +140,71 @@ just. more natural open sounding top end". On paper pass 1 only cleared the foun
 loudness 0.1 dB lower, both shelves still at their bounds (the sum wanted +6.5 dB air
 against the 2.5 dB bound; perc and snare took the stem cap of +3 dB).
 
+**Addendum, 2026-11-10: the stems audit's fixes.** The phase B decisions above stand (ranges
+unchanged, stems printed after the mix bus, at most two correction passes, corrections
+limited to static EQ, compression and kick/bass ducking). What changed in behaviour:
+
+- *Notches.* A notch the planner itself held back on (a "suspect" reason, the chord-tone
+  guard, no cut, or a 0 dB cap) is listed as "found, skipped: <why>", is not a limit and is
+  never cut on a stem. A 0.0 dB musical cap is a cap (it read as "no cap" and the stem got
+  1.5 then 3 dB). A notch that ran out of room, or an S-only one the notch stage cannot
+  take, may still be cut on the stem.
+- *Ducking.* The bass role needs evidence: a bass/sub/808 name, or a low band at least
+  15 dB over the rest of the stem's energy, tonal, and not the set's dominant broadband
+  stem. A 3-stem delivery's "music" stem (sub + pads + lead) is never ducked full band;
+  its limiter entry compresses instead. A bass already dipping under the kick (a sidechain
+  in the mix: its level 10-60 ms under the kick against the louder of 50 ms before and
+  100-200 ms after) has that dip taken off the duck; the audit's 6 dB sidechained sub gets
+  none (it got 2.2 dB more).
+- *Limits.* The limiter held by its average budget and the loudness shortfall are one limit
+  (detail "which" says which), ranked by the leave-one-out drop of the sum's peak at the
+  limiter's median reductions. Limiter and clipper moments rank the same way: a stem
+  cancelling at the peaks ranks last and is never compressed for them.
+- *EQ.* A stem shelf or bell only when the planner wanted more than the bound it applied
+  (shelves: its range deficit; low shelf, bell, band shelf: the median of its fit's node
+  deficits in the range), sized from that excess. Run1's air shelf (+2.5 applied, 0.42
+  wanted) now proposes nothing.
+- *Attribution is M/S aware.* Each EQ section's shares and levels are read on its own
+  channel (presence and air M, the side shelves S, the rest L+R); a notch on its channel.
+  A side-only stem shows up for the S shelves.
+- *Stem compressor.* Its detector is peak-held over 25 ms, so a sub gets no gain ripple at
+  twice its fundamental (harmonics stay at -124 dB, were -43 dB).
+- *Null test.* The magnitude of the correlation aligns a polarity-inverted mix (reported,
+  the run proceeds); the offset search is +-250 ms; an exact null reads -200 dB (it crashed
+  the report: `--stems a.wav --mix a.wav`). The message names what differs: polarity, gain,
+  length / tail, a sub-sample offset, swapped or unequal channels, a limited or clipped
+  reference. "Processed" is a warning: logged, carried in the stems report and the app's
+  stems-sum message, and the sum is mastered as given; "mismatch" and "silent" still stop.
+  A "mismatch" that a sub-sample shift takes below the pass line is "processed".
+- *Inputs and memory.* Duplicate file names, the same file twice, a missing file and more
+  than two channels are refused naming the stem. The memory guard counts the set: stems x
+  frames x 2 channels x 8 bytes x 2 (the set held through every pass, plus stemfix.apply's
+  copy for the attribution; read_stems fills one preallocated array). 8 stems x 6 min at
+  48 kHz adds 4.1 GiB to the sum's estimate; the record is in run.json "stems".
+- *Speed.* Every stem's spectra are computed once per attribution (one transform per
+  channel, all cross spectra from those) and the notch readings in one pass per stem.
+  `attribute()` on the audit's 6 x 30 s run1: 35.0 s before, 4.5 s after.
+
+*Design notes for the maintainer (not implemented).*
+
+- *Per-stem trims and locks.* A +-1-2 dB stem trim is the gentlest fix for "this stem
+  carries the range" and the first thing an engineer tries; the loop has none. A lock
+  (`--stem-lock vox`: never corrected) and a trim (`--stem-trim vox=-1`) would cover most of
+  what a stem master needs and give the loop a fourth, mildest correction.
+- *Stems printed before the bus.* The null test and the gentle corrections assume stems
+  printed after the mix bus (the ruling above). Stems printed before it never null against
+  a processed mix: with "processed" now a warning such a set masters, but the corrections
+  then act on stems that were not the mix's. If that delivery is to be supported, the null
+  test's verdict should select a mode (corrections off, or a wider "processed" band), and
+  the docs should say which delivery the engine expects.
+- *What the stems report should show.* Per stem: its share of the sum's loud-section level,
+  its share of the limiter's work (the leave-one-out drop now computed), its correlation to
+  the sum (near 0 masked, below 0 cancelling), its crest and 300 ms level, its band shares
+  at the plan's crossovers and its noise floor; for the kept pass, per stem what changed
+  and the before / after of those. The Passes section should carry each pass's crest,
+  slope and section-contrast deltas: the score sees only RMS and limits, and a pass can
+  trade a small RMS gain for more crest (the audit's run1 pass 1: crest +2.7 dB).
+
 ## Questions for the maintainer
 
 Noise (open): -60 or -50 dB as the threshold (built at -60); the maximum reduction;

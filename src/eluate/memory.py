@@ -15,12 +15,20 @@ Contract:
   fails. Windows: GlobalMemoryStatusEx (ullAvailPhys, ullTotalPhys); macOS: `vm_stat`
   free + inactive + speculative pages and `sysctl -n hw.memsize`; Linux and others:
   /proc/meminfo MemAvailable and MemTotal, else os.sysconf (SC_AVPHYS_PAGES).
-- `guard(frames, threads, log)` -> (threads, record): with threads > 1 and an estimate
-  over SAFETY (0.85) of the available memory, one thread (logged); if the one-thread
-  estimate is still over the available memory, ValueError with a plain message (the CLI
-  and the engine print it as one line). A failed query skips the guard (logged). record
-  (run.json "memory"): estimate_mb (for the threads the run uses), available_mb,
-  total_mb, threads_requested, threads; None where the query failed.
+- `stems_extra_mb(frames, stems)`: what a stem set adds over the sum's master (the stems
+  audit, 2026-11-10): the set itself, `stems` x `frames` x 2 channels x 8 bytes
+  (float64, held through every pass), times STEMS_FACTOR (2.0: stemfix.apply makes a
+  second full set for the attribution; read_stems fills one preallocated array, so its
+  own peak, the set plus one stem, stays under that). Measured on 6 stems x 30 s at
+  48 kHz: the set 138 MiB plus 138 MiB for the apply copy. 8 stems x 6 min x 48 kHz:
+  2.1 GiB x 2 = 4.1 GiB on top of the sum's estimate.
+- `guard(frames, threads, log, extra_mb=0.0)` -> (threads, record): with threads > 1 and
+  an estimate (plus extra_mb) over SAFETY (0.85) of the available memory, one thread
+  (logged); if the one-thread estimate is still over the available memory, ValueError
+  with a plain message (the CLI and the engine print it as one line). A failed query
+  skips the guard (logged). record (run.json "memory"): estimate_mb (for the threads the
+  run uses, extra_mb included), extra_mb (when given), available_mb, total_mb,
+  threads_requested, threads; None where the query failed.
 No new dependency: ctypes and the system's own tools only.
 """
 
@@ -35,11 +43,17 @@ MIB_PER_MFRAME = 180.0     # one thread, per million stereo frames
 BASE_MIB = 240.0           # interpreter, libraries, fixed buffers
 THREADED_MIB = 750.0       # extra with threads > 1 (blocks and band solves in flight)
 SAFETY = 0.85              # threads > 1 only while the estimate is under this share
+STEMS_FACTOR = 2.0         # a stem set's copies alive at once (the set and its apply copy)
 
 
 def estimate_mb(frames: int, threads: int = 1) -> float:
     return (MIB_PER_MFRAME * frames / 1e6 + BASE_MIB
             + (THREADED_MIB if threads > 1 else 0.0))
+
+
+def stems_extra_mb(frames: int, stems: int) -> float:
+    """What a stem set of `stems` x `frames` stereo float64 adds to a master (contract)."""
+    return STEMS_FACTOR * stems * frames * 2 * 8 / 2 ** 20
 
 
 def _windows() -> tuple[float, float]:
@@ -104,22 +118,25 @@ def _gb(mib: float) -> str:
     return f"{mib / 1024:.1f} GB"
 
 
-def guard(frames: int, threads: int, log=print) -> tuple[int, dict]:
-    """The thread count to run with and the run.json record (module contract)."""
+def guard(frames: int, threads: int, log=print, extra_mb: float = 0.0) -> tuple[int, dict]:
+    """The thread count to run with and the run.json record (module contract). extra_mb:
+    what the caller holds besides the master itself (a stem set, stems_extra_mb)."""
     rec = {"estimate_mb": None, "available_mb": None, "total_mb": None,
            "threads_requested": threads, "threads": threads}
+    if extra_mb:
+        rec["extra_mb"] = round(extra_mb)
     mem = available_mb()
     if mem is None:
         log("memory check skipped: the free memory could not be read")
         return threads, rec
     avail, total = mem
     rec["available_mb"], rec["total_mb"] = round(avail), round(total)
-    need = estimate_mb(frames, threads)
+    need = estimate_mb(frames, threads) + extra_mb
     if threads > 1 and need > SAFETY * avail:
         log(f"this render needs about {_gb(need)} with {threads} threads and "
             f"{_gb(avail)} is free: running on one thread")
         threads = 1
-        need = estimate_mb(frames, threads)
+        need = estimate_mb(frames, threads) + extra_mb
     rec["estimate_mb"], rec["threads"] = round(need), threads
     if need > avail:
         raise ValueError(f"This render needs about {_gb(need)} of memory; {_gb(avail)} is "
