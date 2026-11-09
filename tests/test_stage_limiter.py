@@ -26,6 +26,71 @@ def fft_reference_db(x, up=32):
     return 20 * np.log10(np.max(np.abs(y)))
 
 
+def _harmonic_db(y, fs, f0, k, skip_s=1.0):
+    """Power of harmonic k re the fundamental (dB) on the steady part of a mono mix of y."""
+    v = y.mean(axis=1)[int(skip_s * fs):-int(skip_s * fs)]
+    w = np.hanning(v.size)
+    P = np.abs(np.fft.rfft(v * w)) ** 2
+    df = fs / v.size
+
+    def band(f):
+        i = int(round(f / df))
+        return P[i - 3:i + 4].sum()
+    return 10 * np.log10(band(k * f0) / band(f0))
+
+
+@pytest.mark.parametrize("f0", [30.0, 40.0])
+def test_hold_removes_the_sub_cycle_ripple(f0):
+    """Audio-rate audit F2: at 3 dB of GR on a sustained sub with the aggressive timing
+    (0.5 / 80 ms) the gain recovered inside each half cycle (H3 -37 to -39 dB); the 25 ms
+    hold (one 40 Hz period) keeps it at the peak's value (H3 below -70 dB). hold None
+    renders exactly as hold 0."""
+    fs = FS
+    n = 6 * fs
+    t = np.arange(n) / fs
+    x = np.stack([0.5 * np.sin(2 * np.pi * f0 * t)] * 2, axis=1)
+    base = LimiterPlan(ceiling_dbtp=-0.3, input_gain_db=8.7, attack_ms=0.5, release_ms=80.0)
+    y0, i0 = limiter.apply_with_info(x, fs, base)
+    y1, i1 = limiter.apply_with_info(x, fs, LimiterPlan(**{**base.__dict__, "hold_ms": 25.0}))
+    h3_0, h3_1 = _harmonic_db(y0, fs, f0, 3), _harmonic_db(y1, fs, f0, 3)
+    print(f"{f0} Hz: GR {i0['max_gain_reduction_db']:.2f} dB; H3 without hold {h3_0:.1f} dB, "
+          f"with 25 ms hold {h3_1:.1f} dB")
+    assert i0["max_gain_reduction_db"] > 2.5
+    assert h3_0 > -45.0
+    assert h3_1 < -70.0
+    assert np.array_equal(y0, limiter.apply(x, fs, LimiterPlan(**{**base.__dict__, "hold_ms": 0.0})))
+    with pytest.raises(ValueError):
+        LimiterPlan(hold_ms=-1.0)
+
+
+def test_aim_margin_is_in_the_reported_gr():
+    """plan.aim_margin_db (planner audit S4-6): the 8x limiter aims the margin under the
+    ceiling: its reported GR on a steady over is the over plus the margin, the output's 8x
+    true peak sits at the aim and nothing is left for the re-limit. None aims at the
+    ceiling (plans made before), bit for bit the same as 0."""
+    fs = FS
+    t = np.arange(3 * fs) / fs
+    x = np.stack([0.5 * np.sin(2 * np.pi * 1000 * t)] * 2, axis=1)   # -6 dBFS
+    m = limiter.AIM_MARGIN_DB
+    base = LimiterPlan(ceiling_dbtp=-1.0, input_gain_db=8.0)
+    _, info = limiter.apply_with_info(x, fs, LimiterPlan(**{**base.__dict__, "aim_margin_db": m}))
+    over = -6.02 + 8.0 + 1.0
+    assert info["max_gain_reduction_db"] == pytest.approx(over + m, abs=0.02)
+    assert info["true_peak_8x_dbtp"] == pytest.approx(-1.0 - m, abs=0.01)
+    assert info["relimit"] == {"passes": 0, "max_db": 0.0, "samples": 0, "fraction": 0.0,
+                               "fraction_over_0p01_db": 0.0}
+    y0, i0 = limiter.apply_with_info(x, fs, base)
+    assert base.aim_margin_db is None
+    assert i0["max_gain_reduction_db"] == pytest.approx(over, abs=0.02)
+    assert np.array_equal(y0, limiter.apply(x, fs, LimiterPlan(**{**base.__dict__,
+                                                                 "aim_margin_db": 0.0})))
+    for bad in (-0.01, 1.5, float("nan")):
+        with pytest.raises(ValueError):
+            LimiterPlan(aim_margin_db=bad)
+    from eluate import planner
+    assert planner.LIMITER_AIM_MARGIN_DB == m
+
+
 def _fractional_impulses(n, fs, period_s, amp, rng):
     """Band-limited impulses (Hann-windowed sinc, 129 taps) at random fractional positions."""
     x = np.zeros(n)
@@ -115,11 +180,17 @@ def test_clipper_with_hf_content_at_onset(fs):
 
 def test_local_relimit_leaves_the_rest_untouched():
     """The re-limit acts only around the excess: a quiet section 0.6 s before the only
-    hot event equals (to rounding) the same section rendered alone through the limiter."""
+    hot event equals (to rounding) the same section rendered alone through the limiter.
+    info["relimit"] summarises the passes (LimiterPlan() aims at the ceiling, no margin,
+    so the re-limit has something to do on this stimulus)."""
     fs = FS
     x = _bed_plus_hf_burst(fs, burst_db=4.0, onset=0.8)
     y, info = limiter.apply_with_info(x, fs, LimiterPlan())
     assert info["relimit_passes"] and info["trim_db"] == 0.0
+    assert info["relimit"]["passes"] == len(info["relimit_passes"])
+    assert info["relimit"]["max_db"] == max(p["max_reduction_db"] for p in info["relimit_passes"])
+    assert 0.0 < info["relimit"]["fraction"] < 1.0
+    assert 0.0 <= info["relimit"]["fraction_over_0p01_db"] <= info["relimit"]["fraction"]
     early = slice(0, int(0.2 * fs))
     y_ref, _ = limiter.apply_with_info(x[: int(0.4 * fs)], fs, LimiterPlan())
     assert np.max(np.abs(y[early] - y_ref[early])) < 1e-12  # FFT-convolution rounding

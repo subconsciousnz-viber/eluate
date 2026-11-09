@@ -26,11 +26,20 @@ Contract: `apply(x, fs, plan) -> y`, pure, stereo (n, 2) in, float64 (n, 2) out.
 - ms_link (MultibandPlan.ms_link, the live profile): M and S of a band take one gain,
   the larger reduction of the two at each instant, with the M makeup. The budget is
   designed per channel, so a channel's applied GR can exceed its own budget's reading.
+  The minimum is taken on the 1 ms control grid (the two channels' compressor and
+  ceiling envelopes share it) and interpolated once (2026-11-10, audio-rate audit H3):
+  the audio-rate minimum of two PCHIP curves had a C0 kink at every crossing (37 to 717
+  per 20 s per band on the live profile, the gain's second difference up to 66 dB/ms^2);
+  the control-rate minimum is C1 and differs from it by under -77 dB re the signal.
 - Bands are summed and converted back to L/R. With every GR, ceiling and makeup
   at 0 dB the output equals the input to double precision (zero-phase bands
   sum exactly); with a minimum-phase crossover the sum is an allpass
   (bands.py). A band whose gain is identically 1 is passed bit-identically, so
-  the sum of the untouched bands is exactly the input's.
+  the sum of the untouched bands is exactly the input's. The planner makes the lowest
+  crossover minimum phase for new plans (planner.xover_phases, `--xover-phase`;
+  filter-maths audit F1: the zero-phase 100 Hz crossover pre-rang a kick by -15 dB
+  6 to 10 ms ahead once the sub band was gained -6 dB); a hand-built MultibandPlan
+  and every saved plan keep the phase they record (default "zero").
 
 `design(x, fs, threshold_db, ...)` builds both envelope sets with envelope.py:
 - Compressor: detector at control point k (t = k ms) = band peak over the two
@@ -43,6 +52,20 @@ Contract: `apply(x, fs, plan) -> y`, pure, stereo (n, 2) in, float64 (n, 2) out.
   neighbouring segments makes g <= g_req hold on every interpolated segment.
   Reduction starts at most attack + one control period before the first
   sample over the threshold (a sample in segment k sets point k).
+  Detector window (detector_window_ms, per band, 2026-11-10, audio-rate audit F3 / F4):
+  point k reads the peak over the trailing W = max(2, round(window_ms)) segments
+  [k - W + 1, k] instead of the two either side of it, so on a sustained tone the
+  detector no longer ripples at twice the fundamental (12 dB p-p on a 40 Hz sine with
+  the 2-segment reading) and the compressor and ceiling envelopes of the low bands stop
+  modulating inside each cycle (sub band at aggressive: 0.22 dB p-p / THD -45 dB at 30 Hz
+  -> 0.000 dB / -207 dB; a 6 dB band ceiling at 30 Hz: 0.48 dB / -39 dB -> 0 / -207).
+  The reading is at least the 2-segment one at every point, so the g <= g_req bound
+  holds a fortiori; the cost is that a band's release starts up to W - 2 ms later.
+  `default_detector_window_ms(crossovers)` is the planner's rule: one period of the
+  band's lower edge (ceil(1000 / f_lo) ms), 25 ms for the sub band (one 40 Hz period),
+  floored at 2 ms: (25, 10, 3, 2, 2) ms on the default crossovers. None (plans made
+  before, and hand-built plans) keeps the 2-segment detector, bit for bit. The same
+  windows serve the band ceilings and speclim.
 - Ceiling: the same detector run on the band *after* the compressor and makeup
   exactly as apply() computes them (the rounded compressor envelope through
   Envelope.at and the cap), required gain = min(1, ceiling / peak), then
@@ -137,19 +160,24 @@ envelope design above, on the band as the stage splits it:
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 import numpy as np
+from scipy.interpolate import PchipInterpolator
 from scipy.ndimage import maximum_filter1d, uniform_filter1d
 
 from eluate import bands, envelope, meter, parallel
-from eluate.plan import (CONTROL_RATE_HZ, MAKEUP_MODES, MODE_MAKEUP_MAX_DB,
+from eluate.plan import (CONTROL_RATE_HZ, EVAL_CHUNK, MAKEUP_MODES, MODE_MAKEUP_MAX_DB,
                             MULTIBAND_LIMIT_MAX_GR_DB, MULTIBAND_MAX_GR_DB,
                             MULTIBAND_OUTLIER_CAP_DB, Envelope,
                             MultibandPlan, control_coord, control_length)
 
 
 ATTACK_FLOOR = 2  # control samples
+DETECTOR_SEGMENTS = 2             # the original detector: the two segments either side of a point
+SUB_DETECTOR_WINDOW_MS = 25.0     # the sub band's detector window: one 40 Hz period
+DETECTOR_WINDOW_MIN_MS = 2.0      # no band reads less than the original two segments
 
 # spec 3.6 crest-loss tolerances for the default five bands, dB
 CREST_LOSS_LIMITS_DB = (1.5, 2.0, 3.0, 3.0, 3.0)
@@ -205,6 +233,13 @@ def _gains_db(plan: MultibandPlan, n: int, fs: float):
     alive at a time (all twenty were 3.2 GB on a 7-minute 48 kHz track)."""
     makeup = plan.makeup()
     for k in range(len(plan.gr_db)):
+        if plan.ms_link:
+            link = linked_reduction_db(plan, k, n, fs)
+            mk = makeup[k][0]
+            if plan.mode_makeup_db is not None:
+                mk = mk + plan.mode_makeup_db[k][0].at(n, fs)
+            yield [(link, mk, None), (link, mk, None)]
+            continue
         row = []
         for c in range(2):
             gr = np.clip(plan.gr_db[k][c].at(n, fs), -MULTIBAND_MAX_GR_DB, 0.0)
@@ -213,11 +248,52 @@ def _gains_db(plan: MultibandPlan, n: int, fs: float):
             if plan.mode_makeup_db is not None:
                 mk = mk + plan.mode_makeup_db[k][c].at(n, fs)
             row.append((gr, mk, cg))
-        if plan.ms_link:
-            red = [g if cg is None else g + cg for g, _, cg in row]
-            link = np.minimum(red[0], red[1])
-            row = [(link, row[0][1], None), (link, row[0][1], None)]
         yield row
+
+
+def _grid(env: Envelope, m: int) -> np.ndarray:
+    """An envelope's control values over m points: a constant broadcast, a shorter curve
+    held at its end value."""
+    v = env.values
+    if v.size == 1:
+        return np.full(m, float(v[0]))
+    if v.size >= m:
+        return v[:m]
+    return np.concatenate([v, np.full(m - v.size, v[-1])])
+
+
+def _ctrl_at(values: np.ndarray, n: int, fs: float, rate_hz: float) -> np.ndarray:
+    """Control values (float64, no float32 cast) at audio rate, with Envelope.at's
+    arithmetic: PCHIP over the grid, end values held, evaluated in EVAL_CHUNK chunks."""
+    m = values.size
+    if m == 1:
+        return np.full(n, float(values[0]))
+    f = PchipInterpolator(np.arange(m, dtype=np.float64), values)
+    out = np.empty(n)
+    for a in range(0, n, EVAL_CHUNK):
+        b = min(n, a + EVAL_CHUNK)
+        out[a:b] = f(np.clip(control_coord(np.arange(a, b), fs, rate_hz), 0.0, m - 1.0))
+    return out
+
+
+def linked_reduction_db(plan: MultibandPlan, k: int, n: int, fs: float) -> np.ndarray:
+    """ms_link: band k's one reduction (dB <= 0, audio rate, no makeup): the minimum over
+    M and S of the capped compressor envelope plus the ceiling envelope, taken on the
+    control grid and interpolated once (module contract)."""
+    envs = [plan.gr_db[k][0], plan.gr_db[k][1]]
+    if plan.ceiling_gr_db is not None:
+        envs += [plan.ceiling_gr_db[k][0], plan.ceiling_gr_db[k][1]]
+    rate = envs[0].rate_hz
+    if any(e.rate_hz != rate for e in envs):
+        raise ValueError("ms_link needs the band's envelopes at one control rate")
+    m = max(e.values.size for e in envs)
+    red = []
+    for c in range(2):
+        r = np.clip(_grid(plan.gr_db[k][c], m), -MULTIBAND_MAX_GR_DB, 0.0)
+        if plan.ceiling_gr_db is not None:
+            r = r + _grid(plan.ceiling_gr_db[k][c], m)
+        red.append(r)
+    return _ctrl_at(np.minimum(red[0], red[1]), n, fs, rate)
 
 
 def _check_stereo(x) -> np.ndarray:
@@ -265,14 +341,7 @@ def _apply_linked(band: np.ndarray, k: int, n: int, fs: float, plan: MultibandPl
                   makeup) -> None:
     """ms_link: M and S of band k take one gain, the larger reduction of the two, with
     the M makeup (MultibandPlan.ms_link), in place."""
-    red = []
-    for c in range(2):
-        r = np.clip(plan.gr_db[k][c].at(n, fs), -MULTIBAND_MAX_GR_DB, 0.0)
-        if plan.ceiling_gr_db is not None:
-            r += plan.ceiling_gr_db[k][c].at(n, fs)
-        red.append(r)
-    total = np.minimum(red[0], red[1])
-    del red
+    total = linked_reduction_db(plan, k, n, fs)
     if plan.mode_makeup_db is not None:
         total += plan.mode_makeup_db[k][0].at(n, fs)
     total += makeup[k][0]
@@ -352,10 +421,48 @@ def _frame_peaks(v: np.ndarray, fs: float, n_ctrl: int, rate_hz: float) -> np.nd
     return peaks
 
 
-def detector(v: np.ndarray, fs: float, n_ctrl: int, rate_hz: float) -> np.ndarray:
-    """Control-point detector: peak over the segments either side of each point."""
+def detector(v: np.ndarray, fs: float, n_ctrl: int, rate_hz: float,
+             window: int = DETECTOR_SEGMENTS) -> np.ndarray:
+    """Control-point detector: peak over the trailing `window` segments [k - window + 1, k]
+    (window 2, the default: the segments either side of each point; module contract)."""
     pk = _frame_peaks(v, fs, n_ctrl, rate_hz)
-    return np.maximum(pk, np.concatenate([[0.0], pk[:-1]]))
+    w = max(DETECTOR_SEGMENTS, int(window))
+    if w == 2:
+        return np.maximum(pk, np.concatenate([[0.0], pk[:-1]]))
+    # the window [k - w + 1, k]: size w, origin so that it ends at k; zeros before the start
+    return maximum_filter1d(pk, size=w, mode="constant", cval=0.0, origin=(w - 1) - w // 2)
+
+
+def window_samples(window_ms, rate_hz: float = CONTROL_RATE_HZ) -> int:
+    """The detector window in control segments: None -> DETECTOR_SEGMENTS (the original
+    2-segment reading), else round(window_ms) at the control rate, at least 2."""
+    if window_ms is None:
+        return DETECTOR_SEGMENTS
+    return max(DETECTOR_SEGMENTS, int(round(float(window_ms) * rate_hz / 1000.0)))
+
+
+def default_detector_window_ms(crossovers_hz) -> list[float]:
+    """The planner's per-band detector windows (ms): one period of the band's lower
+    crossover rounded up to whole ms, SUB_DETECTOR_WINDOW_MS for the sub band (no lower
+    edge), none shorter than DETECTOR_WINDOW_MIN_MS (module contract)."""
+    out = [SUB_DETECTOR_WINDOW_MS]
+    for f in crossovers_hz:
+        if not float(f) > 0.0:
+            raise ValueError("crossovers must be positive")
+        out.append(float(max(DETECTOR_WINDOW_MIN_MS, math.ceil(1000.0 / float(f) - 1e-9))))
+    return out
+
+
+def _windows(v, nb: int) -> list[float | None]:
+    """Per-band detector window (ms) from None, a scalar or one value per band."""
+    if v is None:
+        return [None] * nb
+    if np.ndim(v) == 0:
+        return [float(v)] * nb
+    a = [float(t) for t in v]
+    if len(a) != nb:
+        raise ValueError(f"detector_window_ms must be None, a scalar or {nb} values")
+    return a
 
 
 def to_env32(g_lin: np.ndarray, rate_hz: float) -> Envelope:
@@ -481,12 +588,14 @@ def body_level_db(v: np.ndarray, fs: float) -> float:
 def threshold_for_peak_gr(v: np.ndarray, fs: float, target_db: float, ratio: float,
                           attack_ms: float, release_ms: float, knee_db: float = 0.0,
                           rate_hz: float = CONTROL_RATE_HZ, hits: dict | None = None,
-                          floor_db: float | None = None) -> dict:
+                          floor_db: float | None = None,
+                          window_ms: float | None = None) -> dict:
     """Compressor threshold (dBFS) giving an average peak GR of target_db on band signal
     v over hits (the maximum without hits), by bisection on comp_envelope (module
     contract). Returns {"threshold_db", "peak_gr_db" (the average peak GR reached),
     "outlier_gr_db", "floor_db", "bound"}; a silent band gives 0 dBFS and 0 dB, a zero
-    target a threshold just above the knee's reach.
+    target a threshold just above the knee's reach. window_ms: the band's detector
+    window (None: the 2-segment detector).
 
     The bracket's step-down stops at the floor: the higher of lo - BRACKET_MAX_DB and
     floor_db, by default the band's body (body_level_db) minus BRACKET_BELOW_LEVEL_DB
@@ -502,7 +611,8 @@ def threshold_for_peak_gr(v: np.ndarray, fs: float, target_db: float, ratio: flo
         raise ValueError(f"target_db must lie in [0, {MULTIBAND_MAX_GR_DB}]")
     if not envelope.has_loud(hits):
         target_db = 0.0                  # no loud hits: nothing to compress (S3-2b)
-    det = detector(v, fs, control_length(v.shape[0], fs, rate_hz), rate_hz)
+    det = detector(v, fs, control_length(v.shape[0], fs, rate_hz), rate_hz,
+                   window_samples(window_ms, rate_hz))
     pk = float(det.max()) if det.size else 0.0
     if pk <= 0.0:
         return {"threshold_db": 0.0, "peak_gr_db": 0.0, "outlier_gr_db": 0.0,
@@ -542,12 +652,14 @@ def threshold_for_peak_gr(v: np.ndarray, fs: float, target_db: float, ratio: flo
 
 def ceiling_for_peak_gr(v: np.ndarray, fs: float, target_db: float,
                         lookahead_ms: float = 2.0, release_ms: float = 50.0,
-                        rate_hz: float = CONTROL_RATE_HZ) -> dict:
+                        rate_hz: float = CONTROL_RATE_HZ, window_ms: float | None = None) -> dict:
     """Band limiter ceiling (dBFS) giving a peak GR of target_db on v, the band after the
     compressor and makeup, by bisection on ceiling_envelope. Returns {"ceiling_db",
-    "peak_gr_db"}; ceiling_db None for a silent band or a zero target."""
+    "peak_gr_db"}; ceiling_db None for a silent band or a zero target. window_ms: the
+    band's detector window (None: the 2-segment detector)."""
     v = np.asarray(v, dtype=np.float64)
-    det = detector(v, fs, control_length(v.shape[0], fs, rate_hz), rate_hz)
+    det = detector(v, fs, control_length(v.shape[0], fs, rate_hz), rate_hz,
+                   window_samples(window_ms, rate_hz))
     pk = float(det.max()) if det.size else 0.0
     if pk <= 0.0 or target_db <= 0.0:
         return {"ceiling_db": None, "peak_gr_db": 0.0}
@@ -678,6 +790,7 @@ def design_budget(x: np.ndarray, fs: float, plan: MultibandPlan,
     knee = _table(plan.knee_db, nb, "knee_db")
     crel = _table(plan.ceiling_release_ms, nb, "ceiling_release_ms")
     look = _lookahead(plan.ceiling_lookahead_ms, nb)
+    win = _windows(plan.detector_window_ms, nb)
     rat = _table(2.0 if plan.ratio is None else plan.ratio, nb, "ratio")
     makeup_kc = plan.makeup()
     n_ctrl = control_length(n, fs, rate_hz)
@@ -695,7 +808,7 @@ def design_budget(x: np.ndarray, fs: float, plan: MultibandPlan,
         """One band channel's budget solve: (row, makeup gate, warnings, average
         warnings). Writes only its own [k, c] entries of rat, thr and ceil."""
         warns, warns_avg = [], []
-        det = detector(v, fs, n_ctrl, rate_hz)
+        det = detector(v, fs, n_ctrl, rate_hz, window_samples(win[k], rate_hz))
         with np.errstate(divide="ignore"):
             gate = 20.0 * np.log10(det) > RMS_MAKEUP_GATE_DBFS
         crest = band_crest_db(v, fs)
@@ -710,7 +823,8 @@ def design_budget(x: np.ndarray, fs: float, plan: MultibandPlan,
 
         def comp(target, v=v, det=det, k=k, c=c):
             sol = threshold_for_peak_gr(v, fs, target, rat[k, c], att[k, c], rel[k, c],
-                                        knee[k, c], rate_hz, hits, floor_db=floor_db)
+                                        knee[k, c], rate_hz, hits, floor_db=floor_db,
+                                        window_ms=win[k])
             env = comp_envelope(det, sol["threshold_db"], rat[k, c], att[k, c], rel[k, c],
                                 knee[k, c], rate_hz)
             g = np.clip(env.at(n, fs), -MULTIBAND_MAX_GR_DB, 0.0)
@@ -762,7 +876,7 @@ def design_budget(x: np.ndarray, fs: float, plan: MultibandPlan,
                               "achieved_db": float(sol["peak_gr_db"])})
         lim_t = min(need, lim_max if exception else allowance)
         cs = (ceiling_for_peak_gr(after, fs, lim_t, look[k], crel[k, c],
-                                  rate_hz) if lim_t > 0.01
+                                  rate_hz, window_ms=win[k]) if lim_t > 0.01
               else {"ceiling_db": None, "peak_gr_db": 0.0})
         thr[k, c] = sol["threshold_db"]
         ceil[k][c] = cs["ceiling_db"]
@@ -796,6 +910,7 @@ def design_budget(x: np.ndarray, fs: float, plan: MultibandPlan,
                rate_hz=rate_hz, ceiling_db=ceil if has_ceil else None,
                ceiling_lookahead_ms=plan.ceiling_lookahead_ms,
                ceiling_release_ms=crel.tolist(), knee_db=knee.tolist(),
+               detector_window_ms=plan.detector_window_ms,
                mid_makeup_db=list(plan.mid_makeup_db), side_makeup_db=plan.side_makeup_db,
                decoherence=list(plan.decoherence))
     mm = []
@@ -838,7 +953,7 @@ SPECLIM_OFF_THRESHOLD_DB = 40.0   # compressor threshold that never engages (cei
 def design_speclim(x: np.ndarray, fs: float, crossovers_hz, allow_db,
                    max_cut_db: float, lookahead_ms, release_ms,
                    hits: dict | None = None, order: int = 2,
-                   phase="zero") -> MultibandPlan | None:
+                   phase="zero", detector_window_ms=None) -> MultibandPlan | None:
     """Frequency-dependent limiting (maintainer, 2026-10-19; the Ozone Maximizer's spectral
     limiting is the model): a ceiling-only multiband on x, the audio entering the clipper.
     Per band and M / S: the typical loud hit's peak P50 (median over hits["loud"] of each
@@ -847,7 +962,8 @@ def design_speclim(x: np.ndarray, fs: float, crossovers_hz, allow_db,
     or one value per band), none when P is
     already within it. So only peaks that stand out in their own band are limited, by at
     most max_cut_db, and the rest of the spectrum is left alone. lookahead_ms: the
-    ceilings' lookahead, a scalar or one value per band (design). No makeup. Returns None
+    ceilings' lookahead, a scalar or one value per band (design); detector_window_ms and
+    phase as design's. No makeup. Returns None
     when no band needs a ceiling; the plan's budget records each band's P50, P, ceiling
     and planned cut. A band channel whose loudest-section 1 s RMS sits
     SPECLIM_GATE_BELOW_INPUT_DB below x's (near silent, e.g. the low S band after the side strip) gets no ceiling, as
@@ -896,7 +1012,8 @@ def design_speclim(x: np.ndarray, fs: float, crossovers_hz, allow_db,
         return None
     p = design(x, fs, SPECLIM_OFF_THRESHOLD_DB, ratio=2.0, crossovers_hz=list(crossovers_hz),
                order=order, phase=phase, ceiling_db=ceil, ceiling_lookahead_ms=lookahead_ms,
-               ceiling_release_ms=release_ms, mid_makeup_db=[0.0] * nb, side_makeup_db=0.0)
+               ceiling_release_ms=release_ms, detector_window_ms=detector_window_ms,
+               mid_makeup_db=[0.0] * nb, side_makeup_db=0.0)
     p.budget = {"kind": "speclim", "allow_db": allow,
                 "max_cut_db": float(max_cut_db), "result": rows}
     return p
@@ -907,7 +1024,7 @@ def design(x: np.ndarray, fs: float, threshold_db, ratio: float = 2.0,
            crossovers_hz=bands.DEFAULT_CROSSOVERS, order: int = 2,
            phase="zero", rate_hz: float = CONTROL_RATE_HZ, ceiling_db=None,
            ceiling_lookahead_ms=2.0, ceiling_release_ms=50.0, knee_db=0.0,
-           **plan_kw) -> MultibandPlan:
+           detector_window_ms=None, **plan_kw) -> MultibandPlan:
     """Compressor and ceiling envelopes from band peaks (see module contract).
 
     threshold_db, attack_ms, release_ms, ceiling_release_ms: scalar, per band
@@ -915,7 +1032,9 @@ def design(x: np.ndarray, fs: float, threshold_db, ratio: float = 2.0,
     same shapes, an entry None meaning no ceiling for that band and channel
     (dBFS sample peak of the M or S band as processed). ratio and knee_db: scalar or
     the same shapes (a scalar is recorded as a scalar). ceiling_lookahead_ms: scalar or
-    per band (band k's ceiling uses its own; recorded as given). plan_kw go to
+    per band (band k's ceiling uses its own; recorded as given). detector_window_ms:
+    None (the 2-segment detector), a scalar or per band, the compressor's and the
+    ceiling's detector window (recorded as given). plan_kw go to
     MultibandPlan (mid_makeup_db, side_makeup_db, decoherence); the ceiling
     detector sees the makeup, which the plan records (ceiling_makeup_db).
     Raises ValueError when a ceiling needs more than 120 dB of reduction
@@ -935,6 +1054,7 @@ def design(x: np.ndarray, fs: float, threshold_db, ratio: float = 2.0,
     rel = _table(release_ms, nb, "release_ms")
     crel = _table(ceiling_release_ms, nb, "ceiling_release_ms")
     look = _lookahead(ceiling_lookahead_ms, nb)
+    win = _windows(detector_window_ms, nb)
     if np.any(att <= 0) or np.any(rel < 0) or np.any(crel <= 0):
         raise ValueError("attack_ms and ceiling_release_ms must be > 0, release_ms >= 0")
     ceil = None
@@ -952,7 +1072,7 @@ def design(x: np.ndarray, fs: float, threshold_db, ratio: float = 2.0,
     for k, band in enumerate(bands.split_iter(ms, fs, crossovers_hz, order=order, phase=phase)):
         pair = []
         for c in range(2):
-            det = detector(band[:, c], fs, n_ctrl, rate_hz)
+            det = detector(band[:, c], fs, n_ctrl, rate_hz, window_samples(win[k], rate_hz))
             pair.append(comp_envelope(det, thr[k, c], rat[k, c], att[k, c], rel[k, c],
                                       kn[k, c], rate_hz))
         gr.append(pair)
@@ -966,6 +1086,8 @@ def design(x: np.ndarray, fs: float, threshold_db, ratio: float = 2.0,
                   ceiling_lookahead_ms=(float(ceiling_lookahead_ms)
                                         if np.ndim(ceiling_lookahead_ms) == 0 else look),
                   ceiling_release_ms=crel.tolist(),
+                  detector_window_ms=(detector_window_ms if detector_window_ms is None
+                                      or np.ndim(detector_window_ms) == 0 else win),
                   design_span_s=n / fs, **plan_kw)
     plan = MultibandPlan(**common)
     if ceil is None:
@@ -982,7 +1104,7 @@ def design(x: np.ndarray, fs: float, threshold_db, ratio: float = 2.0,
             g_comp = np.clip(plan.gr_db[k][c].at(n, fs), -MULTIBAND_MAX_GR_DB, 0.0)
             pre = band[:, c] * 10.0 ** ((g_comp + makeup_kc[k][c]) / 20.0)
             del g_comp
-            det = detector(pre, fs, n_ctrl, rate_hz)
+            det = detector(pre, fs, n_ctrl, rate_hz, window_samples(win[k], rate_hz))
             g_min = float(envelope.required_gain(det, 10.0 ** (ceil[k][c] / 20.0)).min())
             if g_min < envelope.G_MIN:
                 raise ValueError(
@@ -1011,6 +1133,7 @@ def design_from(plan: MultibandPlan, x: np.ndarray, fs: float,
                           ceiling_db=plan.ceiling_db,
                           ceiling_lookahead_ms=plan.ceiling_lookahead_ms,
                           ceiling_release_ms=plan.ceiling_release_ms,
+                          detector_window_ms=plan.detector_window_ms,
                           mid_makeup_db=list(plan.mid_makeup_db),
                           side_makeup_db=plan.side_makeup_db,
                           decoherence=list(plan.decoherence), knee_db=plan.knee_db),

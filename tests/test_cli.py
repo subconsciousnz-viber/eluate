@@ -37,6 +37,11 @@ def test_parser_controls():
     c = cli._controls(a)
     assert (c.tilt_db, c.target_rms, c.preserve_mix, c.subside_hz) == (-1.0, -5.0, True, 90.0)
     assert c.rms_target == -5.0
+    assert c.xover_phase == "minimum"                          # 2026-11-10 default
+    assert cli._controls(cli.build_parser().parse_args(
+        ["master", "in.wav", "-o", "out", "--xover-phase", "zero"])).xover_phase == "zero"
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["master", "in.wav", "-o", "out", "--xover-phase", "linear"])
     with pytest.raises(SystemExit):              # genre presets retired (maintainer, 2026-10-20)
         cli.build_parser().parse_args(["master", "in.wav", "-o", "out", "--genre", "techno"])
     k = cli._controls(cli.build_parser().parse_args(

@@ -40,11 +40,17 @@ Contract:
   Minimum-phase crossovers are causal and start from rest, i.e. the same
   silence assumption. Inputs shorter than 2 samples raise ValueError, as does
   NaN or Inf.
-- `split_iter(...)` yields the same bands one at a time (bit-identical); with
-  only zero-phase crossovers it holds just the current band and the residual.
-  `split` fills a preallocated output from it in that case. Zero-phase
+- `split_iter(...)` yields the same bands one at a time (bit-identical) and holds
+  just the current band and the residual, for every phase mode (since 2026-11-10,
+  when the planner made the lowest crossover minimum phase; before, a minimum-phase
+  crossover computed the whole split first). `split` fills a preallocated output
+  from it. Zero-phase
   filtering runs one column at a time (sosfilt treats columns independently,
-  so the result is unchanged) to hold one padded column, not all.
+  so the result is unchanged) to hold one padded column, not all. The edge "zero"
+  pass is iir.sosfiltfilt_zero (2026-11-10, filter-maths audit F5): blocked, with
+  filter state below 1e-150 flushed to 0 and silent blocks skipped, so digital
+  silence no longer runs the tails in the subnormal range (10x slower); identical to
+  scipy's sosfiltfilt bit for bit unless a flush happens, within 1e-12 when it does.
 - `to_ms` / `to_lr`: M = (L + R) / sqrt(2), S = (L - R) / sqrt(2), and the
   inverse with the same factor. Orthonormal: energy-preserving and exactly
   self-inverse up to rounding.
@@ -58,6 +64,8 @@ from collections.abc import Sequence
 
 import numpy as np
 from scipy import signal
+
+from eluate import iir
 
 # x4 spacing (docs/gain-staging.md 4); planner.key_crossovers moves the lowest with the key
 DEFAULT_CROSSOVERS: tuple[float, ...] = (100.0, 400.0, 1600.0, 6400.0)
@@ -142,12 +150,12 @@ def _zero_low(r: np.ndarray, lp: np.ndarray, pl: int, edge: str) -> np.ndarray:
     """Zero-phase low part of r, one column at a time (sosfilt treats columns
     independently, so this is bit-identical to filtering (n, ch) at once and
     holds one padded column instead of all of them)."""
-    n = r.shape[0]
     lo = np.empty_like(r)
     for c in range(r.shape[1]):
         if edge == "zero":
-            rp = np.pad(r[:, c], (pl, pl))
-            lo[:, c] = signal.sosfiltfilt(lp, rp, padtype=None)[pl:pl + n]
+            # blocked with the subnormal flush (iir.py): scipy's sosfiltfilt of the
+            # zero-padded column bit for bit unless digital silence lets the tail flush
+            lo[:, c] = iir.sosfiltfilt_zero(lp, r[:, c], pl)
         else:
             lo[:, c] = signal.sosfiltfilt(lp, r[:, c], padtype="odd", padlen=pl)
     return lo
@@ -163,30 +171,40 @@ def split_iter(
 ):
     """Yield the bands of `split` one at a time, low to high, each (n, ch) (or (n,)).
 
-    Bit-identical to `split(...)[k]`. With only zero-phase crossovers at most
-    the current band and the residual are alive (spec 1 memory); with any
-    minimum-phase crossover the lower bands need the allpasses of the crossovers
-    above them, so the full split is computed and yielded band by band."""
+    At most the current band and the residual are alive (spec 1 memory), for every
+    phase mode: band k is passed through the allpass of each minimum-phase crossover
+    above it as soon as it is split (the allpasses depend only on the crossover
+    frequencies), in the order of the crossovers, so the bands are bit-identical to
+    the whole-split computation used before 2026-11-10 (tested against it)."""
     x2, squeeze, fcs, modes = _check_split(x, fs, fcs, order, phase, edge)
-    if "minimum" in modes:
-        for b in split(x, fs, fcs, order, phase, edge):
-            yield b
-        return
     del x                            # only r refers to the input from here: a caller that
     n = x2.shape[0]                  # passes a temporary lets it go after the first band
-    pl = padlen(None if edge == "zero" else n, fs, min(fcs)) if fcs else 0
+    pl = (padlen(None if edge == "zero" else n, fs, min(fcs))
+          if fcs and "zero" in modes else 0)
+    lps = [signal.butter(order, fc, btype="lowpass", fs=fs, output="sos") for fc in fcs]
+    aps = [allpass_sos(lp) if m == "minimum" else None for lp, m in zip(lps, modes)]
     r = x2
     del x2
     own = False                      # r is the caller's array until the first residual
-    for fc in fcs:
-        lp = signal.butter(order, fc, btype="lowpass", fs=fs, output="sos")
-        lo = _zero_low(r, lp, pl, edge)
-        if own:
-            np.subtract(r, lo, out=r)    # same values as r - lo, no new array
-            hi = r
+    for k, (fc, mode) in enumerate(zip(fcs, modes)):
+        lp = lps[k]
+        if mode == "zero":
+            lo = _zero_low(r, lp, pl, edge)
+            if own:
+                np.subtract(r, lo, out=r)    # same values as r - lo, no new array
+                hi = r
+            else:
+                hi = r - lo
         else:
-            hi = r - lo
-            own = True
+            hp = signal.butter(order, fc, btype="highpass", fs=fs, output="sos")
+            lo = signal.sosfilt(lp, signal.sosfilt(lp, r, axis=0), axis=0)
+            hi = signal.sosfilt(hp, signal.sosfilt(hp, r, axis=0), axis=0)
+        own = True
+        # phase-align: band k passes through the allpass of every minimum-phase
+        # crossover above it, so the band sum is the product of those allpasses
+        for j in range(k + 1, len(fcs)):
+            if aps[j] is not None:
+                lo = signal.sosfilt(aps[j], lo, axis=0)
         yield lo[:, 0] if squeeze else lo
         del lo
         r = hi
@@ -204,43 +222,10 @@ def split(
     """Split `x` (n,) or (n, ch) into len(fcs)+1 bands, shape (bands, n, ch)."""
     x, squeeze, fcs, modes = _check_split(x, fs, fcs, order, phase, edge)
     n = x.shape[0]
-    if "minimum" not in modes:
-        # zero-phase only: fill a preallocated output from split_iter (no second
-        # copy of every band from np.stack)
-        out = np.empty((len(fcs) + 1, n, x.shape[1]))
-        for k, b in enumerate(split_iter(x, fs, fcs, order, phase, edge)):
-            out[k] = b
-        return out[:, :, 0] if squeeze else out
-    pl = 0
-    if fcs and "zero" in modes:
-        pl = padlen(None if edge == "zero" else n, fs, min(fcs))
-
-    bands: list[np.ndarray] = []
-    aps: list[np.ndarray | None] = []
-    r = x
-    for fc, mode in zip(fcs, modes):
-        lp = signal.butter(order, fc, btype="lowpass", fs=fs, output="sos")
-        if mode == "zero":
-            lo = _zero_low(r, lp, pl, edge)
-            hi = r - lo
-            aps.append(None)
-        else:
-            hp = signal.butter(order, fc, btype="highpass", fs=fs, output="sos")
-            lo = signal.sosfilt(lp, signal.sosfilt(lp, r, axis=0), axis=0)
-            hi = signal.sosfilt(hp, signal.sosfilt(hp, r, axis=0), axis=0)
-            aps.append(allpass_sos(lp))
-        bands.append(lo)
-        r = hi
-    bands.append(r)
-
-    # Phase-align: band k passes through the allpass of every minimum-phase
-    # crossover above it, so the band sum is the product of those allpasses.
-    for k in range(len(bands)):
-        for j in range(k + 1, len(fcs)):
-            if aps[j] is not None:
-                bands[k] = signal.sosfilt(aps[j], bands[k], axis=0)
-
-    out = np.stack(bands, axis=0)
+    # fill a preallocated output from split_iter (no second copy of every band)
+    out = np.empty((len(fcs) + 1, n, x.shape[1]))
+    for k, b in enumerate(split_iter(x, fs, fcs, order, phase, edge)):
+        out[k] = b
     return out[:, :, 0] if squeeze else out
 
 

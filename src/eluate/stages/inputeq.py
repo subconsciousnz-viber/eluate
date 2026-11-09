@@ -47,7 +47,12 @@ would boost pads and ambience in every breakdown with no sub).
   RBJ shelf is the square of a first-order shelf). The track is embedded in
   digital silence (zero padding of PAD_TAU time constants of the slowest
   pole, at least bands.PAD_MIN samples per side) and filtered from rest, as
-  bands.split and the notch stage do.
+  bands.split and the notch stage do. Every zero-phase pass and the causal
+  high-pass run through iir.py (2026-11-10, filter-maths audit F5): blocked, with
+  filter state below 1e-150 flushed to 0, so digital silence does not run the
+  tails in the subnormal range (the high-pass was 9x, the minimum-free zero
+  path up to 21x slower on a mostly silent track); bit-identical to scipy unless
+  a flush happens, within 1e-12 when it does.
 - phase "minimum": the specified filter run once, causally, from rest. Exact
   magnitude, minimum phase (kept as an option; see the chunk 2 PR for why zero
   phase is the default).
@@ -66,7 +71,7 @@ from dataclasses import replace
 import numpy as np
 from scipy import signal
 
-from eluate import bands
+from eluate import bands, iir
 from eluate.plan import InputEqPlan
 
 PAD_TAU = 20.0     # time constants of the slowest pole (bands.PAD_TAU)
@@ -133,11 +138,11 @@ def band_shelf_db(plan: InputEqPlan, f, fs: float) -> np.ndarray:
 def _band_shelf_zero(y: np.ndarray, fs: float, plan: InputEqPlan) -> np.ndarray:
     bs = plan.band_shelf
     sos = np.vstack([_butter2(bs.lo_hz, fs, "highpass"), _butter2(bs.hi_hz, fs, "lowpass")])
-    n, pl = y.shape[0], padlen(sos)
+    pl = padlen(sos)
     g = 10.0 ** (bs.gain_db / 20.0)
     out = np.empty_like(y)
     for c in range(y.shape[1]):
-        mid = signal.sosfiltfilt(sos, np.pad(y[:, c], (pl, pl)), padtype=None)[pl:pl + n]
+        mid = iir.sosfiltfilt_zero(sos, y[:, c], pl)
         out[:, c] = y[:, c] - (1.0 - g) * mid
     return out
 
@@ -237,8 +242,7 @@ def _shelf(v: np.ndarray, fs: float, shelves, phase: str) -> np.ndarray:
         sos = np.vstack([_first_order_high_shelf(s.gain_db, s.fc_hz, fs) for s in shelves])
         return signal.sosfilt(sos, v)
     sos = np.vstack([_first_order_high_shelf(s.gain_db / 2.0, s.fc_hz, fs) for s in shelves])
-    n, pl = v.shape[0], padlen(sos)
-    return signal.sosfiltfilt(sos, np.pad(v, (pl, pl)), padtype=None)[pl:pl + n]
+    return iir.sosfiltfilt_zero(sos, v, padlen(sos))
 
 
 def apply(x: np.ndarray, fs: float, plan: InputEqPlan) -> np.ndarray:
@@ -263,15 +267,14 @@ def apply(x: np.ndarray, fs: float, plan: InputEqPlan) -> np.ndarray:
     if plan.highpass is not None:
         hp = section_sos(replace(plan, low_shelf=None, bell=None, high_shelf=None,
                                  air_shelf=None, band_shelf=None), fs, 1)["highpass"]
-        x = signal.sosfilt(hp, x, axis=0)
+        x = iir.sosfilt(hp, x)[0]          # causal; blocked with the subnormal flush
         plan = replace(plan, highpass=None)
     sos = pass_sos(plan, fs)
     if sos is None:
         y = x.copy()
     else:
-        n, pl = x.shape[0], padlen(sos)
+        pl = padlen(sos)
         y = np.empty_like(x)
         for c in range(x.shape[1]):
-            xp = np.pad(x[:, c], (pl, pl))
-            y[:, c] = signal.sosfiltfilt(sos, xp, padtype=None)[pl:pl + n]
+            y[:, c] = iir.sosfiltfilt_zero(sos, x[:, c], pl)
     return y if plan.band_shelf is None else _band_shelf_zero(y, fs, plan)

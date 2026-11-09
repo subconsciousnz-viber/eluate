@@ -308,6 +308,99 @@ def test_plan_validation_and_round_trip(tmp_path):
     assert np.array_equal(glue.apply(x, FS, r.glue), glue.apply(x, FS, p.glue))
 
 
+def _sub_plus_kicks(fs, seconds=8.0, f_sub=40.0, bpm=128.0, sub_dbfs=-12.0, kick_dbfs=-6.0):
+    """The audio-rate audit's S2: a 40 Hz sine with a swept kick (150 -> 45 Hz over 60 ms,
+    150 ms decay) on every beat. Returns (x, onsets_s)."""
+    n = int(seconds * fs)
+    t = np.arange(n) / fs
+    x = 10 ** (sub_dbfs / 20) * np.sin(2 * np.pi * f_sub * t)
+    tk = np.arange(int(0.4 * fs)) / fs
+    f = np.where(tk < 0.06, 150.0 * np.exp(np.log(45.0 / 150.0) / 0.06 * np.minimum(tk, 0.06)), 45.0)
+    kick = 10 ** (kick_dbfs / 20) * np.exp(-tk / 0.15) * (1 - np.exp(-tk / 0.002)) \
+        * np.sin(2 * np.pi * np.cumsum(f) / fs)
+    onsets = np.arange(0.25, seconds - 0.5, 60.0 / bpm)
+    for o in onsets:
+        i = int(round(o * fs))
+        m = min(kick.size, n - i)
+        x[i:i + m] += kick[:m]
+    return np.stack([x, x], axis=1), onsets
+
+
+def _band_energy_db(v, fs, lo, hi):
+    X = np.abs(np.fft.rfft(v)) ** 2
+    f = np.fft.rfftfreq(v.size, 1 / fs)
+    return 10 * np.log10(X[(f >= lo) & (f <= hi)].sum() + 1e-300)
+
+
+def _onset_energy_db(y, fs, onsets, lo, hi):
+    """Median over onsets of the band energy in the 2 ms before to 20 ms after each."""
+    v = y.mean(axis=1)
+    vals = []
+    for o in onsets:
+        i = int(round(o * fs))
+        seg = v[i - int(0.002 * fs):i + int(0.02 * fs)]
+        vals.append(_band_energy_db(seg * np.hanning(seg.size), fs, lo, hi))
+    return float(np.median(vals))
+
+
+def test_attack_floor_recorded_and_applied(monkeypatch):
+    """2026-11-10 (audio-rate audit F1): the applied lagging attack is floored at 3 ms (three
+    control samples); the request is kept in attack_ms, the applied value recorded. A 0.1 ms
+    request builds the same envelope as a 3 ms one; 30 ms is untouched."""
+    x, _ = kick_plus_sustain(FS, beats=4)
+    p = glue.design(x, FS, -12.0, attack_ms=0.1)
+    q = glue.design(x, FS, -12.0, attack_ms=3.0)
+    r = glue.design(x, FS, -12.0, attack_ms=30.0)
+    assert (p.attack_ms, p.attack_applied_ms) == (0.1, 3.0)
+    assert (q.attack_ms, q.attack_applied_ms) == (3.0, 3.0)
+    assert (r.attack_ms, r.attack_applied_ms) == (30.0, 30.0)
+    assert p.gain_db == q.gain_db and p.gain_db != r.gain_db
+    assert glue.ATTACK_FLOOR_MS == 3.0
+    s = Plan.from_json(Plan(fs=FS, glue=p).to_json()).glue
+    assert s.attack_applied_ms == 3.0
+    assert GluePlan(Envelope.constant(0.0)).attack_applied_ms is None       # plans made before
+    with pytest.raises(ValueError):
+        GluePlan(Envelope.constant(0.0), attack_applied_ms=0.0)
+
+
+def test_attack_floor_removes_the_full_band_step(monkeypatch):
+    """Audio-rate audit H4 on S2 (40 Hz sub + kicks at 128 BPM, aggressive glue 0.1 / 80 ms,
+    budget-solved): the 1 ms gain fall around each onset drops from about 4 dB to 1.5 dB or
+    less and the output's 1 to 5 kHz onset energy by 12 dB or more, with the net budget
+    (1.5 dB on the meter reading) still met."""
+    fs = FS
+    x, onsets = _sub_plus_kicks(fs)
+    beats = np.arange(60.0 / 128.0, x.shape[0] / fs, 60.0 / 128.0)
+    hits = envelope.hits_for(x, fs, beats)
+    kw = dict(ratio=2.0, knee_db=3.0, attack_ms=0.1, release_ms=80.0, hits=hits)
+    monkeypatch.setattr(glue, "ATTACK_FLOOR_MS", 1e-6)      # the behaviour before the floor
+    p0 = glue.design_budget(x, fs, "serial", **kw)
+    monkeypatch.setattr(glue, "ATTACK_FLOOR_MS", 3.0)
+    p1 = glue.design_budget(x, fs, "serial", **kw)
+    assert p1.attack_applied_ms == 3.0 and p1.attack_ms == 0.1
+
+    def fall_1ms(p):
+        g = glue.gain_trace_db(p, x.shape[0], fs)
+        s = int(0.001 * fs)
+        worst = 0.0
+        for o in onsets:
+            i = int(round(o * fs))
+            seg = g[i - int(0.005 * fs):i + int(0.08 * fs)]
+            worst = max(worst, float(np.max(seg[:-s] - seg[s:])))
+        return worst
+
+    y0, y1 = glue.apply(x, fs, p0), glue.apply(x, fs, p1)
+    e_in = _onset_energy_db(x, fs, onsets, 1000, 5000)
+    e0, e1 = _onset_energy_db(y0, fs, onsets, 1000, 5000), _onset_energy_db(y1, fs, onsets, 1000, 5000)
+    print(f"largest 1 ms fall: {fall_1ms(p0):.2f} -> {fall_1ms(p1):.2f} dB; onset 1-5 kHz energy "
+          f"in {e_in:.1f}, out {e0:.1f} -> {e1:.1f} dB; net {p0.budget['net_db']:.2f} -> "
+          f"{p1.budget['net_db']:.2f} dB")
+    assert fall_1ms(p0) > 3.0
+    assert fall_1ms(p1) <= 1.5
+    assert e0 - e1 >= 12.0
+    assert abs(p1.budget["net_db"] - 1.5) <= 0.5 and not p1.budget["warnings"]
+
+
 def test_render_order_and_skip():
     """Glue sits between saturate and keyeq; render skips it when its section is absent."""
     assert STAGE_ORDER == ("input", "inputeq", "notch", "sidestrip", "multiband", "tone",

@@ -21,6 +21,20 @@ Contract: `apply(x, fs, plan) -> y`, pure, stereo (n, 2) in, float64 (n, 2) out.
   content), so the change is high-passed at the band's lower crossover (the
   high part of bands.split, zero phase) before it is added; the sub band never
   saturates, so every driven band has a lower edge.
+- Leakage below the band (measured, filter-maths audit F4, 2026-11-10; band 1 =
+  100-400 Hz driven by two tones 150.15 + 180.18 Hz at 0.25 each, harmonic 1): the
+  sub-region residue is mostly odd-order intermodulation, not the even term's
+  rectification. 3f1 - 2f2 = 90 Hz sits where the second-order high-pass is only
+  -8 dB down (|HP| = r^4 / (1 + r^4)), 4f1 - 3f2 = 60 Hz at -19 dB. Residual below
+  100 Hz re the fundamentals at sym 0 / 0.3 / 1: drive 2 dB -92 / -76 / -66 dB;
+  6 dB -51 / -50 / -47 dB; 12 dB -33.5 / -33.3 / -31.6 dB. In-band non-fundamental
+  power (sym 0): -43.5 / -23.3 / -15.3 dB at 2 / 6 / 12 dB (3rd-order 2f2 - f1 leads);
+  band level change -0.19 / -2.03 / -6.83 dB. So "the sub band never saturates" holds
+  for the sub band's own signal, while a band 1 driven past about 6 dB injects
+  sub-region products at -50 dB and worse; the planner's drives stay near 2 dB.
+  Behaviour unchanged (documented only); the split stays zero phase (the multiband's
+  lowest crossover is minimum phase for new plans, saturate's is not: its change is
+  small and its pre-ring with it).
 - The knee is scaled to a robust band level (gated RMS x sqrt 2, the peak of a
   sine at that RMS), never the whole-track peak, so one spike does not mute the
   saturator. G < 1e-12, h = 0, or a band with no block above the gate leaves

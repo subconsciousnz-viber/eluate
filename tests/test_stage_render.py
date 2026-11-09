@@ -330,3 +330,42 @@ def test_validation_bounds_from_second_audit():
     p = multiband.design(x, FS, np.full((5, 2), -40.0), ratio=4.0, attack_ms=0.5)
     q = multiband.design(x, FS, np.full((5, 2), -40.0), ratio=4.0, attack_ms=2.0)
     assert all(a == b for pa, pb in zip(p.gr_db, q.gr_db) for a, b in zip(pa, pb))
+
+
+NEW_2026_11_10 = ("attack_applied_ms", "hold_ms", "aim_margin_db", "detector_window_ms")
+# sha256 of render(x, FS, plan) for the old-style plan below on fb082d1 (the commit before
+# the 2026-11-10 audio-rate / crossover fixes), numpy 2.5.4 / scipy 1.18.1, Windows x64
+OLD_STYLE_RENDER_SHA256 = "418e2e9377b8d7286668df26ad061512af0cfa66fe6b64c782677c277d494a4e"
+
+
+def _strip(d):
+    if isinstance(d, dict):
+        return {k: _strip(v) for k, v in d.items() if k not in NEW_2026_11_10}
+    if isinstance(d, list):
+        return [_strip(v) for v in d]
+    return d
+
+
+def test_old_style_plan_renders_bit_identically_to_before():
+    """A plan without the 2026-11-10 fields (limiter hold and aim margin None, multiband
+    zero phase without detector windows, glue without attack_applied_ms) renders bit for
+    bit as on fb082d1: every new behaviour is opt-in through a plan field, and the
+    blocked IIR (iir.py) reproduces scipy exactly on material without digital silence.
+    The reference hash was computed on fb082d1 with this same plan; a numpy / scipy /
+    platform change can move it legitimately (then recompute it there)."""
+    import hashlib
+    from dataclasses import replace
+    from eluate.stages import glue
+    x, onsets = _signal()
+    p = _full_plan(x, onsets)
+    g = glue.design(x, FS, -20.0, ratio=2.0, attack_ms=30.0, release_ms=300.0, mix=0.5)
+    lim = replace(p.limiter, clip_depth_db=0.0, clip_onsets_s=[], clip_threshold_db=-8.0,
+                  clip_split_hz=100.0, release_ms=100.0, attack_ms=2.0)
+    p = replace(p, glue=g, limiter=lim)
+    old = Plan.from_json(json.dumps(_strip(json.loads(p.to_json()))))
+    assert old.limiter.hold_ms is None and old.limiter.aim_margin_db is None
+    assert old.multiband.detector_window_ms is None and old.multiband.phase == "zero"
+    assert old.glue.attack_applied_ms is None
+    y = render(x, FS, old)[0]
+    digest = hashlib.sha256(np.ascontiguousarray(y, dtype=np.float64).tobytes()).hexdigest()
+    assert digest == OLD_STYLE_RENDER_SHA256

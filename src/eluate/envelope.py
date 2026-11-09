@@ -12,25 +12,39 @@ Contract:
   a = exp(-1/release): gain reduction recovers exponentially in dB with time
   constant `release` samples. h <= u. Closed form (log-domain cumulative max),
   restarted every block so precision does not degrade with track length.
-- `box_smooth(g_req, attack, release)`:
+- `box_smooth(g_req, attack, release, hold=0)`:
     1. u as above; h = release_hull(u, release).
-    2. Lookahead running minimum over offsets [-(L-1), L-1] (window 2L-1,
-       scipy.ndimage.minimum_filter1d), L = attack // 2 + 1.
+    2. Lookahead running minimum over offsets [-(L-1) - hold, L-1] (window
+       2L-1 + hold, scipy.ndimage.minimum_filter1d), L = attack // 2 + 1:
+       m[n] = min h[n-(L-1)-hold .. n+(L-1)]. hold (control samples, >= 0,
+       default 0) is the asymmetric part: it looks `hold` samples further back,
+       so a dip at p keeps the minimum low until p + (L-1) + hold.
     3. Moving average over offsets [-(L-1), 0] then over [0, L-1]: a symmetric
        triangular kernel with support [-(L-1), L-1], C1 output.
   Because every kernel weight is >= 0, sums to 1, and every sample n - j in the
-  kernel support has n inside its minimum window, g[n] <= h[n] <= u[n] holds
-  exactly; a final min(g, u) removes only cumulative-sum rounding (1.5e-11
-  measured at n = 200k, tested < 1e-9). Gain reduction for an isolated dip
-  starts exactly 2 * (attack // 2) samples before it, i.e. `attack` rounded
-  down to even, never earlier than `attack` (tested for 199 / 200 / 201).
-  Without a hull it recovers over the same span after the dip.
+  kernel support (|j| <= L-1) has n inside its minimum window
+  [n-j-(L-1)-hold, n-j+(L-1)] (the left reach L-1+hold >= L-1 >= j and the
+  right reach L-1 >= -j), g[n] <= h[n] <= u[n] holds exactly for every hold;
+  a final min(g, u) removes only cumulative-sum rounding (1.5e-11 measured at
+  n = 200k, tested < 1e-9). Gain reduction for an isolated dip at p starts
+  exactly 2 * (attack // 2) samples before it, i.e. `attack` rounded down to
+  even, never earlier than `attack` (tested for 199 / 200 / 201), whatever the
+  hold: the minimum reaches forward by L-1 and the kernel by L-1, neither
+  depends on hold. Without a hull it recovers 2 * (attack // 2) + hold samples
+  after the dip: the hold delays the recovery by exactly `hold` samples (the
+  minimum's backward reach grows by hold, the kernel's does not) and does nothing
+  else (audit 2026-11-10, audio-rate F2: the final limiter's hold removes the
+  sub-cycle gain ripple on 30 to 40 Hz at 3 dB of GR). hold 0 is the original
+  symmetric window, the same minimum_filter1d call. With a hull the hull decides
+  the recovery after the hold.
   Why the release is a hull and not a longer average: with a matched minimum
   window, any kernel of support width W spreads an isolated dip by exactly W on
   both sides, so a longer averaging window on the release side cannot give a
   longer release than attack while keeping the bound by construction.
-- `qp_smooth(g_req, length | attack=..., release=..., mu=...)`: banded QP
+- `qp_smooth(g_req, length | attack=..., release=..., mu=..., hold=0)`: banded QP
       minimise ||D2 g||^2 + mu ||g - h||^2   s.t.  g <= h = release_hull(u)
+  (with hold > 0 the bound is the trailing minimum min h[n-hold .. n] of the
+  hull, so each dip is held `hold` samples longer, as in box_smooth; h <= u still)
   mu defaults to length**-4 (the unconstrained smoother's -6 dB point is
   1 / length rad/sample): smoothing length and fidelity weight are one knob
   unless mu is given explicitly. The fidelity term is required; without it
@@ -208,23 +222,47 @@ def release_hull(u: np.ndarray, release: float) -> np.ndarray:
     return np.clip(h, u.min(), u, out=h)
 
 
-def _box_smooth_raw(g_req, attack: int, release: float = 0.0, g_min: float = G_MIN):
+def running_min(h: np.ndarray, left: int, right: int) -> np.ndarray:
+    """m[n] = min h[n-left .. n+right] (edges replicated), O(n) (van Herk / Gil-Werman in
+    scipy.ndimage.minimum_filter1d); left == right is the centred window."""
+    left, right = max(0, int(left)), max(0, int(right))
+    if left == 0 and right == 0:
+        return h.copy()
+    size = left + right + 1
+    # origin shifts the window: output n covers [n - size // 2 + origin ...], so a window
+    # starting at n - left needs origin = left - size // 2 (0 when left == right)
+    return minimum_filter1d(h, size=size, mode="nearest", origin=left - size // 2)
+
+
+def _hold(hold) -> int:
+    h = int(hold)
+    if h < 0:
+        raise ValueError("hold must be >= 0 samples")
+    return h
+
+
+def _box_smooth_raw(g_req, attack: int, release: float = 0.0, g_min: float = G_MIN,
+                    hold: int = 0):
     u = _ceiling(g_req, g_min)
+    hold = _hold(hold)
     if u.size == 0:
         return u, u
     h = release_hull(u, release)
     L = max(1, int(attack) // 2 + 1)
-    if L == 1:
+    if L == 1 and hold == 0:
         return h.copy(), u
-    m = minimum_filter1d(h, size=2 * L - 1, mode="nearest")  # offsets [-(L-1), L-1]
+    m = running_min(h, L - 1 + hold, L - 1)       # offsets [-(L-1)-hold, L-1]
+    if L == 1:
+        return m, u                                # a trailing hold alone, no averaging
     g = _box(_box(m, -(L - 1), 0), 0, L - 1)
     return g, u
 
 
 def box_smooth(g_req: np.ndarray, attack: int, release: float = 0.0,
-               g_min: float = G_MIN) -> np.ndarray:
-    """Lookahead min + twice-applied moving average; g <= clip(g_req, g_min, 1) exactly."""
-    g, u = _box_smooth_raw(g_req, attack, release, g_min)
+               g_min: float = G_MIN, hold: int = 0) -> np.ndarray:
+    """Lookahead min (held `hold` samples past each dip) + twice-applied moving average;
+    g <= clip(g_req, g_min, 1) exactly (module contract)."""
+    g, u = _box_smooth_raw(g_req, attack, release, g_min, hold)
     return np.clip(g, g_min, u)
 
 
@@ -279,8 +317,10 @@ def qp_smooth(
     max_iter: int = 100,
     tol: float = 1e-8,
     polish: bool = True,
+    hold: int = 0,
 ) -> tuple[np.ndarray, dict]:
-    """Smoothest envelope under g <= h = release_hull(clip(g_req, g_min, 1)).
+    """Smoothest envelope under g <= h = release_hull(clip(g_req, g_min, 1)), h held
+    `hold` samples past each dip (its trailing minimum) when hold > 0.
 
     Give `length` (samples) or `attack` (samples; length = attack /
     QP_EXTENT_RATIO) or `mu` directly; mu defaults to length**-4.
@@ -305,6 +345,9 @@ def qp_smooth(
             raise ValueError("give length, attack or mu")
         mu = float(length) ** -4.0
     h = release_hull(u, release)
+    hold = _hold(hold)
+    if hold > 0:
+        h = running_min(h, hold, 0)        # min(h) <= held h <= h <= u
     if n < 4:
         return h.copy(), {"iterations": 0, "converged": True, "polished": False,
                           "seconds": 0.0, "mu": mu, "length": mu ** -0.25}

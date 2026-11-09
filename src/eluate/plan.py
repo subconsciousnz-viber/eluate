@@ -498,7 +498,17 @@ class MultibandPlan:
     ms_link (the live profile, sprint 2026-10-21 L8): M and S of a band take one gain, the
     larger reduction of the two (compressor + ceiling) at each instant with the M makeup,
     so the band's image does not move when M and S would compress differently. The design
-    record and the budget stay per channel (what each detector asked for)."""
+    record and the budget stay per channel (what each detector asked for).
+
+    detector_window_ms (2026-11-10, audio-rate audit F3 / F4): the compressor's and the
+    ceiling's detector window per band (ms, > 0; a scalar or one value per band), the
+    trailing peak reading of multiband.detector; the planner writes
+    multiband.default_detector_window_ms(crossovers) (one period of the band's lower
+    edge, (25, 10, 3, 2, 2) ms on the default crossovers). None (plans made before, and
+    hand-built plans) is the original 2-segment detector. The planner also writes the
+    band ceilings' release per band since then (planner.CEILING_RELEASE_MS: 100 / 80 /
+    50 ms low to high) and the lowest crossover's phase (planner.xover_phases); a plan
+    records both, so saved plans render as they did."""
 
     gr_db: list[list[Envelope]]
     crossovers_hz: list[float] = field(default_factory=lambda: list(bands.DEFAULT_CROSSOVERS))
@@ -521,12 +531,25 @@ class MultibandPlan:
     mode_makeup_db: list[list[Envelope]] | None = None
     budget: dict | None = None
     ms_link: bool = False
+    detector_window_ms: float | list[float] | None = None
 
     def __post_init__(self):
         _ascending("crossovers_hz", self.crossovers_hz)
         nb = len(self.crossovers_hz) + 1
         if len(self.gr_db) != nb or any(len(p) != 2 for p in self.gr_db):
             raise ValueError(f"gr_db must be {nb} bands x [M, S]")
+        if self.detector_window_ms is not None:
+            v = self.detector_window_ms
+            if np.ndim(v) == 0:
+                self.detector_window_ms = float(v)
+                ws = [self.detector_window_ms]
+            else:
+                self.detector_window_ms = [float(a) for a in v]
+                ws = self.detector_window_ms
+                if len(ws) != nb:
+                    raise ValueError(f"detector_window_ms must be a scalar or {nb} values")
+            if not all(math.isfinite(a) and a > 0.0 for a in ws):
+                raise ValueError("detector_window_ms must be finite and > 0")
         if self.ceiling_gr_db is not None:
             if len(self.ceiling_gr_db) != nb or any(len(p) != 2 for p in self.ceiling_gr_db):
                 raise ValueError(f"ceiling_gr_db must be {nb} bands x [M, S]")
@@ -831,7 +854,10 @@ class GluePlan:
     curve, whose even-harmonic term engages above it. budget (chunk 3, glue.design_budget):
     the design record of the budget solve, {"mode": "serial" | "parallel", the
     targets, and once designed the wet and net peak GR and the warnings}; with it
-    set the threshold (and in parallel mode the mix) are solved on the glue input."""
+    set the threshold (and in parallel mode the mix) are solved on the glue input.
+    attack_applied_ms (2026-11-10): the attack the envelope was built with, attack_ms
+    floored at glue.ATTACK_FLOOR_MS (3 ms); None on plans made before (the render never
+    reads it: apply uses the envelope)."""
 
     gain_db: Envelope
     mix: float = 0.5
@@ -843,13 +869,19 @@ class GluePlan:
     attack_ms: float = 30.0
     release_ms: float = 300.0
     budget: dict | None = None
+    attack_applied_ms: float | None = None
 
     def __post_init__(self):
         if self.budget is not None and self.budget.get("mode") not in GLUE_MODES:
             raise ValueError(f"glue budget mode must be one of {GLUE_MODES}")
         _finite("glue", [self.mix, self.makeup_db, self.ratio, self.knee_db, self.attack_ms,
                          self.release_ms]
-                + ([] if self.threshold_db is None else [self.threshold_db]))
+                + ([] if self.threshold_db is None else [self.threshold_db])
+                + ([] if self.attack_applied_ms is None else [self.attack_applied_ms]))
+        if self.attack_applied_ms is not None:
+            self.attack_applied_ms = float(self.attack_applied_ms)
+            if self.attack_applied_ms <= 0:
+                raise ValueError("attack_applied_ms must be > 0")
         if np.any(self.gain_db.values > GLUE_MAX_GAIN_DB):
             raise ValueError(f"glue gain_db must be <= {GLUE_MAX_GAIN_DB} dB")
         if not 0.0 <= self.mix <= 1.0:
@@ -922,7 +954,19 @@ class LimiterPlan:
     second-order split, limiter.clip_hi_part): spans are found on that part, the curve
     is applied to it and the change added back, so the sub passes to the limiter
     untouched. The threshold is then solved on that part's per-hit output peak. None
-    (old plans) keeps the full-band clipper."""
+    (old plans) keeps the full-band clipper.
+
+    hold_ms (2026-11-10, audio-rate audit F2): the 8x limiter's gain is held at each
+    peak's value for this long before the release starts (envelope.box_smooth hold, also
+    in the base-rate re-limit), so a sustained 30 to 40 Hz sub at 3 dB of GR no longer
+    ripples inside each half cycle. The planner writes planner.LIMITER_HOLD_MS (25 ms);
+    None (plans made before) or 0 is the original smoother, bit for bit.
+
+    aim_margin_db (2026-11-10, planner audit S4-6): the 8x limiter aims this far under
+    the ceiling (dB, in [0, 1]), so the decimated output's 8x / 32x / Annex 2 peaks
+    land under the ceiling and the base-rate re-limit is the exception, not a second
+    limiter over the whole track. The planner writes planner.LIMITER_AIM_MARGIN_DB;
+    None (plans made before) or 0 aims at the ceiling, bit for bit."""
 
     ceiling_dbtp: float = -0.3
     input_gain_db: float = 0.0
@@ -947,8 +991,18 @@ class LimiterPlan:
     clip_split_hz: float | None = None
     speclim_max_cut_db: float | None = None
     speclim_lookahead_ms: float | list[float] | None = None
+    hold_ms: float | None = None
+    aim_margin_db: float | None = None
 
     def __post_init__(self):
+        if self.aim_margin_db is not None:
+            self.aim_margin_db = float(self.aim_margin_db)
+            if not (math.isfinite(self.aim_margin_db) and 0.0 <= self.aim_margin_db <= 1.0):
+                raise ValueError("aim_margin_db must lie in [0, 1]")
+        if self.hold_ms is not None:
+            self.hold_ms = float(self.hold_ms)
+            if not (math.isfinite(self.hold_ms) and self.hold_ms >= 0.0):
+                raise ValueError("hold_ms must be finite and >= 0")
         if self.speclim_lookahead_ms is not None:
             v = self.speclim_lookahead_ms
             self.speclim_lookahead_ms = float(v) if np.ndim(v) == 0 else [float(a) for a in v]

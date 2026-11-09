@@ -210,3 +210,45 @@ def test_rejects_bad_arguments():
     bad[5, 1] = np.inf
     with pytest.raises(ValueError):
         bands.split(bad, 48000)
+
+
+def _split_whole_2026_11_09(x, fs, fcs, order=2, phase="zero"):
+    """bands.split's minimum-phase path as it was before split_iter streamed it: every
+    band computed, then the allpasses of the crossovers above each band applied."""
+    from scipy import signal
+    x = np.asarray(x, dtype=np.float64)
+    modes = [phase] * len(fcs) if isinstance(phase, str) else list(phase)
+    pl = bands.padlen(None, fs, min(fcs)) if "zero" in modes else 0
+    out, aps, r = [], [], x
+    for fc, mode in zip(fcs, modes):
+        lp = signal.butter(order, fc, btype="lowpass", fs=fs, output="sos")
+        if mode == "zero":
+            lo = bands._zero_low(r, lp, pl, "zero")
+            hi = r - lo
+            aps.append(None)
+        else:
+            hp = signal.butter(order, fc, btype="highpass", fs=fs, output="sos")
+            lo = signal.sosfilt(lp, signal.sosfilt(lp, r, axis=0), axis=0)
+            hi = signal.sosfilt(hp, signal.sosfilt(hp, r, axis=0), axis=0)
+            aps.append(bands.allpass_sos(lp))
+        out.append(lo)
+        r = hi
+    out.append(r)
+    for k in range(len(out)):
+        for j in range(k + 1, len(fcs)):
+            if aps[j] is not None:
+                out[k] = signal.sosfilt(aps[j], out[k], axis=0)
+    return np.stack(out)
+
+
+@pytest.mark.parametrize("phase", ["minimum", ["minimum", "zero", "zero", "zero"],
+                                   ["zero", "minimum", "zero", "minimum"]])
+def test_streamed_minimum_split_is_bit_identical_to_the_whole_split(phase):
+    """2026-11-10: split_iter streams minimum-phase crossovers too (one band alive at a
+    time); the bands are bit-identical to the whole-split computation used before."""
+    fs = 48000
+    x = np.random.default_rng(9).standard_normal((fs, 2)) * 0.1
+    ref = _split_whole_2026_11_09(x, fs, bands.DEFAULT_CROSSOVERS, phase=phase)
+    got = np.stack(list(bands.split_iter(x, fs, bands.DEFAULT_CROSSOVERS, phase=phase)))
+    assert np.array_equal(got, ref)
+    assert np.array_equal(bands.split(x, fs, bands.DEFAULT_CROSSOVERS, phase=phase), ref)

@@ -144,7 +144,6 @@ import time
 from dataclasses import asdict, dataclass, replace
 
 import numpy as np
-from scipy.ndimage import minimum_filter1d
 from scipy.optimize import brentq
 
 from eluate import envelope, meter, parallel, planner
@@ -220,11 +219,13 @@ def _hull_carry(u: np.ndarray, release: float, carry_db: float | None) -> np.nda
     return envelope.release_hull(np.concatenate([[u0], u]), release)[1:]
 
 
-def _box_tail(h: np.ndarray, L: int) -> np.ndarray:
-    """Steps 2-3 of envelope.box_smooth on a hull (no clip)."""
-    if L == 1:
+def _box_tail(h: np.ndarray, L: int, hold: int = 0) -> np.ndarray:
+    """Steps 2-3 of envelope.box_smooth on a hull (no clip), hold as there."""
+    if L == 1 and hold == 0:
         return h.copy()
-    m = minimum_filter1d(h, size=2 * L - 1, mode="nearest")
+    m = envelope.running_min(h, L - 1 + hold, L - 1)
+    if L == 1:
+        return m
     return envelope._box(envelope._box(m, -(L - 1), 0), 0, L - 1)
 
 
@@ -305,8 +306,11 @@ def limit_blocked(x: np.ndarray, fs: float, plan: LimiterPlan, block: int = BLOC
     hb = c8 // L + 2                             # in base samples, with slack
     attack = max(lim.ATTACK_FLOOR, int(round(plan.attack_ms * 1e-3 * fs_up)))
     release = plan.release_ms * 1e-3 * fs_up
+    hold = lim.hold_samples(plan, fs_up)         # the smoother's hold, 8x samples
+    aim = lim.aim(ceiling, plan)                 # the 8x limiter's target level
     Lb = max(1, attack // 2 + 1)
     sup = 2 * (Lb - 1)                           # box smoother support, 8x samples
+    sup_l = sup + hold                           # its reach to the left (the hold looks back)
     m_bl = lim.BL_MARGIN * L
     spans, ramp = ([], 0)
     whole = plan.clip_threshold_db is not None
@@ -332,7 +336,7 @@ def limit_blocked(x: np.ndarray, fs: float, plan: LimiterPlan, block: int = BLOC
         """Clipper, band-limit and detector of one block: independent of every other."""
         c1 = min(n, c0 + block)
         p0, p1 = max(0, (c0 - hb) * L), min(n8, (c1 + hb) * L)      # decimation input
-        g0, g1 = max(0, p0 - sup), min(n8, p1 + sup)                # gain needed here
+        g0, g1 = max(0, p0 - sup_l), min(n8, p1 + sup)              # gain needed here
         sel = np.flatnonzero((span_hi > g0) & (span_lo < g1)) if spans else np.zeros(0, int)
         r8_lo = min([g0] + [int(span_lo[i]) for i in sel])
         r8_hi = max([g1] + [int(span_hi[i]) for i in sel])
@@ -371,7 +375,7 @@ def limit_blocked(x: np.ndarray, fs: float, plan: LimiterPlan, block: int = BLOC
         if denv is not None:
             denv[c0:c1] = det[L * c0 - g0:L * c1 - g0].reshape(c1 - c0, L).max(axis=1)
         if not measure_only:
-            f["uu"] = np.clip(envelope.required_gain(det, ceiling), envelope.G_MIN, 1.0)
+            f["uu"] = np.clip(envelope.required_gain(det, aim), envelope.G_MIN, 1.0)
             f["v"] = ubl[p0 - off:p1 - off]
         return f
 
@@ -379,7 +383,7 @@ def limit_blocked(x: np.ndarray, fs: float, plan: LimiterPlan, block: int = BLOC
         """Box smoother, gain and decimation of one block, given its hull; the block's
         minimum gain."""
         c0, c1, p0, p1, g0 = f["c0"], f["c1"], f["p0"], f["p1"], f["g0"]
-        g = np.clip(_box_tail(f.pop("hh"), Lb), envelope.G_MIN, f.pop("uu"))
+        g = np.clip(_box_tail(f.pop("hh"), Lb, hold), envelope.G_MIN, f.pop("uu"))
         k0, k1 = L * c0 - g0, L * c1 - g0
         gmin = float(g[k0:k1].min())
         v = f.pop("v") * g[p0 - g0:p1 - g0, None]
@@ -415,7 +419,7 @@ def limit_blocked(x: np.ndarray, fs: float, plan: LimiterPlan, block: int = BLOC
             # the next block's region starts at g0' and needs the hull just before it:
             # carry that one scalar (audit 07 A3)
             if c1 < n:
-                g0n = max(0, max(0, (c1 - hb) * L) - sup)
+                g0n = max(0, max(0, (c1 - hb) * L) - sup_l)
                 j = g0n - 1 - g0
                 if not 0 <= j < hh.size:
                     raise RuntimeError("hull carry index outside this block")
@@ -519,34 +523,9 @@ def limiter_input_gain(z: np.ndarray, fs: float, plan: LimiterPlan,
 
 
 def _relimit(y: np.ndarray, fs: float, plan: LimiterPlan, ceiling: float):
-    """limiter.apply_with_info steps 6-7 on the decimated output."""
-    e8, e32, e4 = lim._peak_envelopes(y, fs)
-    tp8_0, tp32_0 = lim._db(e8.max(initial=0.0)), lim._db(e32.max(initial=0.0))
-    e = np.maximum(np.maximum(e8, e32), e4)
-    passes = []
-    target = ceiling * 10.0 ** (-lim.RELIMIT_MARGIN_DB / 20.0)
-    a_base = max(lim.ATTACK_FLOOR, int(round(plan.attack_ms * 1e-3 * fs)))
-    r_base = plan.release_ms * 1e-3 * fs
-    for _ in range(lim.RELIMIT_PASSES):
-        if e.size == 0 or e.max() <= ceiling:
-            break
-        g2 = envelope.box_smooth(envelope.required_gain(e, target), attack=a_base,
-                                 release=r_base)
-        y = y * g2[:, None]
-        passes.append({"samples": int(np.count_nonzero(g2 < 1.0)),
-                       "max_reduction_db": float(-20.0 * np.log10(g2.min()))})
-        e8, e32, e4 = lim._peak_envelopes(y, fs)
-        e = np.maximum(np.maximum(e8, e32), e4)
-    tp8, tp32 = lim._db(e8.max(initial=0.0)), lim._db(e32.max(initial=0.0))
-    trim_db = 0.0
-    worst = max(tp8, tp32, lim._db(e4.max(initial=0.0)))
-    if worst > plan.ceiling_dbtp:
-        trim_db = plan.ceiling_dbtp - worst
-        y = y * 10.0 ** (trim_db / 20.0)
-    return y, {"true_peak_8x_before_relimit_dbtp": tp8_0,
-               "true_peak_32x_before_relimit_dbtp": tp32_0, "relimit_passes": passes,
-               "true_peak_8x_dbtp": tp8 + trim_db, "true_peak_32x_dbtp": tp32 + trim_db,
-               "trim_db": trim_db}
+    """limiter.apply_with_info steps 6-7 on the decimated output (limiter.relimit: the
+    same code, so the blocked and the whole-track limiter stay identical)."""
+    return lim.relimit(y, fs, plan, ceiling)
 
 
 def clip_hi_for(z: np.ndarray, fs: float, plan: LimiterPlan) -> np.ndarray | None:
