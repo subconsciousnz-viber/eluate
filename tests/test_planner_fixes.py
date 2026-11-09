@@ -77,6 +77,77 @@ def test_loud_hits_fallback_still_fills_sixteen_from_gated_hits():
     assert envelope.loud_hits(x, FS, e).sum() == envelope.LOUD_MIN_HITS
 
 
+def test_no_hit_above_the_gate_means_no_loud_hits():
+    """A hit is loud only when its 1 s window and its own RMS pass the -70 dBFS gate; when
+    no hit does, the mask is all False (no loud hits), never the 16 loudest of the floor."""
+    n = 10 * FS
+    x = np.full((n, 2), 1e-27)
+    x[3 * FS:3 * FS + 64] = 0.5                       # a 1.5 ms click: its hit is loud
+    e = np.array([0.0, 2.0, 2.9999, 3.01, 5.0, 10.0])
+    assert envelope.loud_hits(x, FS, e).tolist() == [False, False, True, False, False]
+    # one 0.1 sample: its 1 s window reads -66 dBFS (gated in), but the 9 s hit holding
+    # it reads -76 dBFS and the other hit is the floor: no hit is loud
+    x = np.full((n, 2), 1e-27)
+    x[FS // 2] = 0.1
+    e = np.array([0.0, 9.0, 10.0])
+    assert envelope.loud_hits(x, FS, e).tolist() == [False, False]
+    assert envelope.has_loud(None) and envelope.has_loud({"loud": None})
+    assert not envelope.has_loud({"edges_s": e, "loud": np.zeros(2, dtype=bool)})
+
+
+def test_every_budget_solve_leaves_its_stage_alone_without_loud_hits():
+    """S3-2b, the callers: with no loud hit the multiband, glue, clipper, frequency-dependent
+    limiter and the limiter's average term do not compress (no near-silent reading)."""
+    x, beats = _two_bursts(1e-27)
+    h = envelope.hits_for(x, FS, beats)
+    none = {"edges_s": h["edges_s"], "loud": np.zeros_like(h["loud"])}
+    v = bands.split(bands.to_ms(x), FS, [100.0, 400.0, 1600.0, 6400.0])[2, :, 0]
+    sol = mb.threshold_for_peak_gr(v, FS, 2.5, 2.0, 10.0, 100.0, 6.0, 1000.0, none)
+    assert sol["peak_gr_db"] == 0.0 and sol["bound"] is None
+    p0 = mb.design(x, FS, -20.0, crossovers_hz=[100.0, 400.0, 1600.0, 6400.0])
+    p0.budget = mb.default_budget("peak")
+    p = mb.design_budget(x, FS, p0, hits=none)
+    assert all(r["no_loud_hits"] and r["comp_target_db"] == 0.0 and r["limit_target_db"] == 0.0
+               for row in p.budget["result"] for r in row)
+    assert all(np.all(np.asarray(g.values) == 0.0) for row in p.gr_db for g in row)
+    assert p.ceiling_db is None
+    g = planner.design_glue(x, FS, planner.glue_unrealised(None, mode="serial"), none)
+    assert np.all(g.gain_db.values == 0.0) and g.budget["no_loud_hits"]
+    lp = LimiterPlan(input_gain_db=0.0, clip_threshold_db=-20.0, clip_knee_db=1.0)
+    c = solver.clip_threshold_for_average_peak(x, FS, lp, 1.0, none)
+    assert c["peak_gr_db"] == 0.0 and c["threshold_db"] > -20.0
+    pk = solver.limiter_peaks(x, FS, replace(lp, clip_threshold_db=None), none)
+    assert pk["average_peak_dbfs"] == pk["peak_dbfs"]
+    plan = Plan(fs=FS, hits=planner.HitsPlan(beats_s=list(beats), loud=[False] * len(none["loud"])),
+                limiter=LimiterPlan(speclim_allow_db=3.0))
+    assert planner.design_speclim(plan, x, FS) is None
+    (w,) = [w for w in planner.budget_report(plan)["warnings"] if w["stage"] == "hits"]
+    assert w["kind"] == "no loud hits" and "do not compress" in w["text"]
+
+
+@pytest.mark.slow
+def test_dc_premaster_budgets_on_its_real_hits():
+    """The audit's DC case (0.5 DC, 8 s, edge_cases.log "DC 0.5 8s"): the input EQ's HPF
+    leaves -540 dBFS between the edge transients; the multiband thresholds sat at -545 to
+    -842 dBFS, the clipper's at -732 dBFS and the limiter asked for its 36 dB drive-range
+    end. Now no budget is solved on a hit below the gate."""
+    n = 8 * FS
+    x = np.full((n, 2), 0.5)
+    a = planner.analyse(x, FS)
+    assert a["meta"]["crossovers"] == list(bands.DEFAULT_CROSSOVERS) or         tuple(a["meta"]["crossovers"]) == tuple(bands.DEFAULT_CROSSOVERS)   # no key lock
+    p = planner.realise(planner.plan_from_analysis(a, planner.Controls(), x), x, FS)
+    thr = np.asarray(p.multiband.threshold_db, dtype=np.float64)
+    assert np.all(np.isfinite(thr)) and thr.min() > -120.0
+    lb = p.limiter.budget
+    if lb.get("clipper") is not None:
+        assert p.limiter.clip_threshold_db is None or p.limiter.clip_threshold_db > -120.0
+    lim = lb["limiter"]
+    assert lim["clipped_average_peak_dbfs"] is None or lim["clipped_average_peak_dbfs"] > -120.0
+    assert lim["requested_gain_db"] is None or lim["requested_gain_db"] < 30.0
+    if p.glue is not None and p.glue.threshold_db is not None:
+        assert p.glue.threshold_db > -120.0
+
+
 # ------------------------------------------------------------ S2-3: the threshold floor
 
 def _sparse_top():
@@ -628,32 +699,47 @@ def test_composite_clamp_bound_holds_with_smooth_envelopes():
 
 # ------------------------------------------------------------ S2-4, S4-6: budget_report
 
-def _limiter_plan(split):
+def _limiter_plan(split, full=None):
+    clip = {"target_db": 1.0, "peak_gr_db": 0.9, "outlier_gr_db": 1.4,
+            "budget_db": 3.0, "outlier_cap_db": 3.0, "curve_gr_db": 1.2, "threshold_db": -6.0,
+            "input_peak_8x_dbfs": -9.6, "split_hz": split, "warnings": []}
+    if full is not None:
+        clip["input_peak_8x_full_dbfs"] = full
     lp = LimiterPlan(clip_threshold_db=-6.0, clip_target_db=1.0, max_gr_db=3.0,
                      input_gain_db=10.0, clip_split_hz=split,
-                     budget={"clipper": {"target_db": 1.0, "peak_gr_db": 0.9, "outlier_gr_db": 1.4,
-                                         "budget_db": 3.0, "outlier_cap_db": 3.0,
-                                         "curve_gr_db": 1.2, "threshold_db": -6.0,
-                                         "input_peak_8x_dbfs": -9.6, "split_hz": split,
-                                         "warnings": []},
+                     budget={"clipper": clip,
                              "limiter": {"planned_gr_db": 2.0, "planned_outlier_gr_db": 3.0,
                                          "budget_db": 3.0, "outlier_cap_db": 5.0,
                                          "input_gain_db": 10.0, "requested_gain_db": 12.0,
-                                         "warnings": []}})
+                                         "clipped_peak_dbfs": -10.5, "warnings": []}})
     return Plan(fs=FS, limiter=lp)
 
 
-def test_clipper_rendered_fall_only_when_it_acts_on_the_whole_signal():
-    info = {"detector_peak_dbfs": -0.8, "max_gain_reduction_db": 2.3, "relimit_passes": []}
+def test_clipper_rendered_fall_compares_like_with_like():
+    """S2-4: the rendered track-peak fall reads the full signal's 8x input peak against the
+    render's (full-signal) detector peak, with or without clip_split_hz; the solve's input
+    peak above the split is never mixed with the full detector peak."""
+    info = {"detector_peak_dbfs": -0.8, "max_gain_reduction_db": 2.3, "relimit_passes": [],
+            "clip_max_reduction_db": 1.25}
     cs = planner.budget_report(_limiter_plan(None), info)["stages"]["clipper"]
-    assert cs["rendered_db"] == pytest.approx(-9.6 + 10.0 + 0.8) and "rendered_note" not in cs
+    assert cs["rendered_db"] == pytest.approx(-9.6 + 10.0 + 0.8)
+    assert cs["planned_track_db"] == pytest.approx(-9.6 + 10.5)
+    assert cs["rendered_curve_db"] == 1.25 and cs["rendered_on"] == "track peak, full signal"
+    # with a split: the full-signal peak (-8.4), not the part above the split (-9.6)
+    cs = planner.budget_report(_limiter_plan(87.3, full=-8.4), info)["stages"]["clipper"]
+    assert cs["rendered_db"] == pytest.approx(-8.4 + 10.0 + 0.8)
+    assert cs["planned_track_db"] == pytest.approx(-8.4 + 10.5)
+    # an old plan with a split and no full-signal peak: not measured, said so
     cs = planner.budget_report(_limiter_plan(87.3), info)["stages"]["clipper"]
     assert cs["rendered_db"] is None and "above 87.3 Hz" in cs["rendered_note"]
+    assert "planned_track_db" not in cs
     assert cs["planned_db"] == 0.9 and cs["status"] == "ok"
-    assert "rendered_db" not in planner.budget_report(_limiter_plan(87.3))["stages"]["clipper"]
+    assert "rendered_db" not in planner.budget_report(_limiter_plan(87.3, -8.4))["stages"]["clipper"]
 
 
 def test_limiter_row_carries_the_relimit():
+    """S4-6: the base-rate re-limit's passes, largest reduction and share of samples, read
+    from lim_info["relimit"] when the limiter reports it, else from relimit_passes."""
     info = {"detector_peak_dbfs": -0.8, "max_gain_reduction_db": 2.3, "trim_db": 0.0,
             "samples": 1_000_000,
             "relimit_passes": [{"samples": 980_000, "max_reduction_db": 0.29},
@@ -663,28 +749,42 @@ def test_limiter_row_carries_the_relimit():
     assert st["relimit"] == {"passes": 2, "max_db": 0.29, "samples": 980_000, "fraction": 0.98,
                              "trim_db": 0.0}
     assert st["rendered_total_max_db"] == pytest.approx(2.59)
-    st = planner.budget_report(_limiter_plan(None),
-                               {"max_gain_reduction_db": 1.0})["stages"]["limiter"]
-    assert st["relimit"] == {"passes": 0, "max_db": 0.0, "samples": 0, "fraction": None,
+    # the limiter's own record wins (a count of passes, or a list)
+    info2 = dict(info, relimit={"passes": 1, "max_db": 0.4, "fraction": 0.5})
+    st = planner.budget_report(_limiter_plan(None), info2)["stages"]["limiter"]
+    assert st["relimit"]["passes"] == 1 and st["relimit"]["max_db"] == 0.4
+    assert st["relimit"]["fraction"] == 0.5 and st["rendered_total_max_db"] == pytest.approx(2.7)
+    info3 = {"max_gain_reduction_db": 1.0, "samples": 1000,
+             "relimit": {"passes": [{"samples": 250, "max_reduction_db": 0.1}]}}
+    st = planner.budget_report(_limiter_plan(None), info3)["stages"]["limiter"]
+    assert st["relimit"] == {"passes": 1, "max_db": 0.1, "samples": 250, "fraction": 0.25,
                              "trim_db": None}
+    # None-safe: no re-limit figures in the info, or relimit None
+    for i in ({"max_gain_reduction_db": 1.0}, {"max_gain_reduction_db": 1.0, "relimit": None}):
+        st = planner.budget_report(_limiter_plan(None), i)["stages"]["limiter"]
+        assert st["relimit"] is None and "rendered_total_max_db" not in st
     assert "relimit" not in planner.budget_report(_limiter_plan(None))["stages"]["limiter"]
 
 
 @pytest.mark.slow
-def test_clipper_rendered_fall_agrees_with_the_solve_without_a_split(pana):
-    """On the synthetic loop with the clipper on the whole signal, the render's track-peak
-    fall agrees with the solve's curve reduction at that peak within 0.2 dB (the
-    band-limit's rebound), and the render reports its sample count for the re-limit share."""
+@pytest.mark.parametrize("split", [True, False])
+def test_clipper_planned_and_rendered_track_fall_agree(pana, split):
+    """On the synthetic loop, with the planner's clip_split_hz and with the clipper on the
+    whole signal, the render's track-peak fall agrees with the solve's within 0.2 dB, and
+    the render reports its sample count for the re-limit share."""
     x, a = pana
     p = planner.plan_from_analysis(a, planner.Controls())
-    p = replace(p, limiter=replace(p.limiter, clip_split_hz=None))
+    if not split:
+        p = replace(p, limiter=replace(p.limiter, clip_split_hz=None))
+    assert (p.limiter.clip_split_hz is not None) == split
     p = planner.realise(p, x, FS)
     y, info, _ = solver.render_plan(x, FS, p)
     assert info["samples"] == x.shape[0]
     cs = planner.budget_report(p, info)["stages"]["clipper"]
     assert cs["rendered_db"] is not None and cs["rendered_db"] >= -0.05
-    assert abs(cs["rendered_db"] - cs["curve_db"]) < 0.2
-    assert cs["rendered_db"] <= cs["outlier_db"] + 0.2
+    assert abs(cs["rendered_db"] - cs["planned_track_db"]) < 0.2
+    assert abs(cs["rendered_curve_db"] - cs["curve_db"]) < 0.2
+    assert cs["rendered_db"] <= cs["curve_db"] + 0.2
     st = planner.budget_report(p, info)["stages"]["limiter"]
     assert st["relimit"]["passes"] == len(info["relimit_passes"])
     assert 0.0 <= (st["relimit"]["fraction"] or 0.0) <= 1.0

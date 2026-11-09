@@ -119,6 +119,8 @@ envelope design above, on the band as the stage splits it:
   target still short warns kind "unreachable" instead (with "threshold_db", "floor_db",
   "bound" "level floor" | "bracket floor", "level_db"), and its result row carries
   "bound" and "threshold_floor_db" (planner.budget_report: status "target unreachable").
+  Hits with no loud hit (envelope.has_loud) leave every channel uncompressed, as a gated
+  one, its row marked "no_loud_hits".
   The
   envelopes are then built by `design` with the solved values, so they are
   exactly the ones solved. Makeup mode budget["makeup"]: "peak" = + the band's
@@ -482,10 +484,13 @@ def threshold_for_peak_gr(v: np.ndarray, fs: float, target_db: float, ratio: flo
     100 % of the time; a threshold more than BRACKET_BELOW_LEVEL_DB under the band's body
     compresses the body, not its peaks). When the floor binds and the target is still
     short, "bound" is "level floor" (or "bracket floor") and the threshold returned is
-    the floor's; design_budget then warns kind "unreachable"."""
+    the floor's; design_budget then warns kind "unreachable". hits with no loud hit
+    (envelope.has_loud) read as a zero target: no compression."""
     v = np.asarray(v, dtype=np.float64)
     if not 0.0 <= target_db <= MULTIBAND_MAX_GR_DB:
         raise ValueError(f"target_db must lie in [0, {MULTIBAND_MAX_GR_DB}]")
+    if not envelope.has_loud(hits):
+        target_db = 0.0                  # no loud hits: nothing to compress (S3-2b)
     det = detector(v, fs, control_length(v.shape[0], fs, rate_hz), rate_hz)
     pk = float(det.max()) if det.size else 0.0
     if pk <= 0.0:
@@ -700,13 +705,17 @@ def design_budget(x: np.ndarray, fs: float, plan: MultibandPlan,
             return sol, v * 10.0 ** ((g + makeup_kc[k][c]) / 20.0)
 
         gated = bool(np.isfinite(full_db) and not lvl >= full_db - GATE_BELOW_INPUT_DB)
-        if gated:
+        # no loud hits (envelope.has_loud: every hit below the -70 dBFS gate): nothing to
+        # budget, the channel is left uncompressed like a gated one (audit 2026-11-10 S3-2b)
+        quiet = not envelope.has_loud(hits)
+        if gated or quiet:
             sol, _ = comp(0.0)
             thr[k, c] = sol["threshold_db"]
             return ({"crest_db": float(crest) if np.isfinite(crest) else None,
                      "ratio": float(rat[k, c]), "threshold_db": float(thr[k, c]),
                      "comp_target_db": 0.0, "limit_need_db": 0.0,
                      "limit_target_db": 0.0, "exception": False, "gated": True,
+                     "no_loud_hits": quiet,
                      "level_db": float(lvl) if np.isfinite(lvl) else None,
                      "budget_db": float(normal)}, gate, warns, warns_avg)
         sol, after = comp(comp_t)

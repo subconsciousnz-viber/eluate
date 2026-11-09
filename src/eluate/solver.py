@@ -444,13 +444,15 @@ def limiter_peaks(z: np.ndarray, fs: float, plan: LimiterPlan, hits: dict | None
     """The limiter's 8x detector peaks at 0 dB input gain on the clipper's output
     (limit_blocked measure_only): {"peak_dbfs" (the track's, the outlier reading),
     "average_peak_dbfs" (the median over the loud hits of each hit's peak; the track's
-    without hits)}. The whole-signal clipper's threshold sits before the gain, so both
-    move dB for dB with it."""
+    without hits or without a loud hit)}. The whole-signal clipper's threshold sits
+    before the gain, so both move dB for dB with it."""
     m = limit_blocked(z, fs, replace(plan, input_gain_db=0.0), block, measure_only=True,
                       detector_env=hits is not None)
     p = m["detector_peak_dbfs"]
     avg = p
-    if hits is not None and math.isfinite(p):
+    # no loud hits (envelope.has_loud): the track's peak is the average term too, so the
+    # gain is never pushed by near-silent hits (audit 2026-11-10 S3-2b)
+    if hits is not None and math.isfinite(p) and envelope.has_loud(hits):
         pk = hit_peaks_db(m["detector_env"], fs, hits["edges_s"])
         avg = envelope.summarise_hits(pk, hits["loud"])["average_db"] if np.any(
             np.isfinite(pk)) else p
@@ -722,7 +724,10 @@ def clip_threshold_for_average_peak(y: np.ndarray, fs: float, plan: LimiterPlan,
     curve's reduction at the track's 8x peak), "peak_8x_dbfs", "bound" ("outlier",
     "sample cap" or None)}. With plan.clip_split_hz the solve runs on the part of y above
     it (limiter.clip_hi_part), the signal the clipper acts on: every reading (the input
-    peaks, the falls, peak_8x_dbfs) is that part's."""
+    peaks, the falls, peak_8x_dbfs) is that part's. Hits with no loud hit
+    (envelope.has_loud) read as a zero target: no clipping."""
+    if not envelope.has_loud(hits):
+        target_db = 0.0              # no loud hits: no clipping (audit 2026-11-10 S3-2b)
     if plan.clip_split_hz is not None:
         y = lim.clip_hi_part(np.asarray(y, dtype=np.float64), fs, plan.clip_split_hz)
     base = replace(plan, input_gain_db=0.0, clip_depth_db=0.0, clip_onsets_s=[],

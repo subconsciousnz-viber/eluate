@@ -533,7 +533,8 @@ def _noise(d: Doc, rep):
 
 def _flags(d: Doc, rep):
     d.h(2, "Warnings and flags")
-    items = [w["text"] if w.get("stage") == "tempo" and w.get("text") else
+    # the planner's own notes (a --bpm off the detected grid, no loud hits) carry their text
+    items = [w["text"] if w.get("stage") in ("tempo", "hits") and w.get("text") else
              evaluate.warning_text(w, rep) for w in rep.get("warnings") or []]
     items += rep.get("flags") or []
     d.ul(items or ["None."])

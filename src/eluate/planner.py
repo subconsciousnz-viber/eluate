@@ -54,11 +54,11 @@ Contract:
   chain order on each stage's real input (multiband.design_budget, design_glue, design_limiter);
   `budget_report` collects per-stage peak GR against budget and the warnings (a
   multiband row whose threshold search stopped at its floor short of the target reads
-  status "target unreachable", S2-3; the clipper's rendered output-peak fall is given
-  only when the clipper acts on the whole signal, S2-4: with clip_split_hz the solve's
-  reading is on the part above the split and the render's detector peak is the full
-  signal's; the limiter row carries the base-rate re-limit's passes, largest reduction
-  and share of samples touched, S4-6). plan_record also carries "tempo"
+  status "target unreachable", S2-3; the clipper row's planned_track_db and rendered_db
+  are both the full signal's track-peak fall, like with like when clip_split_hz is set,
+  S2-4: the solve records the full signal's 8x input peak next to the part above the
+  split; the limiter row carries the base-rate re-limit's passes, largest reduction and
+  share of samples touched, `relimit_summary`, S4-6; no loud hit adds a "hits" warning). plan_record also carries "tempo"
   (`tempo_record`: the tempo used, its source and, for a user tempo, the detected one
   with a "disagreement" warning past TEMPO_DISAGREE_PCT) and "sidestrip"
   (`sidestrip_choice`: the request, the rule and the clip to SUBSIDE_RANGE_HZ).
@@ -2115,7 +2115,7 @@ def plan_hits(analysis: dict, controls: "Controls") -> HitsPlan:
 def design_speclim(plan: Plan, y: np.ndarray, fs: float):
     """The frequency-dependent limiter on y, the glue's output (multiband.design_speclim on
     the multiband's crossovers, over the stage's hits), or None when the limiter section
-    does not ask for it or no band needs a ceiling."""
+    does not ask for it, no band needs a ceiling or there is no loud hit."""
     lp = plan.limiter
     if lp is None or lp.speclim_allow_db is None:
         return None
@@ -2130,8 +2130,10 @@ def design_speclim(plan: Plan, y: np.ndarray, fs: float):
     look = SPECLIM_LOOKAHEAD_MS if lp.speclim_lookahead_ms is None else lp.speclim_lookahead_ms
     if np.ndim(look):
         look = _per_band(look, nb)
-    return mb_stage.design_speclim(y, fs, xo, allow, cut, look, rel,
-                                   hits=stage_hits(plan, y, fs))
+    hits = stage_hits(plan, y, fs)
+    if not envelope.has_loud(hits):
+        return None                   # no loud hit: no typical peak to hold the bands to
+    return mb_stage.design_speclim(y, fs, xo, allow, cut, look, rel, hits=hits)
 
 
 def stage_hits(plan: Plan, y: np.ndarray, fs: float) -> dict | None:
@@ -2156,7 +2158,10 @@ def freeze_hits(plan: Plan, pre: np.ndarray, fs: float) -> Plan:
 
 def design_glue(y: np.ndarray, fs: float, g: GluePlan, hits: dict | None = None) -> GluePlan:
     """The glue section realised on its input y: the budget solve (glue.design_budget,
-    over hits) when g has a budget, else the threshold rule at g's mix."""
+    over hits) when g has a budget, else the threshold rule at g's mix. Hits with no loud
+    hit (envelope.has_loud) give a glue that does not compress (`_glue_off`)."""
+    if g.budget is not None and not envelope.has_loud(hits):
+        return _glue_off(y, fs, g)
     if g.budget is not None:
         return glue_stage.design_budget(y, fs, g.budget["mode"], ratio=g.ratio,
                                         knee_db=g.knee_db, attack_ms=g.attack_ms,
@@ -2167,6 +2172,26 @@ def design_glue(y: np.ndarray, fs: float, g: GluePlan, hits: dict | None = None)
     return glue_stage.design(y, fs, thr, ratio=g.ratio, knee_db=g.knee_db,
                              attack_ms=g.attack_ms, release_ms=g.release_ms, curve=g.curve,
                              mix=g.mix, makeup_db=g.makeup_db)
+
+
+def _glue_off(y: np.ndarray, fs: float, g: GluePlan) -> GluePlan:
+    """The budget glue with no loud hit to read (audit 2026-11-10 S3-2b): its threshold
+    above the signal's peak plus the knee, so it never compresses; the budget record
+    reads zero GR and "no_loud_hits" True."""
+    pk = float(np.max(np.abs(y))) if np.size(y) else 0.0
+    top = 20.0 * math.log10(pk) if pk > 0.0 else 0.0
+    serial = g.budget["mode"] == "serial"
+    p = glue_stage.design(y, fs, top + g.knee_db / 2.0 + 1.0, ratio=g.ratio, knee_db=g.knee_db,
+                          attack_ms=g.attack_ms, release_ms=g.release_ms, curve=g.curve,
+                          mix=1.0 if serial else g.mix)
+    net = float(g.budget.get("net_db", glue_stage.SERIAL_GR_DB))
+    p.budget = {"mode": g.budget["mode"], "net_target_db": net,
+                "wet_target_db": net if serial else glue_stage.WET_GR_DB, "wet_db": 0.0,
+                "wet_outlier_db": 0.0, "net_db": 0.0, "net_outlier_db": 0.0,
+                "net_cap_db": glue_stage.OUTLIER_CAP_DB, "wet_floor_db": None,
+                "mix": float(p.mix), "reading": "average", "no_loud_hits": True,
+                "warnings": []}
+    return p
 
 
 GLUE_FRAME_S = 0.4
@@ -2223,6 +2248,11 @@ def solve_clipper(y: np.ndarray, fs: float, lp: LimiterPlan,
                       "outlier_gr_db": sol["outlier_gr_db"], "capped": sol["capped"],
                       "curve_gr_db": sol["curve_gr_db"], "threshold_db": sol["threshold_db"],
                       "knee_db": lp.clip_knee_db, "input_peak_8x_dbfs": sol["peak_8x_dbfs"],
+                      # the full signal's 8x input peak (S2-4: with a split the solve reads
+                      # the part above it; the render's detector reads the full signal)
+                      "input_peak_8x_full_dbfs": (
+                          sol["peak_8x_dbfs"] if lp.clip_split_hz is None
+                          else _peak_8x_db(y)),
                       "budget_db": CLIP_MAX_GR_DB, "outlier_cap_db": ocap,
                       "sample_cap_db": lp.clip_max_gr_db,
                       "bound": sol.get("bound"),
@@ -2231,6 +2261,11 @@ def solve_clipper(y: np.ndarray, fs: float, lp: LimiterPlan,
                                       else f"output peak above {lp.clip_split_hz:g} Hz"),
                       "reading": "max" if hits is None else "average", "warnings": warn}
     return replace(lp, clip_threshold_db=sol["threshold_db"], budget=rec)
+
+
+def _peak_8x_db(y: np.ndarray) -> float:
+    from eluate.stages import limiter as lim
+    return float(lim.peak_8x_db(y))
 
 
 def limiter_peak(y: np.ndarray, fs: float, lp: LimiterPlan,
@@ -2335,6 +2370,84 @@ def design_limiter(y: np.ndarray, fs: float, lp: LimiterPlan,
 UNREACHABLE_BOUNDS = ("level floor", "bracket floor")   # multiband.threshold_for_peak_gr
 
 
+def _clipper_rendered(cs: dict, c: dict, lp: LimiterPlan, lim_info: dict | None) -> None:
+    """The clipper row's planned and rendered track-peak falls, like with like (S2-4):
+    both on the full signal, the clipper's full-signal 8x input peak (input_peak_8x_full_dbfs;
+    with no split the solve's own input_peak_8x_dbfs) minus the limiter detector's peak
+    after the clipper and band-limit, planned_track_db from the solve
+    (limiter.clipped_peak_dbfs, 0 dB gain) and rendered_db from the render (at the
+    rendered input gain). rendered_curve_db is the render's curve reduction at its 8x
+    peak (the part above the split with one), like for like with curve_db. A plan from
+    before the full-signal peak was recorded, with a split, gets rendered_db None and a
+    note (input_peak_8x_dbfs is then the part above the split)."""
+    split = c.get("split_hz")
+    p_full = c.get("input_peak_8x_full_dbfs")
+    if p_full is None and split is None:
+        p_full = c.get("input_peak_8x_dbfs")
+    ok = p_full is not None and math.isfinite(p_full)
+    lr = (lp.budget or {}).get("limiter") or {}
+    if ok and lr.get("clipped_peak_dbfs") is not None:
+        cs["planned_track_db"] = float(p_full - lr["clipped_peak_dbfs"])
+    det = (lim_info or {}).get("detector_peak_dbfs")
+    if det is None:
+        return
+    if ok:
+        cs["rendered_db"] = float(p_full + lp.input_gain_db - det)
+        cs["rendered_on"] = "track peak, full signal"
+    else:
+        cs["rendered_db"] = None
+        cs["rendered_note"] = (f"not measured: the clipper acts above {split:g} Hz and this "
+                               "plan has no full-signal input peak to compare the render's "
+                               "detector peak with")
+    rc = (lim_info or {}).get("clip_max_reduction_db")
+    if rc is not None:
+        cs["rendered_curve_db"] = float(rc)
+
+
+def relimit_summary(lim_info: dict | None) -> dict | None:
+    """The base-rate re-limit's figures from a render's limiter info (S4-6): {"passes",
+    "max_db" (the largest reduction), "samples" (the most samples one pass touched),
+    "fraction" (of the track; None when the info has no sample count), "trim_db"}. Read
+    from lim_info["relimit"] when the limiter reports it (a dict with "passes" as a count or
+    a list of passes, "max_db" or "max_reduction_db", "samples", "fraction"), else from
+    "relimit_passes"; None when the info has neither (no re-limit figures to report)."""
+    if not lim_info:
+        return None
+    rl, n_s = lim_info.get("relimit"), lim_info.get("samples")
+
+    def num(v):
+        return float(v) if isinstance(v, (int, float)) and math.isfinite(float(v)) else None
+
+    if isinstance(rl, dict):
+        ps = rl.get("passes")
+        plist = ps if isinstance(ps, list) else []
+        mx = num(rl.get("max_db", rl.get("max_reduction_db")))
+        if mx is None:
+            mx = max((num(p.get("max_reduction_db")) or 0.0 for p in plist), default=0.0)
+        smp = rl.get("samples")
+        if smp is None:
+            smp = max((int(p.get("samples") or 0) for p in plist), default=0)
+        n_s = rl.get("n", n_s)
+        frac = num(rl.get("fraction"))
+        if frac is None and n_s:
+            frac = int(smp) / float(n_s)
+        return {"passes": len(plist) if isinstance(ps, list) else int(ps or 0),
+                "max_db": float(mx), "samples": int(smp), "fraction": frac,
+                "trim_db": rl.get("trim_db", lim_info.get("trim_db"))}
+    if isinstance(rl, list):
+        passes = rl
+    elif "relimit_passes" in lim_info:
+        passes = lim_info.get("relimit_passes") or []
+    else:
+        return None
+    touched = max((int(p.get("samples") or 0) for p in passes), default=0)
+    return {"passes": len(passes),
+            "max_db": max((float(p.get("max_reduction_db") or 0.0) for p in passes),
+                          default=0.0),
+            "samples": touched, "fraction": (touched / n_s) if n_s else None,
+            "trim_db": lim_info.get("trim_db")}
+
+
 def _status(avg, target, outlier, cap, bound=None) -> str:
     """"over" when the average passes its target or the outlier its cap, "target
     unreachable" when the solve stopped at its threshold floor short of the target
@@ -2360,6 +2473,13 @@ def budget_report(plan: Plan, lim_info: dict | None = None) -> dict:
     out: dict = {"stages": {}, "warnings": [],
                  "reading": "max" if plan.hits is None else plan.hits.reading,
                  "hits": None if plan.hits is None else plan.hits.source}
+    if plan.hits is not None and plan.hits.loud and not any(plan.hits.loud):
+        # audit 2026-11-10 S3-2b: every hit is below the -70 dBFS gate; the budget stages
+        # were left uncompressed (envelope.has_loud)
+        out["warnings"].append({"stage": "hits", "kind": "no loud hits",
+                                "text": "no hit reaches the loud section above "
+                                        f"{meter.RMS_GATE_DBFS:g} dBFS: the multiband, glue, "
+                                        "clipper and band limits do not compress"})
     mb = plan.multiband
     if mb is not None and mb.budget is not None and mb.budget.get("result") is not None:
         rows = []
@@ -2409,22 +2529,7 @@ def budget_report(plan: Plan, lim_info: dict | None = None) -> dict:
                                         "curve_db": c.get("curve_gr_db"),
                                         "bound": c.get("bound"),
                                         "measured_on": c.get("measured_on", "output peak")}
-            p_in, det = c.get("input_peak_8x_dbfs"), (lim_info or {}).get("detector_peak_dbfs")
-            if det is not None and p_in is not None and math.isfinite(p_in):
-                if c.get("split_hz") is None:
-                    # the track peak's fall: the clipper's 8x input peak at the rendered
-                    # gain minus the limiter detector's peak (after the clipper and
-                    # band-limit); like for like only when the clipper acts on the whole
-                    # signal
-                    out["stages"]["clipper"]["rendered_db"] = float(p_in + lp.input_gain_db - det)
-                else:
-                    # S2-4: input_peak_8x_dbfs is the part above split_hz, the detector
-                    # peak the full signal's (the sub passes untouched): not comparable
-                    out["stages"]["clipper"]["rendered_db"] = None
-                    out["stages"]["clipper"]["rendered_note"] = (
-                        f"not measured: the clipper acts above {c['split_hz']:g} Hz and the "
-                        "render's detector peak reads the full signal; planned_db is the "
-                        "solve's reading on that part")
+            _clipper_rendered(out["stages"]["clipper"], c, lp, lim_info)
             cs = out["stages"]["clipper"]
             cs["status"] = _status(cs["planned_db"], c["target_db"], cs["outlier_db"],
                                    cs["outlier_cap_db"])
@@ -2444,17 +2549,9 @@ def budget_report(plan: Plan, lim_info: dict | None = None) -> dict:
                 # reduction on the decimated output; its passes, largest reduction and the
                 # share of samples it touched are reported next to the 8x figure, and
                 # rendered_total_max_db bounds the two together at any sample
-                passes = lim_info.get("relimit_passes") or []
-                n_s = lim_info.get("samples")
-                touched = max((int(p.get("samples") or 0) for p in passes), default=0)
-                rl = {"passes": len(passes),
-                      "max_db": max((float(p.get("max_reduction_db") or 0.0) for p in passes),
-                                    default=0.0),
-                      "samples": touched,
-                      "fraction": (touched / n_s) if n_s else None,
-                      "trim_db": lim_info.get("trim_db")}
+                rl = relimit_summary(lim_info)
                 st["relimit"] = rl
-                if st["rendered_db"] is not None:
+                if rl is not None and st["rendered_db"] is not None:
                     st["rendered_total_max_db"] = float(st["rendered_db"]) + rl["max_db"]
             # the limiter's target is the loudness: its budget is a ceiling, never "under"
             st["status"] = _status(st["planned_db"], None, st["outlier_db"], st["outlier_cap_db"])
