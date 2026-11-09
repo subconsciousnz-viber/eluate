@@ -14,7 +14,10 @@ Contract:
   Tables 1 and 2 to < 1e-15. Measured 997 Hz full-scale readings: see tests.
 - The K-filter starts from the steady state of the first sample
   (scipy.signal.sosfilt_zi), so DC reads -inf and an abrupt start does not
-  inject a start-up block (audit 02 A16).
+  inject a start-up block (audit 02 A16). This is deliberate and kept (metering
+  audit 2026-11-10, finding 11): libebur128, pyloudnorm and ffmpeg start from a
+  zero state, which moves only the first 400 ms block, by at most 0.04 LU
+  either way; whole-track readings are unaffected.
 - Loudness of a power p (weighted sum over channels of mean square of the
   K-weighted signal) is -0.691 + 10 log10(p) LUFS; silence gives -inf.
 - Gating blocks are 400 ms at 75 % overlap; block j starts at round(0.1 j fs)
@@ -24,16 +27,24 @@ Contract:
   -inf when no block passes (silence, or input shorter than 400 ms).
 - `momentary` / `short_term`: 400 ms / 3 s windows at 100 ms hop, full windows
   only, time stamp = window end. `momentary_max` / `short_term_max` slide the
-  window one sample at a time (EBU Tech 3341 cases 10 and 13).
+  window one sample at a time (EBU Tech 3341 cases 10 and 13), as the maximum
+  of c[i + L] - c[i] over the power's cumulative sum taken in chunks of
+  SLIDE_CHUNK starts (no per-start index arrays; metering audit 2026-11-10,
+  finding 5). A maximum window power below P_FLOOR (the cumulative-sum residue
+  of a K-weighted DC, about -325 LUFS) reads -inf, as silence does (finding 10).
 - `lra`: EBU Tech 3342: short-term values at 100 ms hop, -70 LUFS absolute
   gate, -20 LU relative gate, LRA = L95 - L10 taken from the sorted gated
   values at index floor((N - 1) p + 0.5), libebur128's rule (verified against
   its source). NaN when not measurable (input < 3 s or nothing above the gates).
-- True peak: `oversample=8` (default; what solver, limiter and report
-  constrain against) uses a Kaiser-windowed sinc interpolator: passband to
-  0.93 x Nyquist, -6 dB at 0.965, >= 60 dB image rejection from 1.0 x
-  Nyquist. `oversample=4` uses the 48-tap, 4-phase FIR of BS.1770-4 Annex 2
-  (coefficients verified against the BS.1770-5 PDF), reported for compliance.
+- True peak: `oversample=8` (default; the meter's reading, which the solver
+  constrains together with the 32x FFT reading at 24 bits and with the 4x
+  reading too under the -1 dBTP deliveries; evaluate.measure_track's
+  `true_peak_max_dbtp` is the maximum of all three) uses a Kaiser-windowed
+  sinc interpolator: passband to 0.93 x Nyquist, -6 dB at 0.965, >= 60 dB
+  image rejection from 1.0 x Nyquist (so it under-reads full-band material by
+  up to 0.5 dB against the 32x reading). `oversample=4` uses the 48-tap,
+  4-phase FIR of BS.1770-4 Annex 2 (coefficients verified against the
+  BS.1770-5 PDF), reported for compliance.
   Each input sample owns exactly `oversample` interpolated values (floor
   mapping). The signal is silent outside its span, so reconstruction ringing at
   an abrupt start / end counts. True peak is never below the sample peak;
@@ -64,6 +75,15 @@ Contract:
 - `crest_db` (the one crest reading the CLI, the report, the app and the corpus survey
   share): sample peak minus the loudest-section 1 s RMS (`rms_1s`, plain dBFS). NaN when
   the RMS is not measurable.
+- `measure` computes the K-weighted power, its cumulative sum, the 400 ms and 3 s
+  window powers, the unweighted power's cumulative sum and the 8x envelope once each
+  and shares them between the readings (integrated, S95 / loud section, PSR,
+  short-term and momentary maxima, LRA, true peak, the RMS meters); every value equals
+  the stand-alone function's (tests/test_meter.py, metering audit 2026-11-10 finding 5).
+- The 24-bit export (stages/output.py) is rounded without dither, deliberately
+  (docs/gain-staging.md 11, deviation 3; metering audit 2026-11-10 finding 15: the
+  rounding error sits near -144 dBFS, far below any converter's floor); only the
+  16-bit CD export is dithered (TPDF).
 """
 
 from __future__ import annotations
@@ -92,6 +112,11 @@ RMS_GATE_DBFS = -70.0
 AES17_OFFSET_DB = 10.0 * math.log10(2.0)
 METER_WINDOW_S = 0.3              # the maintainer's meter (rms_meter): Ozone RMS, 300 ms
 METER_HOP_S = 0.01
+# a window power below this is silence (-inf), not a reading: the cumulative-sum residue of
+# a K-weighted DC (about 1e-33, -325 LUFS; metering audit 2026-11-10 finding 10). One 24-bit
+# step of noise is about 3e-15 (-144 LUFS), far above it.
+P_FLOOR = 1e-30
+SLIDE_CHUNK = 1 << 20             # window starts per chunk of the one-sample-hop maxima
 
 # BS.1770-4 Annex 2, order-48 4-phase interpolating FIR. Row p = phase p.
 ANNEX2_PHASES = np.array(
@@ -182,12 +207,16 @@ def _weighted_power(y: np.ndarray, weights) -> np.ndarray:
 
 # ------------------------------------------------------------- block powers
 
-def _window_powers(ps: np.ndarray, fs: float, win_s: float, hop_s: float = HOP_S):
-    """Mean of the per-sample weighted power `ps` over full windows at a fixed hop.
+def _cumsum(ps: np.ndarray) -> np.ndarray:
+    """c with c[0] = 0 and c[i] = sum(ps[:i]), so a window's summed power is c[i + L] - c[i]."""
+    c = np.zeros(ps.shape[0] + 1)
+    np.cumsum(ps, out=c[1:])
+    return c
 
-    Returns (starts, length, powers). Window j starts at round(j * hop_s * fs).
-    """
-    n = ps.shape[0]
+
+def _windows_from_cumsum(c: np.ndarray, fs: float, win_s: float, hop_s: float = HOP_S):
+    """`_window_powers` from the power's cumulative sum `c` (shared between readings)."""
+    n = c.shape[0] - 1
     length = int(round(win_s * fs))
     hop = hop_s * fs
     if n < length or length == 0:
@@ -195,9 +224,15 @@ def _window_powers(ps: np.ndarray, fs: float, win_s: float, hop_s: float = HOP_S
     count = int(math.floor((n - length) / hop + 1e-9)) + 1
     starts = np.round(np.arange(count) * hop).astype(np.int64)
     starts = starts[starts + length <= n]
-    c = np.zeros(n + 1)
-    np.cumsum(ps, out=c[1:])
     return starts, length, (c[starts + length] - c[starts]) / length
+
+
+def _window_powers(ps: np.ndarray, fs: float, win_s: float, hop_s: float = HOP_S):
+    """Mean of the per-sample weighted power `ps` over full windows at a fixed hop.
+
+    Returns (starts, length, powers). Window j starts at round(j * hop_s * fs).
+    """
+    return _windows_from_cumsum(_cumsum(ps), fs, win_s, hop_s)
 
 
 def _gated_mean_power(p: np.ndarray, rel_gate: float = REL_GATE) -> float:
@@ -230,9 +265,31 @@ def short_term(x: np.ndarray, fs: float, hop_s: float = HOP_S, weights=None):
     return (starts + length) / fs, _lufs(p)
 
 
-def _sliding_max_lufs(ps: np.ndarray, fs: float, win_s: float) -> float:
-    _, _, p = _window_powers(ps, fs, win_s, 1.0 / fs)
-    return float(_lufs(p.max())) if p.size else math.nan
+def _sliding_max_power(c: np.ndarray, length: int, chunk: int = SLIDE_CHUNK) -> float:
+    """max over every window start i of c[i + length] - c[i] (the window's summed power),
+    taken in chunks of `chunk` starts so no per-start index array exists. NaN when no full
+    window fits."""
+    n = c.shape[0] - 1
+    if length == 0 or n < length:
+        return math.nan
+    last = n - length
+    m = -math.inf
+    for i in range(0, last + 1, chunk):
+        j = min(i + chunk, last + 1)
+        m = max(m, float(np.max(c[i + length:j + length] - c[i:j])))
+    return m
+
+
+def _sliding_max_lufs(ps: np.ndarray, fs: float, win_s: float, c: np.ndarray | None = None) -> float:
+    """Loudness of the loudest window of `win_s` over every start (1-sample hop); `c` is
+    the power's cumulative sum when the caller has it. -inf below P_FLOOR (silence, or
+    the residue of a K-weighted DC); NaN when no full window fits."""
+    length = int(round(win_s * fs))
+    m = _sliding_max_power(_cumsum(ps) if c is None else c, length)
+    if math.isnan(m):
+        return math.nan
+    p = m / length
+    return -math.inf if p < P_FLOOR else float(_lufs(p))
 
 
 def momentary_max(x: np.ndarray, fs: float, weights=None) -> float:
@@ -245,10 +302,15 @@ def short_term_max(x: np.ndarray, fs: float, weights=None) -> float:
     return _sliding_max_lufs(_kpower(x, fs, weights), fs, SHORT_S)
 
 
+def _integrated_blocks(p: np.ndarray) -> float:
+    """Gated integrated loudness from the 400 ms block powers at the 100 ms hop."""
+    return float(_lufs(_gated_mean_power(p)))
+
+
 def integrated(x: np.ndarray, fs: float, weights=None) -> float:
     """BS.1770-4 gated integrated loudness, LUFS (-inf if nothing passes the gates)."""
     _, _, p = _window_powers(_kpower(x, fs, weights), fs, BLOCK_S, HOP_S)
-    return float(_lufs(_gated_mean_power(p)))
+    return _integrated_blocks(p)
 
 
 def _lra_from_short_term(s: np.ndarray) -> float:
@@ -362,14 +424,18 @@ def true_peak_envelope(x: np.ndarray, fs: float, oversample: int = TP_OVERSAMPLE
     return env
 
 
-def true_peak(x: np.ndarray, fs: float, oversample: int = TP_OVERSAMPLE,
-              kind: str | None = None) -> float:
-    """True peak in dBTP (max over channels); -inf for empty or silent input."""
-    env = true_peak_envelope(x, fs, oversample, kind)
+def _env_db(env: np.ndarray) -> float:
+    """The peak of a true-peak envelope in dBTP; -inf for an empty or silent one."""
     if env.size == 0:
         return -math.inf
     with np.errstate(divide="ignore"):
         return float(20.0 * np.log10(env.max()))
+
+
+def true_peak(x: np.ndarray, fs: float, oversample: int = TP_OVERSAMPLE,
+              kind: str | None = None) -> float:
+    """True peak in dBTP (max over channels); -inf for empty or silent input."""
+    return _env_db(true_peak_envelope(x, fs, oversample, kind))
 
 
 def sample_peak(x: np.ndarray) -> float:
@@ -419,7 +485,13 @@ def psr(x: np.ndarray, fs: float, oversample: int = TP_OVERSAMPLE, hop_s: float 
     starts, length, p = _window_powers(_kpower(x, fs, weights), fs, SHORT_S, hop_s)
     if starts.size == 0:
         return np.zeros(0), np.zeros(0), math.nan
-    env = true_peak_envelope(x, fs, oversample)
+    return _psr_from(starts, length, p, true_peak_envelope(x, fs, oversample), fs)
+
+
+def _psr_from(starts, length, p, env, fs):
+    """`psr` from the short-term window powers and the true-peak envelope."""
+    if starts.size == 0:
+        return np.zeros(0), np.zeros(0), math.nan
     # origin -(length // 2) makes wmax[i] = max(env[i : i + length])
     wmax = maximum_filter1d(env, size=length, origin=-(length // 2), mode="nearest")
     s = _lufs(p)
@@ -431,12 +503,15 @@ def psr(x: np.ndarray, fs: float, oversample: int = TP_OVERSAMPLE, hop_s: float 
     return (starts + length) / fs, val, p95
 
 
-def rms_series(x: np.ndarray, fs: float, window_s: float = RMS_WINDOW_S, hop_s: float = HOP_S,
-               aes17: bool = False):
-    """Sliding RMS, dBFS (module contract). Returns (t_end_s, dbfs)."""
+def _unweighted_cumsum(x: np.ndarray) -> np.ndarray:
+    """Cumulative sum of the per-sample power, mean over channels (the RMS meters' base)."""
     xa = _as2d(x)
-    ps = np.mean(xa * xa, axis=1)
-    starts, length, p = _window_powers(ps, fs, window_s, hop_s)
+    return _cumsum(np.mean(xa * xa, axis=1))
+
+
+def _rms_series_c(c: np.ndarray, fs: float, window_s: float, hop_s: float, aes17: bool = False):
+    """`rms_series` from the unweighted power's cumulative sum."""
+    starts, length, p = _windows_from_cumsum(c, fs, window_s, hop_s)
     with np.errstate(divide="ignore"):
         db = 10.0 * np.log10(p)
     if aes17:
@@ -444,15 +519,25 @@ def rms_series(x: np.ndarray, fs: float, window_s: float = RMS_WINDOW_S, hop_s: 
     return (starts + length) / fs, db
 
 
-def rms_1s(x: np.ndarray, fs: float, aes17: bool = False) -> dict:
-    """1 s RMS over the loudest section (p95 over gated windows) and the loudest 1 s."""
-    _, db = rms_series(x, fs)
+def rms_series(x: np.ndarray, fs: float, window_s: float = RMS_WINDOW_S, hop_s: float = HOP_S,
+               aes17: bool = False):
+    """Sliding RMS, dBFS (module contract). Returns (t_end_s, dbfs)."""
+    return _rms_series_c(_unweighted_cumsum(x), fs, window_s, hop_s, aes17)
+
+
+def _rms_1s_db(db: np.ndarray, aes17: bool) -> dict:
     off = AES17_OFFSET_DB if aes17 else 0.0
     gated = db[db > RMS_GATE_DBFS]
     if gated.size == 0:
         return {"loud_section_dbfs": math.nan, "max_dbfs": math.nan, "aes17": bool(aes17)}
     return {"loud_section_dbfs": float(np.percentile(gated, 95.0)) + off,
             "max_dbfs": float(gated.max()) + off, "aes17": bool(aes17)}
+
+
+def rms_1s(x: np.ndarray, fs: float, aes17: bool = False) -> dict:
+    """1 s RMS over the loudest section (p95 over gated windows) and the loudest 1 s."""
+    _, db = rms_series(x, fs)
+    return _rms_1s_db(db, aes17)
 
 
 def crest_db(x: np.ndarray, fs: float) -> float:
@@ -468,6 +553,10 @@ def rms_meter(x: np.ndarray, fs: float) -> dict:
     loudest passage as the maintainer reads it (his masters: -5.2 and -5.4 where he read
     "about -5"), "max_dbfs": the series maximum}. NaN when nothing passes the gate."""
     _, db = rms_series(x, fs, METER_WINDOW_S, METER_HOP_S)
+    return _rms_meter_db(db)
+
+
+def _rms_meter_db(db: np.ndarray) -> dict:
     gated = db[db > RMS_GATE_DBFS]
     if gated.size == 0:
         return {"loud_dbfs": math.nan, "max_dbfs": math.nan}
@@ -478,11 +567,19 @@ def rms_meter(x: np.ndarray, fs: float) -> dict:
 def loud_passage_lufs(x: np.ndarray, fs: float, weights=None) -> dict:
     """Loud-passage loudness: S95 (control) and loud-section integrated (report)."""
     ps = _kpower(x, fs, weights)
-    n = ps.shape[0]
+    c = _cumsum(ps)
+    return _loud_passage_from(ps.shape[0], fs, _windows_from_cumsum(c, fs, BLOCK_S, HOP_S),
+                              _windows_from_cumsum(c, fs, SHORT_S, HOP_S))
+
+
+def _loud_passage_from(n: int, fs: float, blocks, windows) -> dict:
+    """`loud_passage_lufs` from the 400 ms block powers and the 3 s window powers (both at
+    the 100 ms hop) of an n-sample signal; the blocks stand in for the windows when the
+    input is shorter than 3 s."""
     nan = {"s95": math.nan, "loud_section": math.nan, "s_max": math.nan,
            "loud_fraction": 0.0, "window_s": math.nan}
     win_s = SHORT_S if n >= round(SHORT_S * fs) else BLOCK_S
-    w_starts, w_len, w_p = _window_powers(ps, fs, win_s, HOP_S)
+    w_starts, w_len, w_p = windows if win_s == SHORT_S else blocks
     if w_starts.size == 0:
         return nan
     s = _lufs(w_p)
@@ -497,7 +594,7 @@ def loud_passage_lufs(x: np.ndarray, fs: float, weights=None) -> dict:
     np.add.at(d, w_starts[sel], 1)
     np.add.at(d, w_starts[sel] + w_len, -1)
     mask = np.cumsum(d[:-1]) > 0
-    b_starts, b_len, b_p = _window_powers(ps, fs, BLOCK_S, HOP_S)
+    b_starts, b_len, b_p = blocks
     cm = np.concatenate([[0], np.cumsum(mask)])
     inside = (cm[b_starts + b_len] - cm[b_starts]) == b_len
     loud = float(_lufs(_gated_mean_power(b_p[inside])))
@@ -507,13 +604,22 @@ def loud_passage_lufs(x: np.ndarray, fs: float, weights=None) -> dict:
 
 def measure(x: np.ndarray, fs: float, oversample: int = TP_OVERSAMPLE, weights=None) -> dict:
     """Summary metrics for reports. true_peak_dbtp is at `oversample` (8x by
-    default); true_peak_4x_dbtp is the BS.1770 Annex 2 reading for compliance."""
-    tp = true_peak(x, fs, oversample)
-    i = integrated(x, fs, weights)
-    lp = loud_passage_lufs(x, fs, weights)
-    _, _, psr95 = psr(x, fs, oversample, weights=weights)
-    r = rms_1s(x, fs)
-    rm = rms_meter(x, fs)
+    default); true_peak_4x_dbtp is the BS.1770 Annex 2 reading for compliance.
+    The shared intermediates (module contract) make every value equal the
+    stand-alone function's."""
+    x = _as2d(x)
+    ps = _kpower(x, fs, weights)
+    c = _cumsum(ps)
+    blocks = _windows_from_cumsum(c, fs, BLOCK_S, HOP_S)
+    windows = _windows_from_cumsum(c, fs, SHORT_S, HOP_S)
+    env = true_peak_envelope(x, fs, oversample)
+    tp = _env_db(env)
+    i = _integrated_blocks(blocks[2])
+    lp = _loud_passage_from(ps.shape[0], fs, blocks, windows)
+    _, _, psr95 = _psr_from(*windows, env, fs)
+    cu = _unweighted_cumsum(x)
+    r = _rms_1s_db(_rms_series_c(cu, fs, RMS_WINDOW_S, HOP_S)[1], False)
+    rm = _rms_meter_db(_rms_series_c(cu, fs, METER_WINDOW_S, METER_HOP_S)[1])
     sp = sample_peak(x)
     return {
         "rms_meter_dbfs": rm["loud_dbfs"],
@@ -522,9 +628,9 @@ def measure(x: np.ndarray, fs: float, oversample: int = TP_OVERSAMPLE, weights=N
         "s95_lufs": lp["s95"],
         "loud_section_lufs": lp["loud_section"],
         "loud_window_s": lp["window_s"],
-        "short_term_max_lufs": short_term_max(x, fs, weights),
-        "momentary_max_lufs": momentary_max(x, fs, weights),
-        "lra_lu": lra(x, fs, weights),
+        "short_term_max_lufs": _sliding_max_lufs(ps, fs, SHORT_S, c),
+        "momentary_max_lufs": _sliding_max_lufs(ps, fs, BLOCK_S, c),
+        "lra_lu": _lra_from_short_term(_lufs(windows[2])),
         "true_peak_dbtp": tp,
         "true_peak_oversample": oversample,
         "true_peak_4x_dbtp": true_peak(x, fs, 4),
