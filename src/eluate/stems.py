@@ -995,7 +995,9 @@ def pass_score(report: dict, attribution: list) -> dict:
 # ---------------------------------------------------------------- report
 
 def _f(v, nd=1):
-    return "n/a" if v is None or (isinstance(v, float) and not math.isfinite(v)) else f"{v:.{nd}f}"
+    if v is None or (isinstance(v, float) and not math.isfinite(v)):
+        return "n/a"
+    return f"{round(v, nd) + 0.0:.{nd}f}"        # + 0.0: a -0.00004 dB gain reads 0.0, not -0.0
 
 
 def _stem_line(e: dict, r: dict) -> str:
