@@ -32,10 +32,27 @@ Contract: `apply(x, fs, plan) -> y`, pure, (n, ch) in, float64 (n, ch) out.
   20 ms) of an onset at audio rate (the hold is padded by one control period
   on the 1 ms grid, audit 05 A8), raised-cosine ramp of ramp_ms (default 5 ms)
   outside that.
-- Merge (audit 05 A6): candidates whose -3 dB bands (half-cut bands, geometric
-  edges f0 (sqrt(1 + 1/(4Q^2)) +- 1/(2Q))) overlap must be merged by the
-  planner with `merge_candidates`; `apply` raises ValueError on an overlapping
-  pair. Q >= 1 (plan.NOTCH_Q_MIN).
+- Merge (audit 05 A6): candidates whose half-cut bands overlap must be merged by
+  the planner with `merge_candidates(notches, fs)`. The bands are the realised ones
+  (`notch_edges`, 2026-11-10, filter-maths audit F2): the digital notch's half-cut
+  edges after the bilinear warp, fs / pi atan(tan(pi f0 / fs) o^(+-1)) with o from
+  the solved biquad Q (`_notch_bandwidth`), so hi - lo = f0 / Q exactly and
+  tan(pi lo / fs) tan(pi hi / fs) = tan(pi f0 / fs)^2. The analog geometric edges
+  f0 (sqrt(1 + 1/(4Q^2)) +- 1/(2Q)) (`band_edges`, used before) are right only far
+  below fs / 4: at 44.1 kHz and Q 2 they are 5 % high at 12 kHz and 17 % at 18 kHz,
+  so 12000 / 19695 Hz Q 2 (realised bands 8912-14912 and 11756-21603 Hz) passed as
+  disjoint. A merged notch spans the union of its members' realised bands: f0 the
+  tan-domain geometric mean of the edges (always below fs / 2), Q = f0 / (hi - lo).
+  `apply` raises ValueError on a pair whose bands overlap under both the realised
+  and the analog edges, so plans merged on either rule (saved plans used the analog
+  one) render as before; the composite clamp holds the summed cut either way.
+  Q >= 1 (plan.NOTCH_Q_MIN).
+- Padding of the zero-phase bandpass: PAD_TAU time constants of the slowest pole,
+  -1 / ln max|pole| (np.roots of the denominator; 2026-11-10, audit F3). For complex
+  poles this is atanh(alpha), the formula used before (the same pads on 4203 grid
+  cases); at high f0 and low Q the poles are real (alpha >= 1 from f0 / fs 0.225 at
+  Q 1, where math.atanh raised a domain error, or a1^2 > 4 a2 before that, where the
+  old pad followed the geometric mean of the two radii and came out short).
 """
 
 from __future__ import annotations
@@ -97,14 +114,18 @@ def notch_sos(nt: Notch, fs: float) -> np.ndarray:
     return bandpass_sos(nt.f0_hz, design_q(nt.f0_hz, nt.q, fs, _g_ref(nt)), fs)
 
 
+def pad_samples(sos: np.ndarray, fs: float) -> int:
+    """Zero padding per side for the bandpass: bands.padlen at the equivalent corner of
+    the slowest pole, decay per sample -ln max|pole| (module contract)."""
+    r = float(np.max(np.abs(np.roots([1.0, float(sos[0, 4]), float(sos[0, 5])]))))
+    if not 0.0 < r < 1.0:
+        raise ValueError(f"notch bandpass pole radius {r} outside (0, 1)")
+    return bands.padlen(None, fs, fs * -math.log(r) / (2.0 * math.pi))
+
+
 def bandpass_zp(x: np.ndarray, sos: np.ndarray, fs: float) -> np.ndarray:
     """Zero-phase bandpass of x (n, ch), zero-padded edges."""
-    # pole radius r = sqrt((1 - alpha) / (1 + alpha)) from a2 = (1 - alpha) / (1 + alpha);
-    # decay per sample -ln r = atanh(alpha), i.e. an equivalent corner fs atanh(alpha) / (2 pi)
-    a2 = float(sos[0, 5])
-    alpha = (1.0 - a2) / (1.0 + a2)
-    pl = bands.padlen(None, fs, fs * math.atanh(alpha) / (2.0 * math.pi))
-    return iir.sosfiltfilt_zero(sos, x, pl)      # blocked, subnormal flush (iir.py)
+    return iir.sosfiltfilt_zero(sos, x, pad_samples(sos, fs))   # blocked, subnormal flush
 
 
 def kick_mask(onsets_s, duration_s: float, half_ms: float = 20.0, ramp_ms: float = 5.0,
@@ -127,24 +148,58 @@ def kick_mask(onsets_s, duration_s: float, half_ms: float = 20.0, ramp_ms: float
 
 
 def band_edges(f0: float, q: float) -> tuple[float, float]:
-    """Exact geometric half-cut band edges: lo hi = f0^2, hi - lo = f0 / q."""
+    """Analog geometric half-cut band edges: lo hi = f0^2, hi - lo = f0 / q (the rule
+    before 2026-11-10; right far below fs / 4, see notch_edges)."""
     a = math.sqrt(1.0 + 0.25 / (q * q))
     return f0 * (a - 0.5 / q), f0 * (a + 0.5 / q)
 
 
-def merge_candidates(notches: list[Notch]) -> list[Notch]:
-    """Merge notches whose half-cut bands overlap (chained, sorted by lower edge).
+def notch_edges(nt: Notch, fs: float | None) -> tuple[float, float]:
+    """The notch's realised half-cut band edges (Hz) at fs: the digital response's
+    points at half its dB cut G_ref after the bilinear warp (module contract);
+    hi - lo = f0 / Q exactly. fs None: the analog band_edges."""
+    if fs is None:
+        return band_edges(nt.f0_hz, nt.q)
+    g = _g_ref(nt)
+    q_bq = design_q(nt.f0_hz, nt.q, fs, g)
+    k = math.tan(math.pi * nt.f0_hz / fs)
+    c = 10.0 ** (g / 80.0) / q_bq
+    o2 = 0.5 * (c + math.sqrt(c * c + 4.0))
+    return fs / math.pi * math.atan(k / o2), fs / math.pi * math.atan(o2 * k)
 
-    A merged notch spans the union of the members' bands: f0 = sqrt(lo hi),
-    Q = f0 / (hi - lo), floored at Q_MIN by widening; its gain envelope is the
+
+def _centre(lo: float, hi: float, fs: float | None) -> float:
+    """The f0 whose band has edges lo and hi: geometric mean, in the tan (warped) domain
+    when fs is given (always below fs / 2)."""
+    if fs is None:
+        return math.sqrt(lo * hi)
+    return fs / math.pi * math.atan(math.sqrt(math.tan(math.pi * lo / fs)
+                                              * math.tan(math.pi * hi / fs)))
+
+
+def overlap(a: Notch, b: Notch, fs: float | None) -> bool:
+    """True when the two notches' half-cut bands (notch_edges at fs) overlap or touch."""
+    (lo1, hi1), (lo2, hi2) = sorted([notch_edges(a, fs), notch_edges(b, fs)])
+    return lo2 <= hi1
+
+
+def merge_candidates(notches: list[Notch], fs: float | None = None) -> list[Notch]:
+    """Merge notches whose half-cut bands overlap (chained, sorted by lower edge), on the
+    realised edges at fs (notch_edges; fs None: the analog edges, the rule before
+    2026-11-10).
+
+    A merged notch spans the union of the members' bands: f0 the geometric mean of the
+    union's edges (in the warped domain at fs), Q = f0 / (hi - lo), floored at Q_MIN
+    (which narrows the merged band below the union); its gain envelope is the
     member-wise minimum (deepest), on the longest member's grid."""
     if not notches:
         return []
-    srt = sorted(notches, key=lambda n: band_edges(n.f0_hz, n.q)[0])
+    edges = {id(n): notch_edges(n, fs) for n in notches}
+    srt = sorted(notches, key=lambda n: edges[id(n)][0])
     groups = [[srt[0]]]
-    hi_run = band_edges(srt[0].f0_hz, srt[0].q)[1]
+    hi_run = edges[id(srt[0])][1]
     for n in srt[1:]:
-        lo, hi = band_edges(n.f0_hz, n.q)
+        lo, hi = edges[id(n)]
         if lo <= hi_run:
             groups[-1].append(n)
             hi_run = max(hi_run, hi)
@@ -156,9 +211,9 @@ def merge_candidates(notches: list[Notch]) -> list[Notch]:
         if len(g) == 1:
             out.append(g[0])
             continue
-        lo = min(band_edges(n.f0_hz, n.q)[0] for n in g)
-        hi = max(band_edges(n.f0_hz, n.q)[1] for n in g)
-        f0 = math.sqrt(lo * hi)
+        lo = min(edges[id(n)][0] for n in g)
+        hi = max(edges[id(n)][1] for n in g)
+        f0 = _centre(lo, hi, fs)
         rate = g[0].gain_db.rate_hz
         if any(n.gain_db.rate_hz != rate for n in g):
             raise ValueError("cannot merge envelopes at different control rates")
@@ -172,12 +227,16 @@ def merge_candidates(notches: list[Notch]) -> list[Notch]:
     return out
 
 
-def _check_merged(notches: list[Notch]) -> None:
-    e = sorted(band_edges(n.f0_hz, n.q) for n in notches)
-    for (lo1, hi1), (lo2, hi2) in zip(e, e[1:]):
-        if lo2 <= hi1:
-            raise ValueError(f"notch bands [{lo1:.1f}, {hi1:.1f}] and [{lo2:.1f}, {hi2:.1f}] Hz "
-                             "overlap; merge them with merge_candidates")
+def _check_merged(notches: list[Notch], fs: float) -> None:
+    """Raise on a pair whose bands overlap under both the realised edges at fs and the
+    analog ones (module contract: a plan merged on either rule is accepted)."""
+    for i, a in enumerate(notches):
+        for b in notches[i + 1:]:
+            if overlap(a, b, None) and overlap(a, b, fs):
+                lo1, hi1 = notch_edges(a, fs)
+                lo2, hi2 = notch_edges(b, fs)
+                raise ValueError(f"notch bands [{lo1:.1f}, {hi1:.1f}] and [{lo2:.1f}, "
+                                 f"{hi2:.1f}] Hz overlap; merge them with merge_candidates")
 
 
 def _freq_grid(f0s, fs: float) -> np.ndarray:
@@ -232,7 +291,7 @@ def apply(x: np.ndarray, fs: float, plan: NotchPlan) -> np.ndarray:
     if y.ndim == 1:
         y = y[:, None]
     n = y.shape[0]
-    _check_merged(plan.notches)
+    _check_merged(plan.notches, fs)
     if not plan.notches:
         return y if np.ndim(x) == 2 else y[:, 0]
     keep = None if plan.kick_mask is None else 1.0 - np.clip(plan.kick_mask.at(n, fs), 0.0, 1.0)

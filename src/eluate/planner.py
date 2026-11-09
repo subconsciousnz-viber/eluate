@@ -969,14 +969,17 @@ def _guard_frames(analysis: dict, f0: float) -> np.ndarray:
     return m
 
 
-def _merge_groups(items: list[tuple]) -> list[list[tuple]]:
+def _merge_groups(items: list[tuple], fs: float | None = None) -> list[list[tuple]]:
     """Group (notch, ...) items whose half-cut bands overlap, chained in order of the lower
-    edge: the grouping notch.merge_candidates uses."""
-    srt = sorted(items, key=lambda it: notch_stage.band_edges(it[0].f0_hz, it[0].q)[0])
+    edge: the grouping notch.merge_candidates uses (on the realised edges at fs,
+    notch.notch_edges, 2026-11-10)."""
+    edges = [notch_stage.notch_edges(it[0], fs) for it in items]
+    order = sorted(range(len(items)), key=lambda i: edges[i][0])
     groups: list[list[tuple]] = []
     hi_run = -math.inf
-    for it in srt:
-        lo, hi = notch_stage.band_edges(it[0].f0_hz, it[0].q)
+    for i in order:
+        it = items[i]
+        lo, hi = edges[i]
         if groups and lo <= hi_run:
             groups[-1].append(it)
             hi_run = max(hi_run, hi)
@@ -1034,7 +1037,7 @@ def plan_notches(analysis: dict, kick: bool = True) -> tuple[NotchPlan, list[dic
             log.info("notch candidate %.1f Hz skipped, %s", f0, row["reason"])
         rows.append(row)
     # merge first, then cap (audit 07 A10): a merged notch ranks by its members' peak
-    groups = _merge_groups(cands)
+    groups = _merge_groups(cands, fs)
     ranked = sorted(groups, key=lambda grp: (-max(it[2] for it in grp), min(it[1] for it in grp)))
     keep, merged = ranked[:NOTCH_MAX], []
     for grp in ranked[NOTCH_MAX:]:
@@ -1043,7 +1046,8 @@ def plan_notches(analysis: dict, kick: bool = True) -> tuple[NotchPlan, list[dic
     keep = sorted(keep, key=lambda grp: min(it[1] for it in grp))
     notches = []
     for m_i, grp in enumerate(keep):
-        nt = notch_stage.merge_candidates([it[0] for it in sorted(grp, key=lambda it: it[1])])
+        nt = notch_stage.merge_candidates([it[0] for it in sorted(grp, key=lambda it: it[1])],
+                                          fs)
         assert len(nt) == 1
         notches.append(nt[0])
         for _, i, _ in grp:

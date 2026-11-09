@@ -200,3 +200,99 @@ def test_depth_bounded_at_every_sample():
     x[n // 2] = 1.0
     y = notch.apply(x, FS, NotchPlan([Notch(2000.0, 4.0, env)]))
     assert np.all(np.isfinite(y))
+
+
+# ------------------------------------------- 2026-11-10: filter-maths audit F2 / F3
+
+def _half_cut_edges_measured(nt, fs, n=1 << 18):
+    """The notch response's points at half its dB cut, from the impulse response."""
+    mag, f, _ = _impulse_response_db(NotchPlan([nt]), fs, n)
+    half = notch._g_ref(nt) / 2.0
+    below = np.flatnonzero(mag <= half)
+    i0, i1 = below[0], below[-1]
+    lo = np.interp(half, [mag[i0], mag[i0 - 1]], [f[i0], f[i0 - 1]])
+    hi = np.interp(half, [mag[i1], mag[i1 + 1]], [f[i1], f[i1 + 1]])
+    return lo, hi
+
+
+@pytest.mark.parametrize("fs,f0,q", [(44100, 12000.0, 2.0), (44100, 18000.0, 2.0),
+                                     (48000, 1000.0, 8.0), (96000, 30000.0, 3.0)])
+def test_realised_edges_match_the_response(fs, f0, q):
+    """notch_edges are the digital response's half-cut points: width f0 / Q exactly,
+    tan-geometric about f0, and where the impulse response puts them."""
+    nt = Notch(f0, q, Envelope.constant(-6.0))
+    lo, hi = notch.notch_edges(nt, fs)
+    assert hi - lo == pytest.approx(f0 / q, rel=1e-9)
+    t = lambda v: math.tan(math.pi * v / fs)
+    assert t(lo) * t(hi) == pytest.approx(t(f0) ** 2, rel=1e-9)
+    mlo, mhi = _half_cut_edges_measured(nt, fs)
+    assert (mlo, mhi) == pytest.approx((lo, hi), abs=2.0)
+    assert notch.notch_edges(nt, None) == notch.band_edges(f0, q)
+
+
+def test_high_low_q_pair_is_detected_and_merged():
+    """Audit F2: 12000 / 19695 Hz Q 2 at 44.1 kHz. The analog edges call them disjoint;
+    the realised half-cut bands (8912-14912 and 11756-21603 Hz) overlap by 3156 Hz, so
+    the planner's merge (fs given) makes one notch, whose band is the union."""
+    fs = 44100
+    a = Notch(12000.0, 2.0, Envelope.constant(-6.0))
+    b = Notch(19695.0, 2.0, Envelope.constant(-6.0))
+    assert notch.notch_edges(a, fs) == pytest.approx((8912.0, 14912.0), abs=1.0)
+    assert notch.notch_edges(b, fs) == pytest.approx((11756.0, 21603.0), abs=1.0)
+    assert not notch.overlap(a, b, None) and notch.overlap(a, b, fs)
+    assert len(notch.merge_candidates([a, b])) == 2            # the rule before
+    m = notch.merge_candidates([a, b], fs)
+    assert len(m) == 1 and m[0].f0_hz < fs / 2
+    assert notch.notch_edges(m[0], fs) == pytest.approx((8912.0, 21603.0), abs=1.0)
+    # a saved plan holding the pair (merged on the analog rule) still renders
+    y = notch.apply(_noise(0.5, fs=fs), fs, NotchPlan([a, b]))
+    assert np.all(np.isfinite(y))
+    # and the planner's grouping agrees with merge_candidates
+    from eluate import planner
+    assert len(planner._merge_groups([(a, 0, 1.0), (b, 1, 1.0)], fs)) == 1
+    assert len(planner._merge_groups([(a, 0, 1.0), (b, 1, 1.0)])) == 2
+
+
+def test_real_pole_notches_apply():
+    """Audit F3: low-Q notches above about fs / 4 have real poles (alpha >= 1), where
+    math.atanh raised a domain error; the pad now follows the slowest real pole. A merged
+    18 + 20 kHz Q 1 notch at 44.1 kHz applies, as do Notch(12000, 1) at 48 kHz and
+    Notch(10000, 1) / Notch(15000, 1.5) at 44.1 kHz."""
+    fs = 44100
+    m = notch.merge_candidates([Notch(18000.0, 1.0, Envelope.constant(-6.0)),
+                                Notch(20000.0, 1.0, Envelope.constant(-6.0))], fs)
+    assert len(m) == 1 and m[0].q >= 1.0 and m[0].f0_hz < fs / 2
+    for rate, nts in ((fs, m), (48000, [Notch(12000.0, 1.0, Envelope.constant(-6.0))]),
+                      (fs, [Notch(10000.0, 1.0, Envelope.constant(-6.0))]),
+                      (fs, [Notch(15000.0, 1.5, Envelope.constant(-4.0))])):
+        sos = notch.notch_sos(nts[0], rate)
+        a1, a2 = sos[0, 4], sos[0, 5]
+        assert a1 * a1 >= 4 * a2                                   # real poles
+        pl = notch.pad_samples(sos, rate)
+        assert bands_padmin() <= pl < 20000                        # the slowest real pole
+        x = _noise(0.5, fs=rate)
+        y = notch.apply(x, rate, NotchPlan(nts))
+        assert np.all(np.isfinite(y)) and np.max(np.abs(y)) <= 2 * np.max(np.abs(x))
+        mag, f, _ = _impulse_response_db(NotchPlan(nts), rate)
+        assert mag.min() == pytest.approx(-6.0 if nts[0].gain_db.values.min() == -6.0 else -4.0,
+                                          abs=0.05)
+
+
+def bands_padmin():
+    from eluate import bands
+    return bands.PAD_MIN
+
+
+@pytest.mark.parametrize("fs", RATES)
+def test_pad_unchanged_for_complex_poles(fs):
+    """For complex poles -ln max|pole| is atanh(alpha): the pad the stage used before."""
+    for f0 in (40.0, 150.0, 1000.0, 5000.0, fs / 5):
+        for q in (1.0, 3.0, 16.0, 50.0):
+            sos = notch.notch_sos(Notch(f0, q, Envelope.constant(-6.0)), fs)
+            a2 = sos[0, 5]
+            if sos[0, 4] ** 2 >= 4 * a2:
+                continue
+            alpha = (1.0 - a2) / (1.0 + a2)
+            from eluate import bands
+            old = bands.padlen(None, fs, fs * math.atanh(alpha) / (2.0 * math.pi))
+            assert notch.pad_samples(sos, fs) == old
