@@ -44,13 +44,16 @@ def test_ab_matches_on_s95_by_attenuating_louder(pair, tmp_path):
 def test_measure_track_fields(pair):
     x, _ = pair
     m = evaluate.measure_track(x, FS, [{"start": 0.0, "end": 5.0}, {"start": 5.0, "end": 10.0}])
-    for k in ("s95_lufs", "true_peak_dbtp", "true_peak_32x_dbtp", "true_peak_4x_dbtp", "plr_db",
-              "psr_p95_db", "section_lufs", "crest_p95_db", "band_corr", "slope_db_oct",
-              "ltas_db", "short_term_lufs"):
+    for k in ("s95_lufs", "true_peak_dbtp", "true_peak_32x_dbtp", "true_peak_4x_dbtp",
+              "true_peak_max_dbtp", "plr_db", "psr_p95_db", "section_lufs", "crest_p95_db",
+              "band_corr", "slope_db_oct", "ltas_db", "short_term_lufs"):
         assert k in m, k
     assert len(m["section_lufs"]) == 2
     assert np.asarray(m["crest_p95_db"]).shape == (5, 3)
     assert m["true_peak_32x_dbtp"] >= m["sample_peak_dbfs"] - 1e-9
+    # the constrained reading: the worst of the three meters (metering audit 2026-11-10, 3)
+    assert m["true_peak_max_dbtp"] == max(m["true_peak_4x_dbtp"], m["true_peak_dbtp"],
+                                          m["true_peak_32x_dbtp"])
 
 
 def test_report_writes_json_md_plots(pair, tmp_path):
@@ -74,6 +77,40 @@ def test_report_writes_json_md_plots(pair, tmp_path):
     md = (tmp_path / "report.md").read_text(encoding="utf-8")
     assert "## Notches" in md and "3150.0" in md and "## A/B" in md
     assert rep["distance_to_master"]["s95_lufs"]["diff"] == pytest.approx(0.0, abs=1e-12)
+    assert rep["distance_to_master"]["true_peak_max_dbtp"]["diff"] == pytest.approx(0.0, abs=1e-12)
+    # the worst true peak is in before / after / delta (metering audit 2026-11-10, 3)
+    for side in ("before", "after"):
+        assert rep[side]["true_peak_max_dbtp"] == max(
+            rep[side]["true_peak_4x_dbtp"], rep[side]["true_peak_dbtp"], rep[side]["true_peak_32x_dbtp"])
+    assert rep["delta"]["true_peak_max_dbtp"] == pytest.approx(
+        rep["after"]["true_peak_max_dbtp"] - rep["before"]["true_peak_max_dbtp"])
+    # the loudness block's *_rms_dbfs and *_rms_aes17_dbfs are the same meter reading (8)
+    assert rep["loudness"]["before_rms_dbfs"] == rep["loudness"]["before_rms_aes17_dbfs"] \
+        == rep["before"]["rms_meter_dbfs"]
+    # the delivery object (1), with the UI's keys, and its section after Loudness
+    dl = rep["delivery"]
+    assert set(dl) == {"format", "integrated_lufs", "short_term_max_lufs", "momentary_max_lufs",
+                       "lra_lu", "plr_db", "true_peak_max_dbtp", "playback_gain_db",
+                       "references_lufs", "codec_headroom"}
+    assert dl["format"] == {"sample_rate": FS, "bits": None, "dither": None, "ceiling_dbtp": None}
+    assert dl["integrated_lufs"] == {"before": rep["before"]["integrated_lufs"],
+                                     "after": rep["after"]["integrated_lufs"]}
+    assert set(dl["playback_gain_db"]) == set(dl["references_lufs"]) == set(evaluate.PLATFORM_LUFS)
+    assert dl["playback_gain_db"]["spotify"] == pytest.approx(-14.0 - rep["after"]["integrated_lufs"])
+    assert dl["playback_gain_db"]["apple"] == pytest.approx(-16.0 - rep["after"]["integrated_lufs"])
+    assert dl["codec_headroom"] == {"tp_limit_dbtp": -1.0, "tp_limit_loud_dbtp": -2.0,
+                                    "loud_above_lufs": -14.0,
+                                    "ok": dl["true_peak_max_dbtp"]["after"] <= -1.0
+                                    and (rep["after"]["integrated_lufs"] <= -14.0
+                                         or dl["true_peak_max_dbtp"]["after"] <= -2.0)}
+    assert md.index("## Loudness") < md.index("## Delivery") < md.index("## Flags")
+    for s in ("| Spotify (Normal) | -14 LUFS |", "| Apple Music (Sound Check) | -16 LUFS |",
+              "approximate", "Lossy-codec headroom", "-1 dBTP for lossy delivery",
+              "-2 dBTP when the master is louder than -14 LUFS"):
+        assert s in md, s
+    # no plan, so no -1 dBTP delivery: the delivery check is there but never short
+    chk = {c["kind"]: c for c in rep["flags_structured"]}
+    assert chk["delivery"]["value"] == dl["true_peak_max_dbtp"]["after"] and not chk["delivery"]["short"]
 
 
 def test_distance_to_master_resamples(pair):
@@ -240,3 +277,65 @@ def test_report_md_warnings_and_budget_sections(tmp_path):
     # 1 to 2 decimals: no number in report.md carries more
     import re
     assert not re.search(r"\d\.\d{3,}", md)
+    # the plan's export and ceiling in the delivery block
+    assert rep["delivery"]["format"] == {"sample_rate": FS, "bits": 24, "dither": "none",
+                                         "ceiling_dbtp": -0.3}
+    assert "24-bit PCM WAV, 44100 Hz, stereo, no dither; limiter ceiling -0.30 dBTP" in md
+
+
+def _delivery_rep(ceiling, tp, integrated):
+    before = {"integrated_lufs": -20.0, "short_term_max_lufs": -17.0, "momentary_max_lufs": -15.0,
+              "lra_lu": 6.0, "plr_db": 12.0, "true_peak_max_dbtp": -4.0}
+    after = {"integrated_lufs": integrated, "short_term_max_lufs": integrated + 0.6,
+             "momentary_max_lufs": integrated + 1.5, "lra_lu": 4.1, "plr_db": tp - integrated,
+             "true_peak_max_dbtp": tp}
+    rec = {"output": {"bits": 16 if ceiling == -1.0 else 24,
+                      "dither": "tpdf" if ceiling == -1.0 else "none"}, "ceiling_dbtp": ceiling}
+    d = evaluate._delivery(before, after, 44100, None, None, rec)
+    return {"delivery": d, "after": {**after, "true_peak_4x_dbtp": tp, "true_peak_dbtp": tp - 0.01,
+                                     "true_peak_32x_dbtp": tp}}
+
+
+def test_delivery_object_and_flag():
+    """Metering audit 2026-11-10 finding 1: playback gain = reference - integrated; the codec
+    headroom rules (-1 dBTP for lossy delivery, -2 dBTP above -14 LUFS); the flag is short
+    only for a -1 dBTP delivery that breaks a rule, never for the -0.3 dBTP Master export."""
+    # the default master: loud and at -0.3 dBTP breaks both rules; stated, not flagged
+    rep = _delivery_rep(-0.3, -0.3, -7.5)
+    d = rep["delivery"]
+    assert d["format"] == {"sample_rate": 44100, "bits": 24, "dither": "none", "ceiling_dbtp": -0.3}
+    assert d["playback_gain_db"] == pytest.approx(
+        {"spotify": -6.5, "spotify_loud": -3.5, "apple": -8.5, "youtube": -6.5, "tidal": -6.5,
+         "amazon": -6.5, "deezer": -7.5})
+    assert d["references_lufs"] == evaluate.PLATFORM_LUFS and not d["codec_headroom"]["ok"]
+    c = {k["kind"]: k for k in evaluate._checks(rep)}["delivery"]
+    assert (c["value"], c["target"], c["short"], c["text"]) == (-0.3, -2.0, False, None)
+    md = "\n".join(evaluate._delivery_md(rep))
+    assert "meets neither" in md and "| Spotify (Normal) | -14 LUFS | -6.5 dB | -6.8 dBTP |" in md
+    assert "| Deezer | -15 LUFS | -7.5 dB | -7.8 dBTP |" in md and "approximate" in md
+    assert "- File: 24-bit PCM WAV, 44100 Hz, stereo, no dither; limiter ceiling -0.30 dBTP." in md
+    # a streaming / CD delivery (-1 dBTP) of a loud master: -1 met, -2 not: short
+    rep = _delivery_rep(-1.0, -1.0, -7.5)
+    c = {k["kind"]: k for k in evaluate._checks(rep)}["delivery"]
+    assert c["short"] and c["target"] == -2.0 and "louder than -14 LUFS" in c["text"]
+    assert not rep["delivery"]["codec_headroom"]["ok"]
+    assert "meets the -1 dBTP rule but not the -2 dBTP rule" in "\n".join(evaluate._delivery_md(rep))
+    assert evaluate._flags(rep) == [c["text"]]
+    # the same delivery at -14 LUFS or quieter meets both: quiet
+    rep = _delivery_rep(-1.0, -1.0, -15.0)
+    c = {k["kind"]: k for k in evaluate._checks(rep)}["delivery"]
+    assert not c["short"] and c["target"] == -1.0 and rep["delivery"]["codec_headroom"]["ok"]
+    assert "meets both" in "\n".join(evaluate._delivery_md(rep))
+    assert rep["delivery"]["playback_gain_db"]["spotify"] == pytest.approx(1.0)   # turned up
+    # a -1 dBTP delivery whose file reads above -1 (a quiet one): the -1 rule, short
+    rep = _delivery_rep(-1.0, -0.9, -15.0)
+    c = {k["kind"]: k for k in evaluate._checks(rep)}["delivery"]
+    assert c["short"] and c["target"] == -1.0 and "lossy delivery" in c["text"]
+    assert "is above the -1 dBTP rule" in "\n".join(evaluate._delivery_md(rep))
+    # silence: no playback gain, the headroom trivially met, nothing crashes
+    rep = _delivery_rep(-1.0, -math.inf, -math.inf)
+    assert all(math.isnan(v) for v in rep["delivery"]["playback_gain_db"].values())
+    assert rep["delivery"]["codec_headroom"]["ok"]
+    evaluate._delivery_md(evaluate._clean(rep))
+    # a report made before the delivery object: no delivery check
+    assert "delivery" not in {k["kind"] for k in evaluate._checks({"before": {}, "after": {}})}

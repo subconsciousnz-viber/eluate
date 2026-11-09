@@ -168,7 +168,9 @@ def _settings(d: Doc, rep, src, run):
         f"Preserve mix: {'on' if c.get('preserve_mix') else 'off'}.",
         f"Tempo: {_f(ch.get('bpm'), 1)} BPM ({ch.get('bpm_source', 'detected')}); timing preset "
         f"{ch.get('preset', 'n/a')} ({ch.get('reason', '')}).",
-        f"Delivery: {'streaming (-1 dBTP, 16-bit with dither)' if c.get('streaming') else 'master (-0.3 dBTP, 24-bit)'}.",
+        "Delivery: " + ("CD (44.1 kHz, 16-bit with dither, -1 dBTP)" if c.get("cd")
+                        else "streaming (-1 dBTP, 24-bit)" if c.get("streaming")
+                        else "master (-0.3 dBTP, 24-bit)") + ".",
         f"Source: {src.get('path')}.",
     ])
 
@@ -208,7 +210,18 @@ def _result(d: Doc, rep, rep_tilt):
              if rep["after"].get("crest_db") is not None else "")
     d.p(f"Crest (peak against the loud-passage RMS) and loudness range: {crest}PLR "
         f"{_f(rep['before']['plr_db'])} to {_f(rep['after']['plr_db'])} dB, loudness range {_f(rep['before']['lra_lu'])} to "
-        f"{_f(rep['after']['lra_lu'])} LU. True peak {_f(rep['after']['true_peak_dbtp'], 2)} dBTP.")
+        f"{_f(rep['after']['lra_lu'])} LU. True peak {_f(_true_peak(rep['after']), 2)} dBTP "
+        "(the worst of the 4x, 8x and 32x readings).")
+
+
+def _true_peak(side: dict):
+    """report.json true_peak_max_dbtp (evaluate.measure_track); the worst reading an older
+    report holds."""
+    if side.get("true_peak_max_dbtp") is not None:
+        return side["true_peak_max_dbtp"]
+    vals = [side.get(k) for k in ("true_peak_4x_dbtp", "true_peak_dbtp", "true_peak_32x_dbtp")]
+    vals = [v for v in vals if v is not None]
+    return max(vals) if vals else None
 
 
 def _chain(d: Doc, rep):

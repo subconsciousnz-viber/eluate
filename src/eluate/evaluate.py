@@ -3,10 +3,13 @@
 Contract:
 - `measure_track(x, fs, sections, crossovers_hz) -> dict` (JSON-safe): S95,
   loud-section integrated, integrated, LRA, the 1 s RMS of the loudest section
-  and the loudest 1 s (meter.rms_1s, plain dBFS), true peak at 8x (meter, the
-  constrained reading), 32x (FFT zero-padding, stages/limiter.true_peak_fft,
-  the reading the ceiling is checked against, audit 05 D.23) and 4x (BS.1770
-  Annex 2, compliance), sample peak, PLR, PSR p95, per-section integrated
+  and the loudest 1 s (meter.rms_1s, plain dBFS), true peak at 8x (meter), 32x
+  (FFT zero-padding, stages/limiter.true_peak_fft, audit 05 D.23) and 4x
+  (BS.1770 Annex 2, compliance), and `true_peak_max_dbtp`, the maximum of the
+  three (the reading the solver's "worst" meter constrains and the one the UI,
+  the batch summary and the process log show as the true peak; the 8x reading
+  alone under-reads full-band material by up to 0.5 dB, metering audit
+  2026-11-10 finding 3), sample peak, PLR, PSR p95, per-section integrated
   loudness, per-band crest p95 over M / S / stereo (multiband.band_crest, the
   solver's re-split measure), per-band L/R correlation and S/M ratio
   (features.stereo), fitted slope per view and sub shelf (features.tilt), and
@@ -39,7 +42,22 @@ Contract:
   noise.assess of the premaster's and the master's floors. `warnings` holds
   the solver's structured warnings (budget warnings and the loudness shortfall;
   the plan's budget warnings without a solve) and `loudness` the target and the
-  RMS (plain and AES17) and S95 before and after. report.md (chunk 4) opens
+  RMS and S95 before and after: `*_rms_dbfs` and `*_rms_aes17_dbfs` both hold the
+  maintainer's meter reading (300 ms, AES17, loudest passage; the two keys are kept
+  for their consumers, metering audit 2026-11-10 finding 8), `*_rms_1s_dbfs` the
+  plain 1 s loudest-section reading. `delivery` (metering audit 2026-11-10 finding
+  1; the keys are the UI's contract) holds `format` {sample_rate, bits, dither,
+  ceiling_dbtp}, before / after pairs of integrated_lufs, short_term_max_lufs,
+  momentary_max_lufs, lra_lu, plr_db and true_peak_max_dbtp, `playback_gain_db`
+  per platform (PLATFORM_LUFS reference - integrated after; negative = turned
+  down), `references_lufs` (PLATFORM_LUFS) and `codec_headroom` {tp_limit_dbtp
+  CODEC_TP_LIMIT_DBTP, tp_limit_loud_dbtp CODEC_TP_LIMIT_LOUD_DBTP, loud_above_lufs
+  CODEC_LOUD_ABOVE_LUFS, ok: the master's true peak meets both rules}. The
+  structured check `delivery` carries the true peak against the rule that applies
+  (-2 dBTP above -14 LUFS, else -1) and is short only when the output plan is a
+  -1 dBTP delivery (streaming or CD) that breaks a rule: the -0.3 dBTP Master
+  export is a maintainer ruling, so there the Delivery section states the facts
+  and the flag stays quiet. report.md (chunk 4) opens
   with Warnings (each warning in plain language, `warning_text`, naming the
   stage, band and M / S / both, needed against cap, and any loudness
   shortfall, "at least" when the limiter's needed GR comes from the measured shortfall,
@@ -47,7 +65,11 @@ Contract:
   other targets missed), then Gain reduction against budget
   (per stage, band and channel: the average peak GR, the outlier peak GR, the
   budget, the outlier cap and the status ok / over / under, maintainer 2026-10-19), Loudness (RMS with the
-  AES17 value in brackets, S95), Flags and What was done (stage by stage, then
+  AES17 value in brackets, S95), Delivery (the file's format, the integrated /
+  short-term max / momentary max / LRA / PLR / true-peak-max lines, a table per
+  platform of reference LUFS, playback gain and the peak after it, marked
+  approximate, and the codec-headroom line stating both rules and whether this
+  master meets them), Flags and What was done (stage by stage, then
   every solver move kept or reverted, with the section contrast when a move was
   reverted for flattening the sections). Numbers carry 1 or 2 decimals and no
   section prints a raw Python list or dict.
@@ -98,6 +120,27 @@ FLAG_SUB_DB = 3.0
 FLAG_CORR_DROP = 0.25
 FLAG_CREST_DB = 7.1           # the maintainer's masters' lowest crest (meter.crest_db, work/corpus)
 
+# Delivery (metering audit 2026-11-10, finding 1). The reference loudness each platform
+# normalises a track to (BS.1770 integrated LUFS) and the true-peak advice. These are the
+# platforms' published or widely reported values as of 2026 and approximate: Spotify
+# publishes -14 (Normal), -11 (Loud) and the two true-peak rules below; Apple (Sound
+# Check), YouTube, Tidal, Amazon and Deezer are consistent third-party measurements
+# (iZotope, LANDR, Production Expert, MeterPlugs) and can change. Playback gain =
+# reference - integrated (negative = turned down). Kept in one place so a change of a
+# platform's level touches nothing else.
+PLATFORM_LUFS = {"spotify": -14.0, "spotify_loud": -11.0, "apple": -16.0, "youtube": -14.0,
+                 "tidal": -14.0, "amazon": -14.0, "deezer": -15.0}
+PLATFORM_NAMES = {"spotify": "Spotify (Normal)", "spotify_loud": "Spotify (Loud)",
+                  "apple": "Apple Music (Sound Check)", "youtube": "YouTube", "tidal": "Tidal",
+                  "amazon": "Amazon Music", "deezer": "Deezer"}
+CODEC_TP_LIMIT_DBTP = -1.0         # lossy delivery: Spotify, AES TD1008
+CODEC_TP_LIMIT_LOUD_DBTP = -2.0    # Spotify, for masters louder than CODEC_LOUD_ABOVE_LUFS
+CODEC_LOUD_ABOVE_LUFS = -14.0
+# an output plan whose ceiling is at or below this is a delivery for lossy codecs or CD
+# (--streaming, --cd); only there is the delivery check short. The -0.3 dBTP Master export
+# is the maintainer's ruling (docs/gain-staging.md 3 "Ceiling").
+LOSSY_DELIVERY_CEILING_DBTP = -1.0
+
 
 def _clean(v):
     """JSON-safe copy: numpy to Python, non-finite floats to None."""
@@ -127,6 +170,9 @@ def measure_track(x: np.ndarray, fs: int, sections=(), crossovers_hz=bands.DEFAU
     x = np.asarray(x, dtype=np.float64)
     m = meter.measure(x, fs)
     m["true_peak_32x_dbtp"] = lim.true_peak_fft(x)
+    # the constrained reading: the worst of the three meters (module contract)
+    m["true_peak_max_dbtp"] = max(m["true_peak_4x_dbtp"], m["true_peak_dbtp"],
+                                  m["true_peak_32x_dbtp"])
     m["section_lufs"] = section_loudness(x, fs, sections) if sections else []
     m["crest_p95_db"] = mb_stage.band_crest(x, fs, crossovers_hz)["p95_db"]
     ctx = Context(x, fs, crossovers_hz)
@@ -208,7 +254,7 @@ def distance_to_master(ours: np.ndarray, theirs: np.ndarray, fs: int, fs_theirs:
     a = measure_track(ours, fs, (), crossovers_hz, short_term=False)
     b = measure_track(theirs, fs, (), crossovers_hz, short_term=False)
     keys = ("s95_lufs", "integrated_lufs", "plr_db", "psr_p95_db", "true_peak_dbtp",
-            "true_peak_32x_dbtp", "lra_lu")
+            "true_peak_32x_dbtp", "true_peak_max_dbtp", "lra_lu")
     d = {k: {"ours": a[k], "theirs": b[k], "diff": a[k] - b[k]} for k in keys}
     d["slope_stereo"] = {"ours": a["slope_db_oct"]["stereo"], "theirs": b["slope_db_oct"]["stereo"],
                          "diff": a["slope_db_oct"]["stereo"] - b["slope_db_oct"]["stereo"]}
@@ -515,6 +561,21 @@ def _checks(rep: dict) -> list[dict]:
                     f"premaster and {nz['after_db']:.1f} dB after the master, above the "
                     f"{nz['threshold_db']:g} dB threshold in both.")
         out.append(_check("noise", nz["after_db"], nz.get("threshold_db"), 0.0, short, text))
+    dl = rep.get("delivery") or {}
+    tpm = (dl.get("true_peak_max_dbtp") or {}).get("after")
+    if tpm is not None and dl.get("codec_headroom"):
+        i = (dl.get("integrated_lufs") or {}).get("after")
+        ceiling = (dl.get("format") or {}).get("ceiling_dbtp")
+        loud = i is not None and i > CODEC_LOUD_ABOVE_LUFS
+        limit = CODEC_TP_LIMIT_LOUD_DBTP if loud else CODEC_TP_LIMIT_DBTP
+        lossy = ceiling is not None and ceiling <= LOSSY_DELIVERY_CEILING_DBTP + 1e-9
+        short = lossy and not dl["codec_headroom"].get("ok", True)
+        text = (f"Delivery: true peak {tpm:.2f} dBTP"
+                + (f" at {i:.1f} LUFS integrated" if i is not None else "")
+                + f", above the {limit:g} dBTP for "
+                + (f"masters louder than {CODEC_LOUD_ABOVE_LUFS:g} LUFS" if loud
+                   else "lossy delivery") + " (platform rules, approximate).")
+        out.append(_check("delivery", tpm, limit, 0.0, short, text))
     return out
 
 
@@ -526,6 +587,50 @@ def _flags(rep: dict, checks: list[dict] | None = None) -> list[str]:
     heuristic checks (FLAG_*), meant to point the listener at something, not to fail."""
     return [c["text"] for c in (checks if checks is not None else _checks(rep))
             if c["short"] and c["kind"] not in _SOLVER_KINDS]
+
+
+def _finite(v) -> bool:
+    return v is not None and math.isfinite(float(v))
+
+
+def _delivery(before: dict, after: dict, fs: int, plan, targets, plan_rec) -> dict:
+    """The `delivery` object (module contract): the file's format, the delivery readings
+    before and after, the playback gain per platform (PLATFORM_LUFS) and the codec-headroom
+    check on the master."""
+    rec = plan_rec or {}
+    if plan is not None and plan.output is not None:
+        bits, dither = int(plan.output.bits), plan.output.dither
+    elif rec.get("output"):
+        bits, dither = rec["output"].get("bits"), rec["output"].get("dither")
+    else:
+        bits = dither = None
+    if plan is not None and plan.limiter is not None:
+        ceiling = float(plan.limiter.ceiling_dbtp)
+    elif targets is not None:
+        ceiling = float(targets.true_peak_max_dbtp)
+    else:
+        ceiling = rec.get("ceiling_dbtp")
+
+    def pair(k):
+        return {"before": before[k], "after": after[k]}
+
+    i, tp = after["integrated_lufs"], after["true_peak_max_dbtp"]
+    gains = {k: (ref - i) if _finite(i) else math.nan for k, ref in PLATFORM_LUFS.items()}
+    tp_known = tp is not None and not math.isnan(tp)          # -inf (silence) is a reading
+    loud = _finite(i) and i > CODEC_LOUD_ABOVE_LUFS
+    ok = (tp_known and tp <= CODEC_TP_LIMIT_DBTP
+          and (not loud or tp <= CODEC_TP_LIMIT_LOUD_DBTP))
+    return {"format": {"sample_rate": int(fs), "bits": bits, "dither": dither,
+                       "ceiling_dbtp": ceiling},
+            "integrated_lufs": pair("integrated_lufs"),
+            "short_term_max_lufs": pair("short_term_max_lufs"),
+            "momentary_max_lufs": pair("momentary_max_lufs"),
+            "lra_lu": pair("lra_lu"), "plr_db": pair("plr_db"),
+            "true_peak_max_dbtp": pair("true_peak_max_dbtp"),
+            "playback_gain_db": gains, "references_lufs": dict(PLATFORM_LUFS),
+            "codec_headroom": {"tp_limit_dbtp": CODEC_TP_LIMIT_DBTP,
+                               "tp_limit_loud_dbtp": CODEC_TP_LIMIT_LOUD_DBTP,
+                               "loud_above_lufs": CODEC_LOUD_ABOVE_LUFS, "ok": bool(ok)}}
 
 
 def report(x: np.ndarray, y: np.ndarray, fs: int, out_dir, plan=None, targets=None,
@@ -543,7 +648,8 @@ def report(x: np.ndarray, y: np.ndarray, fs: int, out_dir, plan=None, targets=No
         gr_est = limiter_gr_estimate(z * 10.0 ** (plan.limiter.input_gain_db / 20.0), y, fs)
     plots = _plots(out, before, after, secs, plan, gr_est, fs)
     scal = ("s95_lufs", "loud_section_lufs", "integrated_lufs", "lra_lu", "true_peak_dbtp",
-            "true_peak_32x_dbtp", "true_peak_4x_dbtp", "sample_peak_dbfs", "plr_db",
+            "true_peak_32x_dbtp", "true_peak_4x_dbtp", "true_peak_max_dbtp", "sample_peak_dbfs",
+            "plr_db",
             "psr_p95_db", "momentary_max_lufs", "short_term_max_lufs", "rms_meter_dbfs",
             "rms_meter_max_dbfs", "rms_1s_loud_dbfs", "rms_1s_max_dbfs", "crest_db")
     rep = {"before": {k: before[k] for k in scal}, "after": {k: after[k] for k in scal}}
@@ -592,6 +698,7 @@ def report(x: np.ndarray, y: np.ndarray, fs: int, out_dir, plan=None, targets=No
                        "before_rms_1s_dbfs": before["rms_1s_loud_dbfs"],
                        "after_rms_1s_dbfs": after["rms_1s_loud_dbfs"],
                        "before_s95_lufs": before["s95_lufs"], "after_s95_lufs": after["s95_lufs"]}
+    rep["delivery"] = _delivery(before, after, fs, plan, targets, plan_rec)
     nb = noise.floor(x, fs)
     rep["noise"] = noise.assess(nb, noise.floor(y, fs, quiet=nb["quiet"]))
     rep["planner"] = {k: v for k, v in (plan_rec or {}).items() if k != "notches"}
@@ -918,6 +1025,7 @@ _METRIC = {"rms_meter_dbfs": ("RMS, Ozone meter (300 ms, AES17, loudest passage)
            "true_peak_dbtp": ("True peak 8x", "dBTP"),
            "true_peak_32x_dbtp": ("True peak 32x", "dBTP"),
            "true_peak_4x_dbtp": ("True peak 4x (BS.1770)", "dBTP"),
+           "true_peak_max_dbtp": ("True peak, max of 4x / 8x / 32x", "dBTP"),
            "sample_peak_dbfs": ("Sample peak", "dBFS"), "plr_db": ("PLR", "dB"),
            "psr_p95_db": ("PSR p95", "dB"), "momentary_max_lufs": ("Momentary max", "LUFS"),
            "short_term_max_lufs": ("Short-term max", "LUFS"),
@@ -957,6 +1065,7 @@ def report_md(rep: dict) -> str:
         L.append(f"- Solver: {s.get('renders')} renders, runtime {_f(s.get('runtime_s'), 0)} s; "
                  f"crest mode {t_.get('crest_mode')}, true-peak meter {t_.get('tp_meter')}.")
     L.append("")
+    L += _delivery_md(rep)
     fl = rep.get("flags")
     if fl is not None:
         L += ["## Flags", ""] + ([f"- {x}" for x in fl] or ["- none"]) + [""]
@@ -1024,6 +1133,77 @@ def report_md(rep: dict) -> str:
     if rep["plots"]:
         L += ["Plots: " + ", ".join(rep["plots"]), ""]
     return "\n".join(L)
+
+
+def _delivery_md(rep: dict) -> list[str]:
+    """The Delivery section (module contract): format, the delivery readings, the per-platform
+    playback table (approximate) and the codec-headroom line with both rules."""
+    dl = rep.get("delivery")
+    if not dl:
+        return []
+    f = dl.get("format") or {}
+    bits = f.get("bits")
+    word = "32-bit float" if bits == 32 else f"{bits}-bit PCM" if bits else "PCM"
+    dith = {"tpdf": "TPDF dither", "none": "no dither"}.get(f.get("dither"))
+    sr = f.get("sample_rate")
+    ceil_ = f.get("ceiling_dbtp")
+    L = ["## Delivery", ""]
+    L.append(f"- File: {word} WAV" + (f", {sr} Hz" if sr else "") + ", stereo"
+             + (f", {dith}" if dith else "")
+             + (f"; limiter ceiling {_f(ceil_)} dBTP" if ceil_ is not None else "") + ".")
+
+    def val(k, side="after"):
+        return (dl.get(k) or {}).get(side)
+
+    L.append(f"- Integrated {_f(val('integrated_lufs'))} LUFS (premaster "
+             f"{_f(val('integrated_lufs', 'before'))}); short-term max "
+             f"{_f(val('short_term_max_lufs'))} LUFS; momentary max "
+             f"{_f(val('momentary_max_lufs'))} LUFS; loudness range {_f(val('lra_lu'), 1)} LU; "
+             f"PLR {_f(val('plr_db'), 1)} dB.")
+    af = rep.get("after") or {}
+    tp = val("true_peak_max_dbtp")
+    L.append(f"- True peak {_f(tp)} dBTP, the maximum of the 4x BS.1770 "
+             f"({_f(af.get('true_peak_4x_dbtp'))}), 8x ({_f(af.get('true_peak_dbtp'))}) and 32x "
+             f"({_f(af.get('true_peak_32x_dbtp'))}) readings; premaster "
+             f"{_f(val('true_peak_max_dbtp', 'before'))} dBTP.")
+    L += ["- Playback on loudness-normalised services (track normalisation on integrated LUFS; "
+          "the reference levels are the platforms' published or reported values as of 2026, "
+          "approximate, and change):", "",
+          "| service | reference (approx.) | playback gain | peak after playback gain |",
+          "|---|---|---|---|"]
+    gains = dl.get("playback_gain_db") or {}
+    for k, ref in (dl.get("references_lufs") or {}).items():
+        gn = gains.get(k)
+        at = None if gn is None or tp is None else tp + gn
+        L.append(f"| {PLATFORM_NAMES.get(k, k)} | {_f(ref, 0)} LUFS | {_f(gn, 1)} dB | "
+                 f"{_f(at, 1)} dBTP |")
+    L += ["", "  A positive gain is what a service would need to turn the track up: Spotify "
+          "caps it so the peak stays under -1 dBTP, and YouTube and Tidal only turn tracks down."]
+    ch = dl.get("codec_headroom") or {}
+    lim1, lim2, above = (ch.get("tp_limit_dbtp", CODEC_TP_LIMIT_DBTP),
+                         ch.get("tp_limit_loud_dbtp", CODEC_TP_LIMIT_LOUD_DBTP),
+                         ch.get("loud_above_lufs", CODEC_LOUD_ABOVE_LUFS))
+    i = val("integrated_lufs")
+    rule1 = tp is not None and tp <= lim1
+    loud = i is not None and i > above
+    rule2 = tp is not None and tp <= lim2
+    if tp is None:
+        verdict = "has no true-peak reading"
+    elif rule1 and (not loud or rule2):
+        verdict = "meets both"
+    elif rule1:
+        verdict = f"meets the {lim1:g} dBTP rule but not the {lim2:g} dBTP rule for loud masters"
+    elif not loud:
+        verdict = f"is above the {lim1:g} dBTP rule (the {lim2:g} dBTP rule applies only above {above:g} LUFS)"
+    else:
+        verdict = "meets neither"
+    L.append(f"- Lossy-codec headroom: the rules are a true peak at or below {lim1:g} dBTP for "
+             f"lossy delivery (Spotify, AES TD1008) and at or below {lim2:g} dBTP when the master "
+             f"is louder than {above:g} LUFS integrated (Spotify). This master, at {_f(tp)} dBTP "
+             f"and {_f(i, 1)} LUFS, {verdict}."
+             + ("" if ch.get("ok") else " The -1 dBTP deliveries are --streaming (24-bit) and "
+                "--cd (44.1 kHz, 16-bit with dither)."))
+    return L + [""]
 
 
 def _gain_reduction_md(rep: dict) -> list[str]:
