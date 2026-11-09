@@ -34,13 +34,17 @@ Contract:
   27 ms, which puts the next hit's attack inside the previous beat interval;
   aligning to the kicks alone needed a kick on half the beats, so DnB and
   hip-hop patterns kept the lag (measured 18 to 22 ms; with all onsets 0.1 to
-  2.5 ms). Short clips (REFIT_MAX_S = 15 s, constant grid, no user bpm; F16):
-  before the shift the constant grid's t0 and period are refitted by least
-  squares to the matched onsets (REFIT_MIN_BEATS, period within REFIT_MAX_DEV
-  of the tracked one, up to REFIT_ITER passes): librosa's 12.5 ms beat frames
-  fitted over 12 beats read a 128 BPM clip at 131.3; the sample-accurate
-  onsets read 128.0. `tempo_bpm` follows the refit (`beat_align` records
-  coverage, shift and the refit tempo).
+  2.5 ms). Refit (F6 / F16; a constant grid without a user bpm): before the
+  shift the grid's t0 and period are refitted by least squares to the
+  matched onsets (REFIT_MIN_BEATS, period within REFIT_MAX_DEV of the tracked
+  one, up to REFIT_ITER passes). librosa's 12.5 ms beat frames fitted over a
+  dozen beats read a 128 BPM 5 s clip at 131.3 (10 s 128.14, 20 s 128.27,
+  which drifts the grid ends by 20 ms); the sample-accurate onsets read
+  127.9, 128.00 and 127.99, and every fixture loop (four-on-the-floor, DnB,
+  hip-hop, kickless, 10 to 60 s) within 0.01 BPM with the grid's median
+  offset from the true beats 0.7 to 2.4 ms and its 90th percentile <= 3.4 ms.
+  `tempo_bpm` follows the refit (`beat_align` records coverage, shift and the
+  refit tempo).
   A tracked grid at half the hypothesis tempo is subdivided (midpoints), so
   the grid, `tempo_bpm` and the plan's hits (one per beat) follow the octave
   decision (S3); `tempo_octave` is then "doubled from lattice" unless the kick check
@@ -62,7 +66,8 @@ Contract:
   anything, so "fewer than 4 beats" never fired (an ambient pad read 135 to
   175 BPM, pink noise 113.5, both "tracked" and trusted). `grid_informative`
   now needs metrical evidence, recorded in `grid_evidence` and summarised in
-  `grid_reason`: at least GRID_MIN_ONSETS onsets in the track; an onset
+  `grid_reason`: at least GRID_MIN_BEATS beats (F16) and GRID_MIN_ONSETS
+  onsets in the track; an onset
   within the alignment tolerance at >= GRID_MIN_COVERAGE of the beats
   (`beat_onset_coverage`); and the onset strength at the beats (max over the
   3 frames around each) at least GRID_MIN_CONTRAST x the mean onset strength
@@ -71,10 +76,15 @@ Contract:
   fixtures and a 120 -> 140 BPM tempo change read coverage 0.77 to 1.0 and
   contrast 2.2 to 18; an ambient pad, pink noise, a sustained chord and a
   quiet noise bed read 1 onset, coverage 0.0 and contrast 1.33 to 1.39. The
-  autocorrelation heights at the tempo (`acf_upper`, `acf_kick`), the
-  constant-fit residual, the metrical relation and `kick_consistency` are
-  recorded as evidence, not voted: a sustained chord's kick-band ACF read
-  0.74 at an invented 125 BPM. A user `bpm` is informative by definition
+  autocorrelation heights at the tempo (`acf_upper`, `acf_kick`), whether the
+  constant fit held, the local tempo stability (`tracked_ibi_cv`, the spread
+  of librosa's own beat intervals), the onsets per beat, the metrical
+  relation and `kick_consistency` are recorded as evidence, not voted: a
+  sustained chord's kick-band ACF read 0.74 at an invented 125 BPM, and the
+  interval spread of beatless material (0.066 to 0.075) overlaps a 5 s
+  groove clip's (0.075). Off-beat hats over a bass and pad with no on-beat
+  hit read 189 BPM against 128 and coverage 0.33: uninformative, which is
+  the right answer for a wrong grid. A user `bpm` is informative by definition
   (reason "user bpm"); the beatless default grid (120 BPM from t = 0, fewer
   than 4 tracked beats) never is. The plan must not trust an uninformative
   grid's beats (planner.plan_hits falls back to 400 ms frames); `tempo_bpm`
@@ -192,22 +202,29 @@ DROP_AFTER_BEATS = 16
 DROP_MIN_GAP_BEATS = 32
 ALIGN_TOL_S = 0.040      # a beat is on an onset within this (or a quarter interval if shorter); librosa's lag is 17 to 27 ms
 ALIGN_MIN_SHARE = 0.5    # share of beats with an onset for the median shift
-REFIT_MAX_S = 15.0       # clips shorter than this get their constant grid refitted on the onsets (F16)
 REFIT_MIN_BEATS = 4
 REFIT_MAX_DEV = 0.05     # the refitted period may differ from the tracked one by this much
 REFIT_ITER = 3
 GRID_MIN_ONSETS = 8      # informativeness (F1): onsets in the track ...
 GRID_MIN_COVERAGE = 0.5  # ... share of beats with an onset within the alignment tolerance ...
 GRID_MIN_CONTRAST = 1.8  # ... onset strength at the beats over the mean (beatless material reads 1.33 to 1.39)
+GRID_MIN_BEATS = 8       # ... and at least this many beats (F16: a 2 s clip's 4 beats fix no tempo)
 
 
 def beat_grid(onset_t, onset_env, dur: float, start_active: bool = True, bpm: float | None = None,
-              fixed: bool = False):
+              fixed: bool = False, info: dict | None = None):
     """`bpm` seeds librosa's tracker; with `fixed` (the user's tempo) the grid
-    period is 60 / bpm exactly and only its phase is fitted (median offset)."""
+    period is 60 / bpm exactly and only its phase is fitted (median offset).
+    `info`, when given, receives "tracked_beats" (librosa's beat count) and
+    "ibi_cv" (the coefficient of variation of its beat intervals: local tempo
+    stability, F1 evidence)."""
     tempo, beats = librosa.beat.beat_track(onset_envelope=onset_env.astype(np.float32), sr=AR,
                                            hop_length=256, units="time", trim=False, bpm=bpm)
     beats = np.asarray(beats, dtype=np.float64)
+    if info is not None:
+        d = np.diff(beats)
+        info["tracked_beats"] = int(beats.size)
+        info["ibi_cv"] = float(np.std(d) / np.mean(d)) if d.size >= 2 and np.mean(d) > 0 else float("nan")
     if beats.size < 4:
         t = 60.0 / (bpm if fixed else 120.0)
         return np.arange(0.0, dur, t), 60.0 / t, "default"
@@ -595,7 +612,7 @@ def align_to_onsets(beats: np.ndarray, onsets, dur: float, start_active: bool = 
     trail the attack by 17 to 27 ms, enough to put the next hit's attack inside
     a beat interval. `onsets` is the SuperFlux + kick union (any onset marks a
     beat, not only a kick, so patterns without a kick on every beat align too).
-    With `refit` (a short clip's constant grid, F16) the grid's t0 and period
+    With `refit` (a detected constant grid, F6 / F16) the grid's t0 and period
     are first refitted by least squares to the matched onsets (at least
     REFIT_MIN_BEATS, period within REFIT_MAX_DEV of the tracked one, REFIT_ITER
     passes at most): the sample-accurate onsets fix the tempo that librosa's
@@ -683,6 +700,9 @@ def grid_decision(kind: str, evidence: dict, user_bpm: bool) -> tuple[bool, str]
         return True, "user bpm"
     n, cov, con = evidence["onsets"], evidence["beat_onset_coverage"], evidence["onset_contrast"]
     weak = []
+    nb = int(evidence.get("beats", GRID_MIN_BEATS))
+    if nb < GRID_MIN_BEATS:
+        weak.append(f"{nb} beats (< {GRID_MIN_BEATS})")
     if n < GRID_MIN_ONSETS:
         weak.append(f"{n} onset{'s' if n != 1 else ''} in the track (< {GRID_MIN_ONSETS})")
     if cov < GRID_MIN_COVERAGE:
@@ -859,7 +879,7 @@ def analyse(x: np.ndarray, fs: float, ctx: Context | None = None, onset=None,
             onset_times=None) -> dict:
     """See the module docstring. `onset_times` (transients.py's SuperFlux + kick
     union) aligns the grid and carries the informativeness evidence; when it is
-    not given the kick onsets serve for both."""
+    not given the same union is formed here (SuperFlux on ctx plus `kick_onsets`)."""
     ctx = ensure_context(x, fs, ctx)
     g = ctx.grid
     dur = ctx.x.shape[0] / ctx.fs
@@ -874,9 +894,10 @@ def analyse(x: np.ndarray, fs: float, ctx: Context | None = None, onset=None,
     start_active = peak > 0 and float(np.max(np.abs(ctx.x[:m0]))) > peak * 10 ** (START_ACTIVE_DB / 20)
     odfs = band_odfs(ctx.x, ctx.fs)
     mh = metrical_hypothesis(ctx.x, ctx.fs, bpm, odfs=odfs)
+    track_info: dict = {}
     beats, tempo, kind = beat_grid(onset[0], onset[1], dur, start_active,
                                    bpm=mh["tempo_bpm"] if np.isfinite(mh["tempo_bpm"]) else None,
-                                   fixed=bpm is not None)
+                                   fixed=bpm is not None, info=track_info)
     if bpm is None and beats.size >= 2 and _relation(tempo, mh["tempo_bpm"]) == "/2":
         beats, tempo = _subdivide(beats, dur), tempo * 2.0  # the tracker fell back an octave
     if bpm is None:
@@ -887,14 +908,26 @@ def analyse(x: np.ndarray, fs: float, ctx: Context | None = None, onset=None,
     else:
         octave = "user"  # the user's tempo is not second-guessed
     kc = kick_consistency(kick_onsets, tempo, mh["kick_pulse_bpm"])
-    align_src = onset_times if onset_times is not None else kick_onsets
+    if onset_times is None:
+        # standalone call: transients.analyse's onset union (SuperFlux + the kicks given)
+        from .transients import UNION_GAP_S, superflux_onsets
+        sf_on = superflux_onsets(ctx)[0]
+        kk = np.asarray(kick_onsets if kick_onsets is not None else [], dtype=np.float64)
+        add = [k for k in kk if sf_on.size == 0 or np.min(np.abs(sf_on - k)) > UNION_GAP_S]
+        onset_times = np.sort(np.concatenate([sf_on, np.asarray(add, dtype=np.float64)]))
+    align_src = onset_times
     beats, beat_shift, align = align_to_onsets(beats, align_src, dur, start_active,
-                                               refit=bpm is None and kind == "constant" and dur < REFIT_MAX_S)
+                                               refit=bpm is None and kind == "constant")
     if align["refit_bpm"] is not None:
         tempo = align["refit_bpm"]
     evidence = grid_evidence(beats, align_src, onset[0], onset[1], tempo,
                              {name: _acf(odfs[name]) for name in odfs}, align["tolerance_s"])
     evidence["constant_fit"] = kind == "constant"
+    evidence["tracked_ibi_cv"] = track_info.get("ibi_cv", float("nan"))
+    span = float(beats[-1] - beats[0]) if beats.size > 1 else 0.0
+    n_in = int(np.count_nonzero((align_src >= beats[0]) & (align_src <= beats[-1]))) if beats.size > 1 else 0
+    evidence["onsets_per_beat"] = n_in / (beats.size - 1) if beats.size > 1 and span > 0 else float("nan")
+    evidence["beats"] = int(beats.size)
     evidence["metrical_relation"] = mh["relation"]
     evidence["kick_consistent"] = bool(kc["consistent"])
     informative, reason = grid_decision(kind, evidence, bpm is not None)
