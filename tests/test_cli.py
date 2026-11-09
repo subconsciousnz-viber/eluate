@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from fixtures.e_signals import short_track
+from fixtures.e_signals import features_with_key_confidence, short_track
 from eluate import cli, io, solver
 from eluate.plan import Plan
 
@@ -69,7 +69,8 @@ def test_bad_input_exits_2(tmp_path, capsys):
 
 
 @pytest.mark.slow
-def test_analyse_plan_render(wav, tmp_path):
+def test_analyse_plan_render(wav, tmp_path, monkeypatch):
+    features_with_key_confidence(monkeypatch)      # a confident key: the key lock
     work = tmp_path / "work"
     assert cli.main(["analyse", str(wav), "-o", str(work)]) == 0
     for f in ("features.npz", "analysis.json", "source.json"):
@@ -164,6 +165,7 @@ def test_analysis_reuse(wav, tmp_path):
 
 @pytest.mark.slow
 def test_master_and_report(wav, tmp_path, monkeypatch):
+    features_with_key_confidence(monkeypatch)      # a confident key: the key lock
     out = tmp_path / "out"
     run = cli.do_master(wav, out, cli.planner.Controls(), max_renders=3, log=lambda m: None)
     for f in ("master.wav", "plan.json", "plan.npz", "solve.json", "report.json", "report.md",

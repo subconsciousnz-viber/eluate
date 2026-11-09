@@ -9,7 +9,8 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from fixtures.e_signals import short_planner_analysis
+from fixtures.e_signals import (features_with_key_confidence, keyed_planner_analysis,
+                                short_planner_analysis)
 from eluate import bands, cli, features, io, meter, planner, solver
 from eluate.plan import (EqBell, EqHighPass, EqHighShelf, EqLowShelf, InputEqPlan, InputPlan,
                             LimiterPlan, OutputPlan, Plan)
@@ -79,7 +80,9 @@ def test_key_crossovers_names_and_fallback():
 
 @pytest.fixture(scope="module")
 def pana():
-    return short_planner_analysis(FS)
+    # a confident key (the features' key_confidence, which the key gate needs; audit
+    # features F2): the key-locked crossovers
+    return keyed_planner_analysis(FS)
 
 
 def test_analysis_crossovers_follow_the_key(pana):
@@ -107,7 +110,8 @@ def test_analysis_crossovers_follow_the_key(pana):
 def test_key_locked_analysis_equals_a_fixed_one():
     """Finding the key before the first split changes nothing but the crossovers: the
     analysis equals a fixed-crossover analysis at the same crossovers."""
-    x, a = short_planner_analysis(FS)
+    x, a = keyed_planner_analysis(FS)
+    assert tuple(a["meta"]["crossovers"]) != bands.DEFAULT_CROSSOVERS
     xn = np.asarray(x, dtype=np.float64) * 10 ** (a["meta"]["input"]["gain_db"] / 20)
     b = features.analyse(xn, FS, fcs=a["meta"]["crossovers"])
     assert b["meta"]["crossover_rule"] == "fixed"
@@ -120,8 +124,9 @@ def test_key_locked_analysis_equals_a_fixed_one():
 
 
 @pytest.mark.slow
-def test_cache_reuse_with_key_crossovers(tmp_path):
-    x, a = short_planner_analysis(FS)
+def test_cache_reuse_with_key_crossovers(tmp_path, monkeypatch):
+    features_with_key_confidence(monkeypatch)
+    x, a = keyed_planner_analysis(FS)
     wav = tmp_path / "in.wav"
     io.write(wav, x, FS)
     work = tmp_path / "w"

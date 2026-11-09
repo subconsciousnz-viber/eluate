@@ -21,11 +21,14 @@ Contract:
   the base's ratios to its lowest (x4, x16, x64 for the default). An unknown
   or unparsable tonic gives the base. For E, F, F# and G the clip binds (p / 2^(1/3)
   is 65 to 78 Hz), so the crossover sits at 80 Hz, less than a third of an
-  octave below p. The lock is gated on the key's confidence (`key_gate`,
-  `key_confidence`: the features' key_confidence or the record's profile
-  correlation score; KEY_CONFIDENCE_MIN = 0.5, features audit 2026-11-10 F2: pink
-  noise read 0.29 and locked the crossovers to Cm): below it, or unknown, the
-  base crossovers are used and meta["crossover_gate"] records the decision.
+  octave below p. The lock is gated on the key's confidence (`key_gate`;
+  KEY_CONFIDENCE_MIN = 0.5, features audit 2026-11-10 F2: pink noise read Cm and
+  locked the crossovers to it): the confidence is the features' key_confidence (a
+  float in [0, 1]), which features.analyse passes to a `fcs_from_key` taking a
+  `key_confidence` keyword before the first band split and records in
+  plan_inputs["key_confidence"] (`analysis_key_confidence`). Below the gate, or
+  unknown (an analysis without the field), bands.DEFAULT_CROSSOVERS are used and
+  meta["crossover_gate"] records the decision.
   `crossover_choice` is the record (crossovers, rule, tonic, p, key_gate, reason)
   in plan_record["crossovers"].
 - `plan_from_analysis(analysis, controls, x=None) -> Plan`. `analysis` is the
@@ -488,9 +491,10 @@ KEY_PARTIAL_MIN_HZ = 80.0        # the tonic partial is the lowest one at or abo
 KEY_MARGIN_OCT = 1.0 / 3.0       # crossover this far below it (maintainer, 2026-10-18)
 KEY_XOVER_RANGE_HZ = (80.0, 160.0)
 # the key lock's confidence gate (features audit 2026-11-10 F2; `key_gate`): below this
-# the crossovers stay at bands.DEFAULT_CROSSOVERS. On the features' scale (the profile
-# correlation) pink noise read 0.29, drums alone 0.22, a clear progression above 0.7; a
-# DC-only input read 0.71 and is not caught (it is refused upstream as near silent).
+# the crossovers stay at bands.DEFAULT_CROSSOVERS, as they do when the confidence is
+# unknown. The value is the features' key_confidence in [0, 1]; 0.5 is a starting
+# point to calibrate on real material (the audit's raw profile scores: pink noise 0.29,
+# drums alone 0.22, a clear progression above 0.7).
 KEY_CONFIDENCE_MIN = 0.5
 
 CREST_MODES = ("loss", "report", "floor")   # spec 3.6 draft 0.5, maintainer ruling pending
@@ -765,41 +769,43 @@ def key_crossovers(tonic, base=bands.DEFAULT_CROSSOVERS) -> tuple[float, ...]:
     return tuple(fc1 * f / base[0] for f in base)
 
 
-def key_confidence(key) -> float | None:
-    """The key record's confidence in [0, 1] (module contract, key gate): the features'
-    key_confidence when the record carries it, else its profile correlation score
-    (pitch.key_from_chroma's Pearson r, the same scale); None when the record is empty or
-    the value is not finite (treated as "unknown": no key lock)."""
-    if not key:
+def _confidence(v) -> float | None:
+    """A key confidence as a float in [0, 1], None when absent or not finite."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
         return None
-    for name in ("key_confidence", "confidence", "score"):
-        v = key.get(name)
-        if v is not None and math.isfinite(float(v)):
-            return float(np.clip(float(v), 0.0, 1.0))
-    return None
+    return float(np.clip(f, 0.0, 1.0)) if math.isfinite(f) else None
 
 
-def key_gate(key) -> dict:
-    """The key-lock decision for a key record: {"tonic", "confidence", "min", "passed",
-    "reason"}; passed when the confidence is known and at least KEY_CONFIDENCE_MIN."""
-    tonic = (key or {}).get("tonic")
-    conf = key_confidence(key)
+def analysis_key_confidence(analysis: dict) -> float | None:
+    """The analysis's key confidence (module contract, key gate): plan_inputs["key_confidence"]
+    (the features' pitch.key_confidence, in [0, 1]), else meta["key_confidence"]; None
+    when the analysis predates it (unknown: no key lock)."""
+    pi = analysis.get("plan_inputs") or {}
+    v = _confidence(pi.get("key_confidence"))
+    return v if v is not None else _confidence((analysis.get("meta") or {}).get("key_confidence"))
+
+
+def key_gate(tonic, confidence) -> dict:
+    """The key-lock decision: {"tonic", "confidence", "min", "passed", "reason"}; passed
+    when there is a tonic and its confidence is known and at least KEY_CONFIDENCE_MIN."""
+    conf = _confidence(confidence)
+    out = {"tonic": tonic, "confidence": conf, "min": KEY_CONFIDENCE_MIN, "passed": False}
     if tonic is None:
-        return {"tonic": None, "confidence": conf, "min": KEY_CONFIDENCE_MIN, "passed": False,
-                "reason": "no key found"}
+        return dict(out, reason="no key found")
     if conf is None:
-        return {"tonic": tonic, "confidence": None, "min": KEY_CONFIDENCE_MIN, "passed": False,
-                "reason": "key confidence unknown"}
+        return dict(out, reason="key confidence unknown")
     ok = conf >= KEY_CONFIDENCE_MIN
-    return {"tonic": tonic, "confidence": conf, "min": KEY_CONFIDENCE_MIN, "passed": ok,
-            "reason": (f"key {key.get('label') or tonic} confidence {conf:.2f} "
-                       f"{'>=' if ok else '<'} {KEY_CONFIDENCE_MIN:g}")}
+    return dict(out, passed=ok, reason=(f"key {tonic} confidence {conf:.2f} "
+                                        f"{'>=' if ok else '<'} {KEY_CONFIDENCE_MIN:g}"))
 
 
 def crossover_choice(analysis: dict, controls: Controls) -> dict:
     """Record of the crossovers the plan uses and why (plan_record["crossovers"]), the
     key gate's decision included (`key_gate`: meta["crossover_gate"], written by `analyse`;
-    an analysis without it reads the gate from plan_inputs["key"] for the record only)."""
+    an analysis without it reads the gate from `analysis_key_confidence` for the record
+    only, "applied" False)."""
     meta = analysis["meta"]
     xo = [float(f) for f in meta["crossovers"]]
     rule = meta.get("crossover_rule", "fixed")
@@ -809,8 +815,7 @@ def crossover_choice(analysis: dict, controls: Controls) -> dict:
     if rule == "key":
         gate = meta.get("crossover_gate")
         if gate is None:
-            gate = dict(key_gate((analysis.get("plan_inputs") or {}).get("key")),
-                        applied=False)
+            gate = dict(key_gate(tonic, analysis_key_confidence(analysis)), applied=False)
         rec["key_gate"] = gate
         p = tonic_partial_hz(tonic)
         rec["tonic_partial_hz"] = p
@@ -846,8 +851,11 @@ def analyse(x: np.ndarray, fs: float, crossovers=None, bpm: float | None = None)
     kw = {} if bpm is None else {"bpm": float(bpm)}
     gate: dict = {}
     if crossovers is None:
-        def fcs_from_key(tonic, key=None):
-            gate.update(key_gate(key if key is not None else {"tonic": tonic}), applied=True)
+        def fcs_from_key(tonic, key_confidence=None):
+            # features.analyse passes key_confidence to a callback that takes it; without
+            # it (an older features) the confidence is unknown and the lock is refused
+            gate.clear()
+            gate.update(key_gate(tonic, key_confidence), applied=True)
             return key_crossovers(tonic if gate["passed"] else None)
         a = features.analyse(xn, fs, fcs_from_key=fcs_from_key, **kw)
         a["meta"]["crossover_gate"] = gate

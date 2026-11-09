@@ -3,9 +3,7 @@
 Contract of `analyse(x, fs, fcs=bands.DEFAULT_CROSSOVERS, hop_s=0.1, bpm=None,
 fcs_from_key=None)`:
 - `fcs_from_key`: a function of the key's tonic name (or None) returning the
-  crossovers (planner.key_crossovers); one that also takes a `key` keyword
-  receives the whole key record (tonic, mode, label, score), so a caller can
-  gate the lock on the key's confidence (planner.analyse). When given, the key (pitch.key: chroma
+  crossovers (planner.key_crossovers). When given, the key (pitch.key: chroma
   weighted by momentary-loudness power, neither of which reads the band
   split) is found right after loudness, before any band split, and the
   crossovers it returns replace `fcs` for the whole analysis;
@@ -80,17 +78,6 @@ def _frame_power(mom: np.ndarray) -> np.ndarray:
     return np.where(np.isfinite(mom), 10.0 ** (mom / 10.0), 0.0)
 
 
-def _fcs_from_key(fn, key: dict):
-    """fn(tonic, key=key) when fn takes a `key` argument (the planner's confidence gate
-    reads the record's score), else fn(tonic) (the one-argument form of the contract)."""
-    import inspect
-    try:
-        takes_key = "key" in inspect.signature(fn).parameters
-    except (TypeError, ValueError):
-        takes_key = False
-    return fn(key.get("tonic"), key=key) if takes_key else fn(key.get("tonic"))
-
-
 def analyse(x: np.ndarray, fs: float, fcs=_bands.DEFAULT_CROSSOVERS, hop_s: float = HOP_S,
             bpm: float | None = None, fcs_from_key=None) -> dict:
     ctx = Context(x, fs, fcs, hop_s)
@@ -98,9 +85,8 @@ def analyse(x: np.ndarray, fs: float, fcs=_bands.DEFAULT_CROSSOVERS, hop_s: floa
     lo = loudness.analyse(ctx.x, ctx.fs, ctx)
     tonic = None
     if fcs_from_key is not None:
-        kd = pitch.key(ctx, _frame_power(lo["momentary"]))["key"]
-        tonic = kd.get("tonic")
-        ctx.fcs = tuple(float(f) for f in _fcs_from_key(fcs_from_key, kd))
+        tonic = pitch.key(ctx, _frame_power(lo["momentary"]))["key"].get("tonic")
+        ctx.fcs = tuple(float(f) for f in fcs_from_key(tonic))
     out = {"meta": {"fs": ctx.fs, "n": ctx.x.shape[0], "duration_s": ctx.x.shape[0] / ctx.fs,
                     "hop_s": g.hop_s, "frames": g.k, "crossovers": ctx.fcs, "views": VIEWS,
                     "crossover_rule": "fixed" if fcs_from_key is None else "key",

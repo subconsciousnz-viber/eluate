@@ -288,10 +288,14 @@ What landed (§2 item 1, §3 "Ceiling" and "Loudness target", §4, §9):
   first (chroma weighted by momentary loudness, which reads no band split) and
   runs every band-dependent feature on the key-locked crossovers. With
   `--xover` the given ones are used. Since 2026-11-10 the lock is gated on the
-  key's confidence (`planner.key_gate`, `KEY_CONFIDENCE_MIN` = 0.5 on the
-  profile-correlation scale: pink noise read Cm at 0.29 and moved every band
-  split; a clear progression reads above 0.7): below it, or unknown, the default
-  crossovers stay and `meta["crossover_gate"]` records the decision.
+  key's confidence (`planner.key_gate`, `KEY_CONFIDENCE_MIN` = 0.5, a starting
+  value to calibrate; features audit F2: pink noise read Cm and moved every band
+  split): the confidence is the features' `key_confidence` in [0, 1], which
+  `features.analyse` hands to the planner's key callback before the first split
+  and records in `plan_inputs["key_confidence"]`. Below the gate, or unknown (an
+  analysis without that field, which includes every analysis made before the
+  features change lands), the default crossovers stay and
+  `meta["crossover_gate"]` records the decision.
   `plan_record.json` keeps the crossovers,
   the rule, the tonic, p, the gate and a one-line reason. `source.json` keeps the
   crossovers used, the ones requested (null = key-locked) and R_ref. The
