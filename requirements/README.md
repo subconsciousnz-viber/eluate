@@ -37,6 +37,12 @@ pip install -r requirements/lock-dev-win-x64-py312.txt     # tests
 `--no-deps` keeps pip from re-resolving eluate's ranges past the pins. Then
 `pip check` should print "No broken requirements found."
 
+uv is a supported alternative on a machine without Python 3.12, since it fetches the
+interpreter itself: `uv venv --python 3.12`, then `uv pip install -r
+requirements/lock-win-x64-py312.txt -r requirements/lock-dev-win-x64-py312.txt -e . --no-deps`.
+That is how the 2026-11-10 audit environment was built; note a uv venv has no `pip` module, so
+use `uv pip` (and `uv build` for wheels) in it.
+
 ## The Mac
 
 Same procedure on the M3, with a native arm64 Python 3.12 (`uv python install 3.12` or the
