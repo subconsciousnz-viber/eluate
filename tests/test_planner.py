@@ -383,6 +383,7 @@ def test_crest_and_tp_controls(ana):
     assert t.tp_meter == "8x"
     assert planner.targets_from(a, planner.Controls()).tp_meter == "8x"            # S6
     assert planner.targets_from(a, planner.Controls(streaming=True)).tp_meter == "worst"
+    assert planner.targets_from(a, planner.Controls(cd=True)).tp_meter == "worst"
     # without --xover the floors are counted against the analysis's crossovers (audit 08)
     three = {"meta": {"crossovers": [100.0, 400.0, 1600.0]}}
     four = planner.Controls(crest_mode="floor", crest_floors_db=(8, 10, 12, 12))

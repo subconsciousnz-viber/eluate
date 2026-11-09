@@ -74,7 +74,10 @@ Copyright (C) 2026 the Eluate contributors
   not integrated LUFS. The electronic default is -4.1 dBFS. Processing limits can
   prevent reaching a target; reports record shortfalls.
 - **Delivery:** default output is 24-bit PCM with a -0.3 dBTP ceiling;
-  `--streaming` selects 16-bit PCM with TPDF dither and a -1 dBTP ceiling.
+  `--streaming` keeps 24-bit PCM and lowers the ceiling to -1 dBTP, and `--cd`
+  (2026-11-10) resamples the input to 44.1 kHz before the chain and writes 16-bit
+  PCM with TPDF dither at -1 dBTP; report.md's Delivery section gives the
+  integrated loudness, each platform's playback gain and the codec-headroom check.
 - **Pipeline:** `analyse`, `plan`, `render` and `report` expose individual stages;
   `master` runs the complete workflow. See the [engine specification](docs/spec-draft.md)
   and [gain-staging design](docs/gain-staging.md) for rationale and signal-chain detail.

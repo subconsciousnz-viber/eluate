@@ -71,3 +71,25 @@ def test_writes_are_atomic(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         io.write(tmp_path / "new" / "b.wav", np.ones((100, 2)) * 0.5, 48000)
     assert sorted(f.name for f in tmp_path.rglob("*")) == ["a.wav", "j.json", "new", "z.npz"]
+
+
+@pytest.mark.parametrize("fs", [48000, 96000])
+def test_resample_to_the_cd_rate(fs):
+    """io.resample (master --cd): the exact ratio, ceil(n fs_out / fs) samples, dtype kept, a
+    tone in the band at its level to 0.02 dB, a tone above the output Nyquist rejected by at
+    least SRC_STOP_DB - 10 dB, the same rate returned as is."""
+    n = 2 * fs
+    t = np.arange(n) / fs
+    x = np.stack([0.5 * np.sin(2 * np.pi * 1000.0 * t), 0.5 * np.sin(2 * np.pi * 23000.0 * t)],
+                 axis=1).astype(np.float32)
+    y = io.resample(x, fs, io.CD_FS)
+    assert y.shape == (-(-n * io.CD_FS // fs), 2) and y.dtype == np.float32
+    mid = y[io.CD_FS // 10: -io.CD_FS // 10]
+    rms = 20 * np.log10(np.sqrt(np.mean(mid.astype(np.float64) ** 2, axis=0)))
+    assert abs(rms[0] - 20 * np.log10(0.5 / np.sqrt(2))) < 0.02
+    assert rms[1] < 20 * np.log10(0.5 / np.sqrt(2)) - (io.SRC_STOP_DB - 10)
+    assert io.resample(x, fs, fs) is x
+    up = io.resample(y, io.CD_FS, fs)                # back up: the 1 kHz tone survives
+    assert up.shape[0] == -(-y.shape[0] * fs // io.CD_FS)
+    assert abs(20 * np.log10(np.sqrt(np.mean(up[fs // 10: -fs // 10, 0].astype(np.float64) ** 2)))
+               - 20 * np.log10(0.5 / np.sqrt(2))) < 0.02

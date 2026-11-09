@@ -44,6 +44,14 @@ def test_parser_controls():
          "--kick-detective", "--glue-mode", "parallel", "--streaming"]))
     assert (k.character, k.makeup, k.kick_detective, k.glue_mode, k.streaming) == \
         ("slow", "auto", True, "parallel", True)
+    # the deliveries (metering audit 2026-11-10, 6): streaming is -1 dBTP at 24 bits, cd the
+    # 16-bit TPDF export at 44.1 kHz with the same ceiling; one or the other
+    assert (k.cd, k.ceiling_dbtp, k.output_plan().bits, k.tp_meter) == (False, -1.0, 24, "worst")
+    cd = cli._controls(cli.build_parser().parse_args(["master", "in.wav", "-o", "out", "--cd"]))
+    assert (cd.cd, cd.streaming, cd.ceiling_dbtp, cd.tp_meter) == (True, False, -1.0, "worst")
+    assert (cd.output_plan().bits, cd.output_plan().dither) == (16, "tpdf")
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["master", "in.wav", "-o", "out", "--cd", "--streaming"])
     assert cli._controls(cli.build_parser().parse_args(
         ["master", "in.wav", "-o", "out", "--no-kick-detective"])).kick_detective is False
     for gone in (["--target", "-7"], ["--harmonic", "0.4"]):
@@ -290,18 +298,76 @@ def test_a_failed_master_is_not_done(tmp_path, monkeypatch):
 
 @pytest.mark.slow
 def test_master_streaming(wav, tmp_path):
-    """--streaming: -1 dBTP ceiling, 16-bit with TPDF dither, true peak read on the file."""
+    """--streaming: -1 dBTP ceiling at 24 bits (metering audit 2026-11-10, 6), true peak
+    read on the file, the delivery block carrying the format and the -1 dBTP flag."""
     out = tmp_path / "out"
     assert cli.main(["master", str(wav), "-o", str(out), "--streaming", "--max-renders", "1"]) == 0
-    assert sf.info(str(out / "master.wav")).subtype == "PCM_16"
-    y, _ = io.read(out / "master.wav")
-    assert solver.true_peaks(y, FS)["worst"] <= -1.0 + 1e-9
+    assert sf.info(str(out / "master.wav")).subtype == "PCM_24"
+    y, fs = io.read(out / "master.wav")
+    assert fs == FS and solver.true_peaks(y, FS)["worst"] <= -1.0 + 1e-9
     plan = Plan.load(out / "plan.json")
-    assert plan.output.bits == 16 and plan.output.dither == "tpdf"
+    assert plan.output.bits == 24 and plan.output.dither == "none"
     assert plan.limiter.ceiling_dbtp <= -1.0
     t = json.loads((out / "targets.json").read_text(encoding="utf-8"))
     assert t["true_peak_max_dbtp"] == -1.0
+    rep = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert rep["delivery"]["format"] == {"sample_rate": FS, "bits": 24, "dither": "none",
+                                         "ceiling_dbtp": -1.0}
+    assert rep["after"]["true_peak_max_dbtp"] <= -1.0 + 1e-9
+    dl = {c["kind"]: c for c in rep["flags_structured"]}["delivery"]
+    assert dl["short"] == (not rep["delivery"]["codec_headroom"]["ok"])
+    assert "Delivery: streaming (-1 dBTP, 24-bit)" in (out / "process-log.md").read_text(encoding="utf-8")
     # a saved plan renders the same file
     r = tmp_path / "r.wav"
     assert cli.main(["render", str(out / "plan.json"), "-o", str(r)]) == 0
     assert np.array_equal(io.read(r)[0], y)
+
+
+@pytest.mark.slow
+def test_master_cd(tmp_path):
+    """--cd (metering audit 2026-11-10, 6): a 48 kHz premaster is resampled to 44.1 kHz
+    before the chain; master.wav is 16-bit TPDF at 44.1 kHz under -1 dBTP on every meter;
+    source.json and run.json record both rates; the report, the UI data and a render from
+    the saved plan resample the premaster the same way; a cached analysis serves only the
+    same delivery."""
+    from eluate import uidata
+    x, _ = short_track(48000)
+    inp = tmp_path / "in48.wav"
+    io.write(inp, x, 48000)
+    out = tmp_path / "out"
+    assert cli.main(["master", str(inp), "-o", str(out), "--cd", "--max-renders", "1"]) == 0
+    info = sf.info(str(out / "master.wav"))
+    assert (info.samplerate, info.subtype) == (44100, "PCM_16")
+    y, fs = io.read(out / "master.wav")
+    assert fs == 44100 and solver.true_peaks(y, 44100)["worst"] <= -1.0 + 1e-9
+    plan = Plan.load(out / "plan.json")
+    assert plan.fs == 44100 and plan.output.bits == 16 and plan.output.dither == "tpdf"
+    src = json.loads((out / "source.json").read_text(encoding="utf-8"))
+    assert (src["fs"], src["source_fs"], src["resampled_to"]) == (44100, 48000, 44100)
+    run = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    assert (run["fs"], run["source_fs"], run["controls"]["cd"]) == (44100, 48000, True)
+    rep = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert rep["delivery"]["format"] == {"sample_rate": 44100, "bits": 16, "dither": "tpdf",
+                                         "ceiling_dbtp": -1.0}
+    md = (out / "report.md").read_text(encoding="utf-8")
+    assert "16-bit PCM WAV, 44100 Hz, stereo, TPDF dither; limiter ceiling -1.00 dBTP" in md
+    assert "Delivery: CD (44.1 kHz, 16-bit with dither, -1 dBTP)" in \
+        (out / "process-log.md").read_text(encoding="utf-8")
+    ui = uidata.from_render(out)
+    assert ui["fs"] == 44100 and ui["delivery"]["format"]["bits"] == 16
+    assert ui["matchDb"] == round(rep["ab"]["original_gain_db"] - rep["ab"]["master_gain_db"], 2)
+    assert cli.main(["report", str(out)]) == 0
+    r = tmp_path / "r.wav"
+    assert cli.main(["render", str(out / "plan.json"), "-o", str(r)]) == 0
+    assert np.array_equal(io.read(r)[0], y)
+    # the CD analysis is reused for a CD run and not for a plain one (or the reverse)
+    assert cli._matches(out / "source.json", inp, fs_out=44100)
+    assert not cli._matches(out / "source.json", inp)
+    again = cli.do_master(inp, out, cli.planner.Controls(cd=True), max_renders=1, log=lambda m: None)
+    assert again["phases"]["analyse_s"] == 0.0
+
+
+def test_cd_is_refused_with_stems(tmp_path):
+    with pytest.raises(ValueError, match="--cd"):
+        cli.do_master_stems([tmp_path / "a.wav"], tmp_path / "w", cli.planner.Controls(cd=True),
+                            log=lambda m: None)

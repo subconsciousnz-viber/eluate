@@ -28,7 +28,7 @@ Contract:
   key-locked analysis is reused for a request without --xover, whatever
   crossovers the key gave), bpm, R_ref and ANALYSIS_VERSION, and it loads; on reuse source.json
   takes the input's current path), plan, solve, write
-  out/master.wav (24-bit PCM, or 16-bit with TPDF dither under --streaming:
+  out/master.wav (24-bit PCM, or 16-bit with TPDF dither at 44.1 kHz under --cd:
   plan.output, the samples the solver measured), out/plan.json, out/solve.json, the report
   with A/B, and out/run.json (runtime per phase, peak memory, solver
   renders, SHA-256 of every eluate module at the start of the run, and "memory":
@@ -59,8 +59,14 @@ Contract:
   GR plot survive), and the process log with it.
 - Controls flags (spec 3.6 draft 0.5): --crest-mode loss|report|floor,
   --crest-floor a,b,c,d,e (floor mode), --side-band0-exempt, --tp-meter
-  worst|8x; --streaming (docs/gain-staging.md 3: -1 dBTP ceiling, 16-bit
-  output with TPDF dither, instead of -0.3 dBTP at 24 bits); the loudness
+  worst|8x; --streaming (docs/gain-staging.md 3: the -1 dBTP ceiling at 24 bits,
+  instead of -0.3 dBTP) or --cd (not both: the input resampled to io.CD_FS = 44.1 kHz
+  before the chain (io.resample; source.json records the file's rate as source_fs and
+  the rate analysed as resampled_to, run.json carries both, and a cached analysis is
+  reused only for the same delivery rate), -1 dBTP, 16-bit with TPDF dither, so the
+  solver measures everything, the ceiling included, at 44.1 kHz; `report` and
+  uidata resample the premaster the same way; metering audit 2026-11-10 finding 6);
+  `render` resamples its input to the plan's rate when they differ; the loudness
   target --target-rms R (the master's RMS on the maintainer's Ozone meter: 300 ms,
   AES17, loudest passage; default planner.DEFAULT_TARGET_RMS_DBFS = -4.1);
   dynamics: --character
@@ -156,25 +162,42 @@ ANALYSIS_VERSION = 1
 
 
 def _source_record(path: Path, fs: int, n: int, analysis: dict, crossovers=None,
-                   bpm=None) -> dict:
+                   bpm=None, source_fs: int | None = None, fs_out: int | None = None) -> dict:
     """What the cached analysis was made from: path, size, mtime, the audio file's
-    SHA-256, fs, length, the crossovers used and requested, bpm, R_ref, the input
-    gain (audit 07 A17, F15) and ANALYSIS_VERSION (audit 13)."""
+    SHA-256, fs (the rate analysed), length, the crossovers used and requested, bpm, R_ref,
+    the input gain (audit 07 A17, F15), ANALYSIS_VERSION (audit 13), source_fs (the file's
+    own rate) and resampled_to (the delivery rate the input was resampled to before the
+    analysis, None when it was not; module contract, --cd)."""
     st = path.stat()
     meta = analysis["meta"]
     inp = meta.get("input") or {}
     return {"analysis_version": ANALYSIS_VERSION,
             "path": str(path.resolve()), "size": st.st_size, "mtime": st.st_mtime,
             "sha256": file_sha256(path), "fs": int(fs), "n": int(n),
+            "source_fs": int(source_fs if source_fs is not None else fs),
+            "resampled_to": None if fs_out is None else int(fs_out),
             "crossovers_hz": [float(f) for f in meta["crossovers"]],
             "crossovers_requested": _requested(crossovers),
             "crossover_rule": meta.get("crossover_rule"), "bpm": bpm,
             "r_ref_dbfs": inp.get("r_ref_dbfs"), "input_gain_db": inp.get("gain_db")}
 
 
-def do_analyse(inp: Path, work: Path, xover=None, log=print, bpm: float | None = None):
-    work.mkdir(parents=True, exist_ok=True)
+def _read_input(inp: Path, fs_out: int | None = None, log=None):
+    """io.read, then io.resample to the delivery rate `fs_out` when one is asked for (--cd).
+    Returns (x, fs, source_fs): the audio at the rate the chain runs at, and the file's rate."""
     x, fs = io.read(inp)
+    if fs_out is not None and int(fs_out) != fs:
+        x = io.resample(x, fs, int(fs_out))
+        if log is not None:
+            log(f"resampled {inp.name} from {fs} to {int(fs_out)} Hz for the CD delivery")
+        return x, int(fs_out), fs
+    return x, fs, fs
+
+
+def do_analyse(inp: Path, work: Path, xover=None, log=print, bpm: float | None = None,
+               fs_out: int | None = None):
+    work.mkdir(parents=True, exist_ok=True)
+    x, fs, source_fs = _read_input(inp, fs_out, log)
     (work / "source.json").unlink(missing_ok=True)
     (work / "features.pkl").unlink(missing_ok=True)      # the old pickled cache, never read
     t = time.perf_counter()
@@ -182,7 +205,8 @@ def do_analyse(inp: Path, work: Path, xover=None, log=print, bpm: float | None =
     dt = time.perf_counter() - t
     _save_analysis(work, a)
     io.write_json(work / "analysis.json", _summarise(a))
-    io.write_json(work / "source.json", _source_record(inp, fs, x.shape[0], a, xover, bpm))
+    io.write_json(work / "source.json", _source_record(inp, fs, x.shape[0], a, xover, bpm,
+                                                       source_fs, fs_out))
     log(f"analysed {inp.name} in {dt:.1f} s (input gain {a['meta']['input']['gain_db']:+.2f} dB, "
         f"crossovers {', '.join(f'{f:.1f}' for f in a['meta']['crossovers'])} Hz)")
     return a, x, fs, dt
@@ -257,7 +281,7 @@ def _controls(args) -> planner.Controls:
                             subside_hz=args.subside,
                             crest_mode=args.crest_mode, crest_floors_db=args.crest_floor,
                             side_band0_exempt=args.side_band0_exempt, tp_meter=args.tp_meter,
-                            streaming=args.streaming, character=args.character,
+                            streaming=args.streaming, cd=args.cd, character=args.character,
                             bpm=getattr(args, "bpm", None), makeup=args.makeup,
                             glue_mode=args.glue_mode, kick_detective=args.kick_detective,
                             speclim=args.speclim, profile=args.profile, threads=args.threads)
@@ -294,6 +318,8 @@ def do_render(plan_path: Path, out: Path, inp: Path | None, log=print):
         src = json.loads((plan_path.parent / "source.json").read_text(encoding="utf-8"))
         inp = Path(src["path"])
     x, fs = io.read(inp)
+    if fs != plan.fs:                      # a plan made under --cd: the same resampling first
+        x, fs, _ = _read_input(inp, int(plan.fs), log)
     y, info, _ = solver.render_plan(x, fs, plan)
     io.write(out, y, fs, _subtype(plan))
     log(f"rendered {out} (true peak 8x {info.get('true_peak_8x_dbtp', float('nan')):.2f}, "
@@ -305,12 +331,15 @@ def _subtype(plan: Plan) -> str:
     return "FLOAT" if plan.output is None else plan.output.subtype
 
 
-def _matches(src_file: Path, inp: Path, bpm: float | None = None, crossovers=None) -> bool:
+def _matches(src_file: Path, inp: Path, bpm: float | None = None, crossovers=None,
+             fs_out: int | None = None) -> bool:
     """Reuse the cached analysis only for the same audio content (SHA-256), the same
     requested crossovers (None = key-locked: the crossovers the key gave are a function
-    of the audio, so they need no check of their own), bpm, R_ref and the analysis code's
-    version. A source.json from before input normalisation (no r_ref_dbfs) or of another
-    ANALYSIS_VERSION (or none) never matches."""
+    of the audio, so they need no check of their own), bpm, R_ref, the same delivery
+    resampling (resampled_to; an analysis of the file at its own rate never serves a
+    --cd run, nor the other way round) and the analysis code's version. A source.json
+    from before input normalisation (no r_ref_dbfs) or of another ANALYSIS_VERSION (or
+    none) never matches."""
     if not src_file.exists():
         return False
     try:
@@ -322,15 +351,19 @@ def _matches(src_file: Path, inp: Path, bpm: float | None = None, crossovers=Non
             return False
         if s.get("bpm") != bpm or s.get("size") != inp.stat().st_size:
             return False
+        if s.get("resampled_to") != (None if fs_out is None else int(fs_out)):
+            return False
         return s.get("sha256") == file_sha256(inp)
     except (KeyError, ValueError, OSError):
         return False
 
 
-def _reuse_analysis(out: Path, inp: Path, bpm=None, crossovers=None, log=print) -> dict | None:
+def _reuse_analysis(out: Path, inp: Path, bpm=None, crossovers=None, log=print,
+                    fs_out: int | None = None) -> dict | None:
     """The cached analysis in out/ when it matches inp and loads (None: analyse again);
     source.json then takes inp's current path, so a moved track reads from where it is."""
-    if not ((out / ANALYSIS_FILE).exists() and _matches(out / "source.json", inp, bpm, crossovers)):
+    if not ((out / ANALYSIS_FILE).exists()
+            and _matches(out / "source.json", inp, bpm, crossovers, fs_out)):
         return None
     try:
         a = _load_analysis(out)
@@ -370,13 +403,16 @@ def do_master(inp: Path, out: Path, controls: planner.Controls, master_ref: Path
     code = source_hashes()
     out.mkdir(parents=True, exist_ok=True)
     phases = {}
-    a = _reuse_analysis(out, inp, bpm, controls.crossovers_hz, log)
+    fs_out = io.CD_FS if controls.cd else None        # the CD delivery runs the chain at 44.1 kHz
+    a = _reuse_analysis(out, inp, bpm, controls.crossovers_hz, log, fs_out)
     step("analyse", frames=frames, threads=threads, reused=a is not None)
     if a is not None:
-        x, fs = io.read(inp)
+        x, fs, _ = _read_input(inp, fs_out, log)
         phases["analyse_s"] = 0.0
     else:
-        a, x, fs, phases["analyse_s"] = do_analyse(inp, out, controls.crossovers_hz, log, bpm)
+        a, x, fs, phases["analyse_s"] = do_analyse(inp, out, controls.crossovers_hz, log, bpm,
+                                                   fs_out)
+    source_fs = json.loads((out / "source.json").read_text(encoding="utf-8")).get("source_fs", fs)
     step("plan")
     t = time.perf_counter()
     plan0 = planner.plan_from_analysis(a, controls)
@@ -420,7 +456,8 @@ def do_master(inp: Path, out: Path, controls: planner.Controls, master_ref: Path
                     solve_summary=summ, lim_info=res.lim_info, limiter_gr=lim_gr,
                     master_ref=mref)
     phases["report_s"] = time.perf_counter() - t
-    run = {"run_id": run_id, "input": str(inp), "fs": fs, "duration_s": x.shape[0] / fs,
+    run = {"run_id": run_id, "input": str(inp), "fs": fs, "source_fs": int(source_fs),
+           "duration_s": x.shape[0] / fs,
            "controls": controls.to_dict(), "phases": phases,
            "runtime_s": time.perf_counter() - t0, "peak_memory_mb": solver.peak_memory_mb(),
            "memory": mem,
@@ -439,7 +476,7 @@ def do_master(inp: Path, out: Path, controls: planner.Controls, master_ref: Path
 def do_report(out: Path, master_ref: Path | None = None, log=print,
               process_log: bool = True) -> dict:
     src = json.loads((out / "source.json").read_text(encoding="utf-8"))
-    x, fs = io.read(src["path"])
+    x, fs, _ = _read_input(Path(src["path"]), src.get("resampled_to"), log)
     y, fy = io.read(out / "master.wav")
     if fy != fs:
         raise ValueError("master and source sample rates differ")
@@ -491,9 +528,14 @@ def _add_controls(p):
                    help="per-band crest floors, dB, for --crest-mode floor")
     p.add_argument("--side-band0-exempt", action="store_true")
     p.add_argument("--tp-meter", default=None, choices=planner.TP_METERS,
-                   help="default 8x at 24 bits, worst (with BS.1770 Annex 2) under --streaming")
-    p.add_argument("--streaming", action="store_true",
-                   help="-1 dBTP ceiling, 16-bit output with TPDF dither")
+                   help="default 8x for the master export, worst (with BS.1770 Annex 2) under "
+                        "--streaming and --cd")
+    delivery = p.add_mutually_exclusive_group()
+    delivery.add_argument("--streaming", action="store_true",
+                          help="streaming delivery: -1 dBTP ceiling, 24-bit output")
+    delivery.add_argument("--cd", action="store_true",
+                          help=f"CD delivery: input resampled to {io.CD_FS} Hz, -1 dBTP ceiling, "
+                               "16-bit output with TPDF dither")
     p.add_argument("--character", default="auto", choices=planner.CHARACTERS)
     p.add_argument("--makeup", default="peak", choices=MAKEUP_MODES,
                    help="multiband makeup: +peak GR, +mean GR, or following its 3 s average")
@@ -647,6 +689,11 @@ def do_master_stems(paths, out: Path, controls: planner.Controls, mix: Path | No
     """
     step = progress or (lambda *a, **k: None)
     t0 = time.perf_counter()
+    if controls.cd:
+        # the attribution and the correction passes work at the stems' own rate; a CD master
+        # of a stem set is a later change (metering audit 2026-11-10 finding 6)
+        raise ValueError("--cd is not available with --stems yet: master the stems' sum, then "
+                         "the CD delivery from that master")
     controls = dataclasses.replace(controls, profile="stems")
     names = [Path(p).stem for p in paths]
     total = 1 + STEM_PASSES_MAX
