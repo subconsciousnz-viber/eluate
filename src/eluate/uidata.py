@@ -5,28 +5,44 @@ Contract:
   (AES17) at COLUMNS points, shifted so its loudest passage (p95 of the meter series)
   sits on the loudness target, i.e. where a level-matched comparison will put it.
 - `from_render(work, premaster=None)`: everything the UI draws for a finished `master`
-  output dir: the premaster level-matched to the master on the maintainer's meter reading, the master,
-  the limiter GR (positive dB), sections with their contrast change against the
+  output dir: the premaster level-matched to the master by `matchDb`, the A/B files'
+  own match (report.json ab: original_gain_db - master_gain_db, the S95 match of spec
+  3.7, so the drawn premaster and the audio the user hears agree; metering audit
+  2026-11-10 finding 2; the maintainer's meter difference for a report without ab),
+  the master, the limiter GR (positive dB), sections with their contrast change against the
   loudest section (flagged when it rose past evaluate.FLAG_SECTION_LU, as report.md; ignored past
   FLAG_SECTION_IGNORE_LU or when a section has no measurable loudness), LTAS M / S / stereo, tilt, loudness and what held it,
-  crest (meter.crest_db, read from the report), LRA, true peak, the
+  crest (meter.crest_db, read from the report), LRA, `truePeak` (report.json
+  true_peak_max_dbtp, the worst of the 4x / 8x / 32x readings; the worst of what an
+  older report holds), the
   noise floor before and after with its status (None for reports made before noise.py),
   crossovers, the side high-pass, the input EQ high shelves and their limits, the
   paths of master.wav, the A/B files and process-log.html (None when absent), the
-  render's `controls` (run.json; None when absent) and `flags` (report.json
-  `flags_structured`, rebuilt by evaluate._checks for reports made before it).
+  render's `controls` (run.json; None when absent), `flags` (report.json
+  `flags_structured`, rebuilt by evaluate._checks for reports made before it),
+  `delivery` (report.json delivery: integrated_lufs, short_term_max_lufs and
+  true_peak_max_dbtp as {before, after}, format and playback_gain_db; the pairs fall
+  back to the before / after readings in a report made before it), `character`
+  ({requested: the run's control, preset and reason: plan_record.json character; None
+  where absent}) and `voted` (whether the work dir holds ab-votes.jsonl, the shell's
+  vote file).
   `premaster` is the audio the caller vouches for (the app engine passes the input the
   shell granted, audit 13): it is the one read, and a source.json whose path does not
   resolve to the same file raises ValueError. Without it the premaster is source.json's
-  path (the maintainer's own CLI below).
+  path (the maintainer's own CLI below). A premaster the engine resampled for delivery
+  (`master --cd`; source.json resampled_to) is resampled the same way (io.resample) so it
+  lines up with the master; any other rate mismatch raises.
 - `work_dir(input)`: the work dir the app writes for a premaster, "<stem> - eluate"
   next to it (the shell's rule, desktop/src-tauri/src/lib.rs).
 - `summary(input)`: kind "summary", what a batch row needs, from report.json / run.json / source.json
   without loading audio: track, input, work, state "done", loudness (the maintainer's meter),
-  tilt (stereo slope), crest, crestBefore, truePeak, flags, controls, bpm. Done means a
+  tilt (stereo slope), crest, crestBefore, truePeak (as from_render's), integrated_lufs,
+  true_peak_max_dbtp, character_preset (plan_record.json), flags, controls, bpm. Done means a
   readable run.json (cli.do_master's completion marker, written last and removed first,
   report 3.1) with a report.json; anything else (no render, a run that failed or was
   stopped) gives {"kind", "track", "input", "work", "state": "none"}.
+- Audio is read with io.read, so a file with more than two channels is refused the way
+  the engine refuses it (metering audit 2026-11-10 finding 4).
 Numbers only; no audio is copied.
 
 `python -m eluate.uidata <work> ui/data.js` writes the browser-preview data the UI
@@ -39,18 +55,18 @@ import json
 from pathlib import Path
 
 import numpy as np
-import soundfile as sf
 
-from eluate import evaluate
+from eluate import evaluate, io
 from eluate.plan import INPUTEQ_HS_MID_MAX_DB, INPUTEQ_HS_SIDE_MAX_DB
 
 COLUMNS = 1400
 AES17_DB = 3.0103
+VOTES_FILE = "ab-votes.jsonl"      # the shell's vote file (desktop/src-tauri/src/lib.rs VOTES_FILE)
 
 
 def _load(p):
-    x, fs = sf.read(str(p), always_2d=True, dtype="float32")
-    return x[:, :2], fs
+    """float32 stereo (module contract): mono duplicated, more than two channels refused."""
+    return io.read(p)
 
 
 def _columns_peak(x, n):
@@ -109,6 +125,29 @@ def _flags(rep: dict) -> list[dict]:
     return evaluate._clean(evaluate._checks(rep))
 
 
+def _true_peak(side: dict):
+    """The report's true_peak_max_dbtp (module contract); the worst of the readings a report
+    made before it holds."""
+    if side.get("true_peak_max_dbtp") is not None:
+        return side["true_peak_max_dbtp"]
+    vals = [side.get(k) for k in ("true_peak_4x_dbtp", "true_peak_dbtp", "true_peak_32x_dbtp")]
+    vals = [v for v in vals if v is not None]
+    return max(vals) if vals else None
+
+
+def _character(work: Path, controls) -> dict:
+    """{requested, preset, reason} from the run's controls and plan_record.json (None-safe)."""
+    ch = {}
+    try:
+        rec = json.loads((work / "plan_record.json").read_text(encoding="utf-8"))
+        ch = (rec.get("character") if isinstance(rec, dict) else None) or {}
+    except (OSError, ValueError):
+        ch = {}
+    requested = (controls or {}).get("character") if isinstance(controls, dict) else None
+    return {"requested": requested if requested is not None else ch.get("character"),
+            "preset": ch.get("preset"), "reason": ch.get("reason")}
+
+
 def _run(work: Path) -> dict | None:
     """run.json, the completion marker; None when absent or unreadable."""
     try:
@@ -140,11 +179,15 @@ def summary(path) -> dict:
         return {**row, "state": "none"}
     rep = json.loads((work / "report.json").read_text(encoding="utf-8"))
     src = json.loads((work / "source.json").read_text(encoding="utf-8"))
+    tp = _r(_true_peak(rep["after"]))
     return {**row, "state": "done",
             "loudness": _r(rep["after"]["rms_meter_dbfs"]),
             "tilt": _r(rep["tilt"]["after"]["stereo"]),
             "crest": _r(_crest(rep["after"])), "crestBefore": _r(_crest(rep["before"])),
-            "truePeak": _r(rep["after"]["true_peak_dbtp"]),
+            "truePeak": tp,
+            "integrated_lufs": _r(rep["after"].get("integrated_lufs")),
+            "true_peak_max_dbtp": tp,
+            "character_preset": _character(work, run.get("controls"))["preset"],
             "flags": _flags(rep), "controls": run.get("controls"), "bpm": src.get("bpm")}
 
 
@@ -183,12 +226,20 @@ def from_render(work, premaster=None) -> dict:
     pre, fs = _load(path)
     mst, fs2 = _load(work / "master.wav")
     if fs != fs2:
-        raise ValueError("master and source sample rates differ")
+        if src.get("resampled_to") == fs2:       # mastered at the delivery rate (master --cd)
+            pre, fs = io.resample(pre, fs, fs2), fs2
+        else:
+            raise ValueError("master and source sample rates differ")
     n = min(len(pre), len(mst))
     pre, mst = pre[:n], mst[:n]
     dur = n / fs
 
-    match_db = rep["after"]["rms_meter_dbfs"] - rep["before"]["rms_meter_dbfs"]
+    # the A/B files' match (module contract): the premaster drawn at the gain the user hears it
+    ab_rec = rep.get("ab") or {}
+    if ab_rec.get("original_gain_db") is not None and ab_rec.get("master_gain_db") is not None:
+        match_db = ab_rec["original_gain_db"] - ab_rec["master_gain_db"]
+    else:
+        match_db = rep["after"]["rms_meter_dbfs"] - rep["before"]["rms_meter_dbfs"]
     g = 10 ** (match_db / 20)
     tc = (np.arange(COLUMNS) + 0.5) * dur / COLUMNS
     gr = np.zeros(COLUMNS)
@@ -212,6 +263,7 @@ def from_render(work, premaster=None) -> dict:
     lim_w = next((w for w in rep.get("warnings") or [] if w.get("stage") == "limiter"), {})
     secs_eq = (rep["chain"].get("inputeq") or {}).get("sections") or {}
     tg = rep["targets"]
+    controls = _controls(work)
     ab = {k: str((work / "ab" / f).resolve()) for k, f in
           (("before", "original_matched.wav"), ("after", "master_matched.wav"))
           if (work / "ab" / f).exists()}
@@ -243,7 +295,7 @@ def from_render(work, premaster=None) -> dict:
                      "heldBy": lim_w.get("bound")},
         "crest": {"before": _r(_crest(rep["before"])), "after": _r(_crest(rep["after"]))},
         "lra": {"before": _r(rep["before"]["lra_lu"]), "after": _r(rep["after"]["lra_lu"])},
-        "truePeak": _r(rep["after"]["true_peak_dbtp"]),
+        "truePeak": _r(_true_peak(rep["after"])),
         "noise": ({k: (_r(v) if isinstance(v, float) else v) for k, v in rep["noise"].items()
                    if k in ("before_db", "after_db", "threshold_db", "status")}
                   if rep.get("noise") else None),
@@ -253,9 +305,35 @@ def from_render(work, premaster=None) -> dict:
                     "airM": secs_eq.get("air_shelf"), "airS": secs_eq.get("air_shelf_side"),
                     "max": {"M": INPUTEQ_HS_MID_MAX_DB, "S": INPUTEQ_HS_SIDE_MAX_DB,
                             "airM": INPUTEQ_HS_MID_MAX_DB, "airS": INPUTEQ_HS_SIDE_MAX_DB}},
-        "controls": _controls(work),
+        "controls": controls,
         "flags": _flags(rep),
+        "delivery": _delivery(rep, fs),
+        "character": _character(work, controls),
+        "voted": (work / VOTES_FILE).exists(),
     }
+
+
+def _delivery(rep: dict, fs: int) -> dict:
+    """The UI's delivery block (module contract) from report.json's delivery object, with
+    the before / after readings standing in for a report made before it."""
+    dl = rep.get("delivery") or {}
+
+    def pair(k, fallback=None):
+        p = dl.get(k)
+        if p is None:
+            p = {"before": fallback(rep["before"]), "after": fallback(rep["after"])} \
+                if fallback else {}
+        return {"before": _r(p.get("before")), "after": _r(p.get("after"))}
+
+    fmt = dl.get("format") or {"sample_rate": int(fs), "bits": None, "dither": None,
+                               "ceiling_dbtp": None}
+    return {"integrated_lufs": pair("integrated_lufs", lambda s: s.get("integrated_lufs")),
+            "short_term_max_lufs": pair("short_term_max_lufs",
+                                        lambda s: s.get("short_term_max_lufs")),
+            "true_peak_max_dbtp": pair("true_peak_max_dbtp", _true_peak),
+            "format": {"sample_rate": fmt.get("sample_rate"), "bits": fmt.get("bits"),
+                       "dither": fmt.get("dither"), "ceiling_dbtp": _r(fmt.get("ceiling_dbtp"))},
+            "playback_gain_db": {k: _r(v, 1) for k, v in (dl.get("playback_gain_db") or {}).items()}}
 
 
 if __name__ == "__main__":

@@ -14,8 +14,9 @@ Contract:
   gain, applied first. Its record fields (the reference and the premaster's
   measured loudest-section 1 s RMS) are not read by the render.
 - `output` (OutputPlan, docs/gain-staging.md 3 "Ceiling"): the export format
-  of the master, applied last: 24-bit PCM rounded (default), 16-bit PCM with
-  TPDF dither (the streaming option), or 32-bit float (no quantisation). The
+  of the master, applied last: 24-bit PCM rounded (default, and the streaming
+  option), 16-bit PCM with TPDF dither (the CD option), or 32-bit float (no
+  quantisation). The
   render returns the samples exactly as written (k / 2^(bits - 1)), so the
   true peak measured on it is the true peak of the file. The dither is
   seeded (dither_seed) so a render from a saved plan stays bit-exact.

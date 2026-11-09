@@ -481,3 +481,88 @@ def test_crest_db_is_the_corpus_reading():
     assert meter.crest_db(x, FS) == pytest.approx(ref, abs=1e-9)
     assert meter.measure(x, FS)["crest_db"] == pytest.approx(ref, abs=1e-9)
     assert math.isnan(meter.crest_db(np.zeros((FS // 2, 2)), FS))
+
+
+# ------------------------------------------------ measure(): shared intermediates (audit 2026-11-10, 5)
+
+def _old_sliding_max_lufs(ps, fs, win_s):
+    """The pre-refactor one-sample-hop maximum: every window start materialised."""
+    _, _, p = meter._window_powers(ps, fs, win_s, 1.0 / fs)
+    return float(meter._lufs(p.max())) if p.size else math.nan
+
+
+def _old_measure(x, fs):
+    """The pre-refactor measure(): every reading from scratch through the public functions
+    (which still K-weight and interpolate on their own), the maxima by the old formula."""
+    tp = meter.true_peak(x, fs, 8)
+    i = meter.integrated(x, fs)
+    lp = meter.loud_passage_lufs(x, fs)
+    _, _, psr95 = meter.psr(x, fs, 8)
+    r = meter.rms_1s(x, fs)
+    rm = meter.rms_meter(x, fs)
+    sp = meter.sample_peak(x)
+    ps = meter._kpower(x, fs, None)
+    return {"rms_meter_dbfs": rm["loud_dbfs"], "rms_meter_max_dbfs": rm["max_dbfs"],
+            "integrated_lufs": i, "s95_lufs": lp["s95"], "loud_section_lufs": lp["loud_section"],
+            "loud_window_s": lp["window_s"],
+            "short_term_max_lufs": _old_sliding_max_lufs(ps, fs, meter.SHORT_S),
+            "momentary_max_lufs": _old_sliding_max_lufs(ps, fs, meter.BLOCK_S),
+            "lra_lu": meter.lra(x, fs), "true_peak_dbtp": tp, "true_peak_oversample": 8,
+            "true_peak_4x_dbtp": meter.true_peak(x, fs, 4), "sample_peak_dbfs": sp,
+            "plr_db": tp - i, "psr_p95_db": psr95, "rms_1s_loud_dbfs": r["loud_section_dbfs"],
+            "rms_1s_max_dbfs": r["max_dbfs"], "crest_db": sp - r["loud_section_dbfs"]}
+
+
+def _equivalence_signals(fs):
+    t = np.arange(int(6.0 * fs)) / fs
+    sine = _faded(np.stack([np.sin(2 * np.pi * 997.0 * t), 0.5 * np.sin(2 * np.pi * 61.0 * t)],
+                           axis=1) * 10 ** (-6 / 20), fs, 0.02)
+    bursts = syn.tone_sequence([(-20, 0.7), (-40, 0.5), (-14, 0.3), (-70, 0.6)] * 3, fs,
+                               freq=3000.0)
+    return {"pink": syn.pink_noise(int(8.5 * fs), fs, rms_dbfs=-16, seed=11),
+            "sine": sine, "bursts": bursts}
+
+
+@pytest.mark.parametrize("fs", [44100, 48000, 96000])
+def test_measure_equals_the_stand_alone_readings(fs):
+    """measure() shares the K-weighted power, its cumulative sum, the window powers and the
+    8x envelope between its readings; every value is bit-identical to the pre-refactor
+    computation (or within 1e-9 LU), on pink noise, sines and bursts at 44.1 / 48 / 96 kHz."""
+    for name, x in _equivalence_signals(fs).items():
+        new, old = meter.measure(x, fs), _old_measure(x, fs)
+        assert set(new) == set(old), name
+        for k in old:
+            a, b = old[k], new[k]
+            if isinstance(a, float) and not math.isfinite(a):
+                assert (math.isnan(a) and math.isnan(b)) or a == b, (name, k, a, b)
+            else:
+                assert a == b or abs(a - b) <= 1e-9, (name, k, a, b)
+        # the chunked maximum is the old one even when the starts span several chunks
+        ps = meter._kpower(x, fs, None)
+        c = meter._cumsum(ps)
+        for win in (meter.BLOCK_S, meter.SHORT_S):
+            got = meter._sliding_max_power(c, int(round(win * fs)), chunk=4096)
+            assert got / int(round(win * fs)) == pytest.approx(
+                10 ** ((_old_sliding_max_lufs(ps, fs, win) - meter.OFFSET) / 10), rel=1e-12), (name, win)
+    # no window fits: NaN, as before
+    assert math.isnan(meter._sliding_max_lufs(np.ones(10), fs, meter.SHORT_S))
+
+
+def test_dc_like_input_reads_minus_inf_not_a_residue():
+    """Audit 2026-11-10 finding 10: the one-sample-hop maxima of a K-weighted DC are the
+    cumulative sum's residue (about -325 LUFS); they read -inf, as silence does, and the
+    RMS meters stay NaN on silence and on a signal far below any audio floor."""
+    dc = np.full((FS * 5, 2), 0.5)
+    assert meter.momentary_max(dc, FS) == -np.inf and meter.short_term_max(dc, FS) == -np.inf
+    m = meter.measure(dc, FS)
+    assert m["momentary_max_lufs"] == -np.inf and m["short_term_max_lufs"] == -np.inf
+    assert m["integrated_lufs"] == -np.inf and math.isnan(m["lra_lu"])
+    assert m["rms_meter_dbfs"] == pytest.approx(-3.01, abs=0.01)     # unweighted, by design (9)
+    silent = np.zeros((FS * 5, 2))
+    assert meter.momentary_max(silent, FS) == -np.inf
+    for fn in (meter.rms_meter, lambda x, fs: {"v": meter.rms_1s(x, fs)["loud_section_dbfs"]}):
+        assert all(math.isnan(v) for v in fn(silent, FS).values())
+        assert all(math.isnan(v) for v in fn(np.full((FS * 5, 2), 1e-20), FS).values())
+    # a real quiet signal is a reading, not silence: one 24-bit step of noise
+    quiet = syn.pink_noise(FS * 5, FS, rms_dbfs=-130, seed=3)
+    assert math.isfinite(meter.momentary_max(quiet, FS))

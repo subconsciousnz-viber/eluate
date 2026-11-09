@@ -108,6 +108,9 @@ gives the AES17 value, +3.01 dB, in brackets). Default -7.7 dBFS (§9),
 
 **Ceiling**: -0.3 dBTP, 24-bit, by default (maintainer, 2026-10-18; -0.1 is too
 high for inter-sample peaks). A streaming render option: -1 dBTP at 16 bits.
+Since 2026-11-10 (metering audit, finding 6) `--streaming` is -1 dBTP at 24 bits
+and a separate `--cd` option resamples the input to 44.1 kHz before the chain
+and writes 16-bit TPDF at -1 dBTP, so the ceiling is measured at the delivery rate.
 
 ## 4. Crossovers
 
@@ -307,6 +310,9 @@ What landed (§2 item 1, §3 "Ceiling" and "Loudness target", §4, §9):
   -1 dBTP and 16-bit PCM with TPDF dither (seeded, so a saved plan renders
   the same file). The solver measures every constraint, the true peak
   included, on the quantised samples, and master.wav holds exactly those.
+  Changed 2026-11-10 (metering audit, finding 6): `--streaming` now keeps 24 bits at
+  -1 dBTP, and `--cd` is the 16-bit TPDF export, with the input resampled to
+  44.1 kHz (io.resample) before the analysis and the chain.
 
 Deviations, with reasons:
 

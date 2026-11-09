@@ -61,6 +61,10 @@ def test_summary_with_and_without_a_report(tmp_path, capsys):
     assert a["state"] == "done" and a["track"] == "a" and a["bpm"] == 128.0
     assert (a["loudness"], a["tilt"], a["truePeak"]) == (-4.2, -4.6, -0.31)
     assert a["crest"] == 6.6 and a["crestBefore"] == 11.6 and a["controls"] == {"tilt_db": 0.5}
+    # the batch row's delivery numbers (metering audit 2026-11-10): the worst true peak (the
+    # 8x reading is all this older report has), integrated LUFS and the character preset,
+    # None where the report / plan record do not hold them
+    assert (a["true_peak_max_dbtp"], a["integrated_lufs"], a["character_preset"]) == (-0.31, None, None)
     kinds = {f["kind"]: f["short"] for f in a["flags"]}
     assert kinds == {"loudness": False, "lra": False, "crest": True}
     assert b == {"kind": "summary", "track": "b", "input": str(fresh),
@@ -104,6 +108,96 @@ def test_ui_data_reads_only_the_granted_input(tmp_path, capsys, monkeypatch):
     assert uidata._premaster({"path": "a.wav"}, a) == a
     assert uidata._premaster({}, a) == a
     assert uidata._premaster({"path": str(b)}, None) == b      # the maintainer's CLI form
+
+
+def _render_dir(tmp_path, ab=True):
+    """A minimal finished render: a premaster, a master 6 dB louder, and the JSON the UI reads."""
+    rng = np.random.default_rng(1)
+    pre = (0.05 * rng.standard_normal((2 * FS, 2))).astype(np.float32)
+    inp = tmp_path / "t.wav"
+    sf.write(inp, pre, FS)
+    work = uidata.work_dir(inp)
+    work.mkdir()
+    sf.write(work / "master.wav", pre * 2.0, FS)
+    side = {"rms_meter_dbfs": -20.0, "true_peak_dbtp": -4.0, "true_peak_4x_dbtp": -4.1,
+            "true_peak_32x_dbtp": -3.9, "true_peak_max_dbtp": -3.9, "integrated_lufs": -23.0,
+            "short_term_max_lufs": -21.0, "lra_lu": 3.0, "crest_db": 12.0,
+            "sample_peak_dbfs": -8.0, "rms_1s_loud_dbfs": -20.0}
+    after = {**side, "rms_meter_dbfs": -14.0, "true_peak_max_dbtp": -0.9, "integrated_lufs": -17.0}
+    rep = {"before": side, "after": after, "sections": [], "chain": {},
+           "targets": {"slope_db_oct": -4.5, "slope_tol": 0.3, "rms_dbfs": -4.1, "rms_tol_db": 0.3},
+           "ltas": {"centres_hz": [], "before": {}, "after": {}},
+           "tilt": {"before": {"stereo": -4.0}, "after": {"stereo": -4.5}}, "noise": None,
+           "flags_structured": [],
+           "delivery": {"integrated_lufs": {"before": -23.0, "after": -17.0},
+                        "short_term_max_lufs": {"before": -21.0, "after": -15.0},
+                        "true_peak_max_dbtp": {"before": -3.9, "after": -0.9},
+                        "format": {"sample_rate": FS, "bits": 24, "dither": "none",
+                                   "ceiling_dbtp": -0.3},
+                        "playback_gain_db": {"spotify": 3.0, "apple": 1.0}}}
+    if ab:
+        rep["ab"] = {"original_gain_db": 0.0, "master_gain_db": -5.7, "matched_on": "s95"}
+    (work / "report.json").write_text(json.dumps(rep), encoding="utf-8")
+    (work / "source.json").write_text(json.dumps({"path": str(inp),
+                                                  "crossovers_hz": [100.0, 400.0, 1600.0, 6400.0]}),
+                                      encoding="utf-8")
+    (work / "run.json").write_text(json.dumps({"controls": {"character": "slow"}}), encoding="utf-8")
+    (work / "plan_record.json").write_text(
+        json.dumps({"character": {"character": "slow", "preset": "slow", "reason": "asked for"}}),
+        encoding="utf-8")
+    return inp, work, rep
+
+
+def test_from_render_matches_the_ab_files_and_carries_delivery(tmp_path):
+    """Metering audit 2026-11-10: matchDb is the A/B files' match (findings 2), truePeak the
+    worst reading (3), and the page gets delivery, character and voted (1, 5)."""
+    inp, work, rep = _render_dir(tmp_path)
+    ui = uidata.from_render(work, inp)
+    assert ui["matchDb"] == 5.7                       # original_gain - master_gain, not the meter's 6.0
+    assert ui["truePeak"] == -0.9
+    assert ui["delivery"] == {"integrated_lufs": {"before": -23.0, "after": -17.0},
+                              "short_term_max_lufs": {"before": -21.0, "after": -15.0},
+                              "true_peak_max_dbtp": {"before": -3.9, "after": -0.9},
+                              "format": {"sample_rate": FS, "bits": 24, "dither": "none",
+                                         "ceiling_dbtp": -0.3},
+                              "playback_gain_db": {"spotify": 3.0, "apple": 1.0}}
+    assert ui["character"] == {"requested": "slow", "preset": "slow", "reason": "asked for"}
+    assert ui["voted"] is False
+    (work / uidata.VOTES_FILE).write_text('{"vote": "a"}\n', encoding="utf-8")
+    assert uidata.from_render(work, inp)["voted"] is True
+    # the drawn premaster sits where the A/B audio puts it: the meter series moves by matchDb
+    assert np.median(np.asarray(ui["meter"]["before"]) - np.asarray(ui["meter"]["after"])) == \
+        pytest.approx(5.7 - 6.0, abs=0.05)
+    # a report made before the ab block or the delivery object: the meter difference, the
+    # before / after readings, None for the character where there is no plan record
+    (work / "plan_record.json").unlink()
+    rep.pop("ab")
+    rep.pop("delivery")
+    rep["after"].pop("true_peak_max_dbtp")
+    (work / "report.json").write_text(json.dumps(rep), encoding="utf-8")
+    ui = uidata.from_render(work, inp)
+    assert ui["matchDb"] == 6.0 and ui["truePeak"] == -3.9       # the worst of 4x / 8x / 32x
+    assert ui["delivery"]["integrated_lufs"] == {"before": -23.0, "after": -17.0}
+    assert ui["delivery"]["true_peak_max_dbtp"] == {"before": -3.9, "after": -3.9}
+    assert ui["delivery"]["format"] == {"sample_rate": FS, "bits": None, "dither": None,
+                                        "ceiling_dbtp": None}
+    assert ui["delivery"]["playback_gain_db"] == {}
+    assert ui["character"] == {"requested": "slow", "preset": None, "reason": None}
+    row = uidata.summary(inp)
+    assert (row["integrated_lufs"], row["true_peak_max_dbtp"], row["character_preset"]) == \
+        (-17.0, -3.9, None)
+
+
+def test_preview_refuses_more_than_two_channels(tmp_path):
+    """Metering audit 2026-11-10 finding 4: the preview reads with io.read, so a 5.1 file is
+    refused as the engine refuses it instead of drawing its first two channels."""
+    p = tmp_path / "six.wav"
+    sf.write(p, np.zeros((FS, 6), dtype=np.float32), FS)
+    with pytest.raises(ValueError, match="stereo only"):
+        uidata.preview(p, -6.0)
+    m = tmp_path / "mono.wav"
+    sf.write(m, 0.1 * np.ones((FS, 1), dtype=np.float32), FS)
+    assert uidata.preview(m, -6.0)["duration"] == 1.0
 
 
 def test_master_sweeps_stale_spill_dirs(tmp_path, capsys, monkeypatch):

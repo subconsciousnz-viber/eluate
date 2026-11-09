@@ -353,16 +353,24 @@ def test_ceiling_defaults_and_streaming(pana):
     assert LimiterPlan().ceiling_dbtp == -0.3
     assert planner.Targets().true_peak_max_dbtp == -0.3
     assert planner.Controls().output_plan() == OutputPlan(24, "none")
+    # metering audit 2026-11-10 finding 6: streaming keeps 24 bits at -1 dBTP; cd is the
+    # 16-bit TPDF export at the same ceiling; not both
     s = planner.Controls(streaming=True)
-    assert s.ceiling_dbtp == -1.0 and s.output_plan() == OutputPlan(16, "tpdf")
+    assert s.ceiling_dbtp == -1.0 and s.output_plan() == OutputPlan(24, "none")
+    d = planner.Controls(cd=True)
+    assert d.ceiling_dbtp == -1.0 and d.output_plan() == OutputPlan(16, "tpdf")
+    assert s.lossy_delivery and d.lossy_delivery and not planner.Controls().lossy_delivery
+    with pytest.raises(ValueError):
+        planner.Controls(streaming=True, cd=True)
     _, a = pana
-    for c, ceil, bits in ((planner.Controls(), -0.3, 24), (s, -1.0, 16)):
+    for c, ceil, bits in ((planner.Controls(), -0.3, 24), (s, -1.0, 24), (d, -1.0, 16)):
         p = planner.plan_from_analysis(a, c)
         assert p.limiter.ceiling_dbtp == ceil and p.output.bits == bits
         assert planner.targets_from(a, c).true_peak_max_dbtp == ceil
         assert Plan.from_json(p.to_json()).output == p.output
     args = cli.build_parser().parse_args(["master", "in.wav", "-o", "o", "--streaming"])
-    assert cli._controls(args).streaming
+    assert cli._controls(args).streaming and not cli._controls(args).cd
+    assert cli._controls(cli.build_parser().parse_args(["master", "in.wav", "-o", "o", "--cd"])).cd
     assert not cli._controls(cli.build_parser().parse_args(["master", "i", "-o", "o"])).streaming
 
 

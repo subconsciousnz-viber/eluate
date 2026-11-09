@@ -202,7 +202,7 @@ Contract:
   preset, makeup 0 dB, clean curve.
 - Limiter (spec 3.5 item 7, chunk 4): ceiling controls.ceiling_dbtp
   (CEILING_DBTP, -0.3 dBTP; STREAMING_CEILING_DBTP, -1 dBTP, with
-  controls.streaming); target_rms_dbfs = controls.rms_target (the master's
+  controls.streaming or controls.cd); target_rms_dbfs = controls.rms_target (the master's
   RMS on the maintainer's meter, meter.rms_meter: 300 ms, AES17, loudest passage);
   starting gain = the target minus R_ref and the AES17 offset (the analysed audio's
   level after normalisation), which `design_limiter`
@@ -215,9 +215,13 @@ Contract:
   None = auto: on when the character resolves to slow or transparent,
   `kick_detective_choice`) clip depth CLIP_DEPTH_DB at `usable_kick_onsets`
   (clip depth 0 when none).
-- Output (docs/gain-staging.md 3 "Ceiling"): 24-bit PCM, rounded, by default;
-  16-bit PCM with TPDF dither under controls.streaming. Targets.true_peak_max_dbtp
-  is the same ceiling, read on the quantised master.
+- Output (docs/gain-staging.md 3 "Ceiling"; metering audit 2026-11-10 finding 6):
+  24-bit PCM, rounded, by default and under controls.streaming (which only lowers
+  the ceiling to -1 dBTP); 16-bit PCM with TPDF dither under controls.cd (the CD
+  export, -1 dBTP, whose input the CLI resamples to io.CD_FS before the chain so
+  every reading, the ceiling included, is taken at 44.1 kHz). streaming and cd are
+  exclusive. Targets.true_peak_max_dbtp is the same ceiling, read on the quantised
+  master.
 - Under preserve_mix: tone and saturate are None, side makeup is kept (the
   solver's LTAS check bounds it), mid makeup 0.
 - `targets_from(analysis, controls) -> Targets`: the solver's constraint
@@ -230,7 +234,8 @@ Contract:
   all, which made every limiter drive infeasible.
 - Controls: crossovers_hz None (default) means the analysis's own crossovers
   (key-locked when `analyse` found a key); a tuple must equal them.
-  streaming selects the -1 dBTP / 16-bit TPDF export. threads (at least 1, default
+  streaming selects the -1 dBTP ceiling at 24 bits, cd the -1 dBTP / 16-bit TPDF export
+  at io.CD_FS (not both). threads (at least 1, default
   parallel.DEFAULT_THREADS) is the engine's thread count (eluate.parallel), recorded
   with the controls; the plan and master do not depend on it. tilt_db is read as
   dB/oct added to the reference slope (spec 3.5 item 4 "reference_slope +
@@ -242,9 +247,9 @@ Contract:
   is reported and never fails a render; "loss" and "floor" stay available;
   "floor" needs crest_floors_db, one per band, no calibrated default); side_band0_exempt (default False);
   tp_meter "worst" (max of the 4x Annex 2, 8x and 32x readings) or "8x" (max of
-  8x and 32x); None (default) reads "8x" at 24 bits and "worst" under streaming
-  (sprint 2026-10-21 S6, R7g: the Annex 2 reading traded 0.2 to 0.5 dB of loudness
-  for a compliance figure only the lossy-encode path needs).
+  8x and 32x); None (default) reads "8x" for the Master export and "worst" under
+  streaming or cd (sprint 2026-10-21 S6, R7g: the Annex 2 reading traded 0.2 to 0.5 dB
+  of loudness for a compliance figure only the lossy-encode and CD paths need).
 - Profiles (PROFILES, Controls.profile; sprint 2026-10-21 sections 5 and 6): every
   number above that differs by material comes from the profile: "electronic" (the
   values above), "live" (phase 1, uncalibrated: lower budgets, the clipper only under
@@ -387,7 +392,7 @@ GLUE_RELEASE_MS = 300.0
 GLUE_MODES = ("serial", "parallel")
 
 CEILING_DBTP = -0.3              # 24-bit default (maintainer, 2026-10-18; -0.1 is too high)
-STREAMING_CEILING_DBTP = -1.0    # with 16-bit TPDF output (--streaming)
+STREAMING_CEILING_DBTP = -1.0    # the lossy / CD deliveries (--streaming at 24 bits, --cd at 16)
 CLIP_DEPTH_DB = 1.5              # kick-detective clipper depth
 CLIP_TARGET_DB = 1.0             # whole-signal clipper output-peak reduction (at most 1.5)
 CLIP_WARN_DB = envelope.AVERAGE_WARN_DB   # a clipper this far short of its target warns
@@ -571,7 +576,8 @@ class Controls:
     crest_floors_db: tuple | None = None     # per-band floors for crest_mode "floor"
     side_band0_exempt: bool = False          # exempt sidestripped S views from crest
     tp_meter: str | None = None              # "worst" of 4x/8x/32x, "8x"; None: by output
-    streaming: bool = False                  # -1 dBTP ceiling, 16-bit TPDF output
+    streaming: bool = False                  # -1 dBTP ceiling, 24-bit output
+    cd: bool = False                         # -1 dBTP, 16-bit TPDF, input resampled to io.CD_FS
     character: str = "auto"                  # docs/gain-staging.md 7 (CHARACTERS)
     bpm: float | None = None                 # the user's tempo; auto character reads it first
     makeup: str = "peak"                     # multiband makeup mode: peak | rms | auto
@@ -615,8 +621,10 @@ class Controls:
                 _check_floors(self.crest_floors_db, self.crossovers_hz)
         if self.crest_mode == "floor" and self.crest_floors_db is None:
             raise ValueError("crest_mode 'floor' needs crest_floors_db (no calibrated default)")
+        if self.streaming and self.cd:
+            raise ValueError("streaming and cd are two deliveries: choose one")
         if self.tp_meter is None:
-            self.tp_meter = "worst" if self.streaming else "8x"
+            self.tp_meter = "worst" if self.lossy_delivery else "8x"
         if self.tp_meter not in TP_METERS:
             raise ValueError(f"tp_meter must be one of {TP_METERS}")
 
@@ -631,11 +639,17 @@ class Controls:
         return PROFILES[self.profile]
 
     @property
+    def lossy_delivery(self) -> bool:
+        """A delivery for lossy codecs or CD (--streaming, --cd): the -1 dBTP ceiling."""
+        return bool(self.streaming or self.cd)
+
+    @property
     def ceiling_dbtp(self) -> float:
-        return STREAMING_CEILING_DBTP if self.streaming else CEILING_DBTP
+        return STREAMING_CEILING_DBTP if self.lossy_delivery else CEILING_DBTP
 
     def output_plan(self) -> OutputPlan:
-        return OutputPlan(16, "tpdf") if self.streaming else OutputPlan(24)
+        """24-bit rounded, or 16-bit TPDF for the CD export (module contract)."""
+        return OutputPlan(16, "tpdf") if self.cd else OutputPlan(24)
 
     def to_dict(self) -> dict:
         d = asdict(self)

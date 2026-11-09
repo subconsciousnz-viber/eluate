@@ -12,6 +12,15 @@ Contract:
   clipped to the integer range; PCM_24 as int32 holding the value << 8), so
   samples already on that grid (stages/output.py) are written exactly, whatever
   libsndfile's own float scaling.
+- `resample(x, fs, fs_out)`: sample-rate conversion for a delivery rate (`master --cd`,
+  CD_FS = 44100): scipy.signal.resample_poly on the exact ratio Fraction(fs_out, fs) with
+  a Kaiser-windowed sinc designed here (kaiserord for SRC_STOP_DB = 100 dB of image and
+  alias rejection over the transition from SRC_PASS = 0.9 of the lower Nyquist to that
+  Nyquist, cutoff midway: into 44.1 kHz the passband reaches 19.85 kHz and the stopband
+  starts at 22.05 kHz; resample_poly's own default filter would straddle the output
+  Nyquist with about 50 dB of rejection). Shape (n, ch) in and out, output length
+  ceil(n fs_out / fs), dtype kept, zero padding at the edges; fs == fs_out returns x
+  unchanged.
 - `write_text` / `write_json` always write UTF-8 with LF line endings,
   regardless of platform (`open(..., newline="\n")`).
 - `write_npz(path, **arrays)`: np.savez (read it back with allow_pickle=False).
@@ -26,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable
 
@@ -34,6 +44,26 @@ import soundfile as sf
 
 
 PCM_BITS = {"PCM_16": 16, "PCM_24": 24}
+CD_FS = 44100            # the CD delivery rate (`master --cd`)
+SRC_STOP_DB = 100.0      # the delivery resampler's image / alias rejection
+SRC_PASS = 0.9           # its passband edge, as a fraction of the lower Nyquist
+
+
+def resample(x: np.ndarray, fs: int, fs_out: int) -> np.ndarray:
+    """Sample-rate conversion to a delivery rate (module contract)."""
+    if int(fs) == int(fs_out):
+        return x
+    from scipy.signal import firwin, kaiserord, resample_poly
+    fr = Fraction(int(fs_out), int(fs))
+    up, down = fr.numerator, fr.denominator
+    fs_up = float(fs) * up
+    fny = min(float(fs), float(fs_out)) / 2.0
+    numtaps, beta = kaiserord(SRC_STOP_DB, (1.0 - SRC_PASS) * fny / (fs_up / 2.0))
+    numtaps = int(numtaps) | 1                      # odd: an integer delay resample_poly removes
+    h = firwin(numtaps, (1.0 + SRC_PASS) / 2.0 * fny, window=("kaiser", beta), fs=fs_up)
+    xa = np.asarray(x)
+    y = resample_poly(xa.astype(np.float64, copy=False), up, down, axis=0, window=h)
+    return y.astype(xa.dtype, copy=False)
 
 
 def as_stereo(x: np.ndarray) -> np.ndarray:
