@@ -9,11 +9,19 @@ The desktop app's page (`desktop/` wraps it). In a browser it draws `data.js` if
   Character (auto or one of the engine's five timing presets, `--character`) and Loudness
   on the right. Punch, Hardness and Control are kept out of the UI (maintainer, 2026-10-20: no
   Ozone-style complexity; a fine-tune panel may come later). No genre presets.
+- The targets shown are the displayed master's (its report: `tilt.target`, `loudness.target`);
+  the controls set the next render only (Render lights `changed`; on the timeline a moved
+  Loudness is a faint dashed line). Beside Tempo: the master's timing preset
+  (`character.preset`), or before a render Auto's rule (slow only for a given tempo).
 - Amber comes from the engine's checks (`flags`, report.json `flags_structured`):
-  loudness short (and the limiter holding it back), tilt short, sections that rose more
-  than 3 LU against the loudest section, crest below the maintainer's masters, loudness range,
-  and the noise floor in the footer. The page's own thresholds are only a fallback for
-  data made before the engine sent flags.
+  loudness short (and the limiter holding it back), tilt short (Stereo view only in the
+  spectrum), sections that rose more than 3 LU against the loudest section, crest below the
+  maintainer's masters, loudness range, true peak, and the noise floor in the footer. Every
+  amber value has a dot and a screen-reader "(flagged)". Flags n in the footer opens the
+  engine's text of every short flag (any kind: stereo, sub, crest loss, delivery included).
+  The page's own thresholds are only a fallback for data made before the engine sent flags.
+- Footer stats (uidata `delivery` when present): Integrated LUFS, True peak, Crest, Range,
+  Noise, Playback (Spotify and Apple gain), Format (rate, bits, dither, ceiling), Flags n.
 - Batch (docs/batch-mode.md): Open (several files), Folder, or a drop adds tracks to a
   list; two or more show the track list (keyboard listbox; Delete removes a row). Render
   masters every track not Done with the current settings, one at a time (maintainer,
@@ -21,7 +29,10 @@ The desktop app's page (`desktop/` wraps it). In a browser it draws `data.js` if
   beside Render gives a render two engine threads at below-normal priority (sprint WP8).
   Selecting a row shows that track. Tempo, crossovers and the side high-pass belong to the selected track,
   the other controls to the list. A finished list of two or more writes
-  `eluate-batch.csv` into each tracks' folder.
+  `eluate-batch.csv` into each tracks' folder (cells starting = + - @ quoted as text).
+  Reopening a mastered folder adopts the first Done track's shared controls while nothing
+  was touched; a Done track made with other settings reads "Done · other settings" and is
+  never re-mastered until a control is edited (then "Done · settings changed").
 - Log opens the render's process-log.html (eluate.processlog) in the browser.
 - Stems (maintainer, 2026-10-27; docs/noise-and-stems.md, phase C): one track from several
   stems and an optional mix, named "<common prefix> (n stems)". Its sum is written to the
@@ -35,14 +46,16 @@ The desktop app's page (`desktop/` wraps it). In a browser it draws `data.js` if
   (`ab-votes.jsonl`, shell write_vote) before the answer shows. A vote carries the choice,
   which side was the master, switches, listening time, the render's settings and the
   engine's before/after measures, and no file name or path. Blind off before a vote shows
-  the answer and casts none.
+  the answer and casts none. One blind session per master for the run (a master whose
+  answer was shown is not voted on again); a master with a vote on disk (uidata `voted`)
+  opens unblinded. A vote the shell could not save says "Vote not saved." and is not shared.
 - Sharing votes (maintainer, 2026-10-26): off unless the user says yes in the panel shown after
   their first vote (or on switching Share votes on); the answer is kept in the app's
   storage. A shared vote (the local record with its UUID, minus `v`) is queued by the shell
   and sent to https://jective.nz/api/eluate/votes in batches, retried when offline
   (desktop/src-tauri/src/votes.rs); switching sharing off deletes what is still waiting.
 - Tilt under Live moves from the mix's own slope, not from -4.5 dB/oct
-  (planner.target_slope); the spectrum's target line and the readout follow it.
+  (planner.target_slope); after a render the target shown is the render's own.
 - Layout (maintainer feedback 2026-10-24, docs/UI-brief.md): the header holds the app-level
   controls (Open, Folder, Stems, Delivery, Profile, Limit CPU, Render); the graph card starts with
   the track row: the selected track's full name, its status under it, and Cancel, Log and
@@ -53,6 +66,8 @@ The desktop app's page (`desktop/` wraps it). In a browser it draws `data.js` if
   track's preview its analysis runs in the background (`app_engine analyse`, the shell's
   analyse slot), so Render reuses it; Render waits for one still running. While a render
   runs the settings are disabled, and Cancel stops it (the track goes back to Queued).
+  Without an estimate the time reads "7:42 elapsed". Errors show in plain words (raw text in
+  the tooltip) and are announced by a separate alert (`#stage-alert`).
 
 Design tokens (top of `style.css`): page `#0D1011`, panel `#111517`, well `#0A0D0E` (the
 Jective Marks ground), graphite `#75899A` (before), ice `#E3ECEF` (after), reach `#8FD0BF`

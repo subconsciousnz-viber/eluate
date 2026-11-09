@@ -63,7 +63,7 @@ button, input { font: inherit; color: inherit; }
 }
 
 /* names are semi-condensed, values normal width */
-.name, .seg button, .render, .stage, .stats dt, .macro label, .tl-label, .spec-label {
+.name, .seg button, .render, .stage, .stats dt, .macro label, .tl-label {
   font-variation-settings: "wdth" 82;
 }
 
@@ -142,7 +142,7 @@ button, input { font: inherit; color: inherit; }
 .rows { max-height: 13.5rem; overflow-y: auto; }
 .trk {
   display: grid; align-items: baseline; gap: 0 1rem; padding: 0.3rem 1rem;
-  grid-template-columns: minmax(8rem, 1fr) 9rem repeat(5, 5.5rem) 1.5rem;
+  grid-template-columns: minmax(8rem, 1fr) 10.5rem repeat(5, 5.5rem) 1.5rem;
 }
 .trk.head {
   color: var(--dim); font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.12em;
@@ -152,7 +152,7 @@ button, input { font: inherit; color: inherit; }
 .rows .trk:hover { background: var(--well); }
 .rows .trk[aria-selected="true"] { background: var(--well); border-left-color: var(--reach); }
 .trk .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-.trk .st { color: var(--dim); white-space: nowrap; font-variation-settings: "wdth" 82; }
+.trk .st { color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variation-settings: "wdth" 82; }
 .trk.st-running .st { color: var(--reach); }
 .trk.st-error .st { color: var(--red); }
 .trk .num { text-align: right; white-space: nowrap; }
@@ -190,6 +190,7 @@ button, input { font: inherit; color: inherit; }
 .stage { margin: 0; min-height: 1.35em; line-height: 1.35; color: var(--dim); }
 .stage.running { color: var(--ice); }
 .stage-time { color: var(--dim); }
+.stage-err { color: var(--red); }
 .stage-time:not(:empty)::before { content: "\00b7"; margin: 0 0.45rem; }
 .cancel { color: var(--ice); border-color: var(--graphite); flex: none; }
 .stage.running::before {
@@ -249,10 +250,11 @@ button, input { font: inherit; color: inherit; }
 .timeline.drop .tl { outline: 1px dashed var(--reach); outline-offset: 4px; }
 .tl svg, .sp svg { display: block; width: 100%; height: 100%; overflow: visible; }
 
-.tl-label, .spec-label, .tl-axis { fill: var(--dim); font-size: 11px; }
-.sec-name { fill: var(--dim); font-size: 11px; font-variation-settings: "wdth" 82; }
-.sec-val { fill: var(--amber); font-size: 11px; font-weight: 600; }
-.sec-ref { fill: var(--reach); font-size: 12px; }
+/* chart text in rem, so it follows the text size */
+.tl-label, .tl-axis { fill: var(--dim); font-size: 0.6875rem; }
+.sec-name { fill: var(--dim); font-size: 0.6875rem; font-variation-settings: "wdth" 82; }
+.sec-val { fill: var(--amber); font-size: 0.6875rem; font-weight: 600; }
+.sec-ref { fill: var(--reach); font-size: 0.75rem; }
 
 /* ---------------------------------------------------------------- spectrum */
 
@@ -263,9 +265,9 @@ button, input { font: inherit; color: inherit; }
 .sp { height: 308px; }
 /* the crossovers are handles, not data: they sit back until touched */
 .xo { cursor: ew-resize; }
-.xo line { stroke: var(--rule-hi); stroke-dasharray: 3 3; }
+.xo line { stroke: var(--graphite); stroke-dasharray: 3 3; }   /* 5.07:1 on the panel (1.4.11) */
 .xo.side line { stroke-dasharray: 1 3; }
-.xo text { fill: var(--dim); font-size: 11px; }
+.xo text { fill: var(--dim); font-size: 0.6875rem; }
 .xo:hover line, .xo:focus line { stroke: var(--ice); stroke-dasharray: none; }
 .xo:hover text, .xo:focus text { fill: var(--ice); }
 .xo:focus { outline: none; }
@@ -318,24 +320,27 @@ button, input { font: inherit; color: inherit; }
 .got small { display: block; font-size: var(--s-1); font-weight: 400; color: var(--dim); }
 .got .of { color: var(--dim); font-weight: 400; }
 .got.short { color: var(--amber); }
-.got.short::before {
-  content: ""; display: inline-block; width: 0.4rem; height: 0.4rem; border-radius: 50%;
-  background: var(--amber); margin-right: 0.4rem; vertical-align: 0.12em;
+/* amber is never colour alone: every short value has the dot before it (and "(flagged)"
+   for screen readers, from app.js) */
+.short::before {
+  content: ""; display: inline-block; flex: none; align-self: center; width: 0.4rem; height: 0.4rem;
+  border-radius: 50%; background: var(--amber); margin-right: 0.4rem; vertical-align: 0.12em;
 }
 
 input[type="range"] {
   -webkit-appearance: none; appearance: none; background: none; width: 100%; height: 1.5rem; cursor: pointer;
 }
-input[type="range"]::-webkit-slider-runnable-track { height: 3px; border-radius: 2px; background: var(--rule-hi); }
+/* the track in graphite: 5.07:1 on the panel (1.4.11; rule-hi was 1.52:1) */
+input[type="range"]::-webkit-slider-runnable-track { height: 3px; border-radius: 2px; background: var(--graphite); }
 input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none; width: 0.85rem; height: 0.85rem; border-radius: 50%;
   background: var(--ice); margin-top: -0.32rem; border: 0; box-shadow: 0 0 0 3px var(--panel);
 }
-input[type="range"]::-moz-range-track { height: 3px; border-radius: 2px; background: var(--rule-hi); }
+input[type="range"]::-moz-range-track { height: 3px; border-radius: 2px; background: var(--graphite); }
 input[type="range"]::-moz-range-thumb { width: 0.85rem; height: 0.85rem; border-radius: 50%; background: var(--ice); border: 0; }
 
 input[type="number"] {
-  background: var(--well); border: 1px solid var(--rule); border-radius: var(--r); padding: 0.3rem 0.5rem;
+  background: var(--well); border: 1px solid var(--graphite); border-radius: var(--r); padding: 0.3rem 0.5rem;
 }
 .tempo input { width: 5.5rem; }
 
@@ -362,7 +367,7 @@ input[type="range"]:disabled, input[type="number"]:disabled, .toggle:disabled,
 /* About: version, licence and the source at this version's release tag (AGPL source offer) */
 .about { grid-column: 1 / -1; margin: 0; color: var(--dim); font-size: var(--s-1); }
 .about .url { color: var(--ice); user-select: all; }
-.seg.wide { display: flex; }
+.seg.wide { display: flex; flex-wrap: wrap; }
 .seg.wide button { flex: 1; }
 .macro {
   display: grid; grid-template-columns: 6.5rem minmax(0, 1fr) 3rem minmax(7.5rem, auto);
@@ -373,18 +378,18 @@ input[type="range"]:disabled, input[type="number"]:disabled, .toggle:disabled,
 /* ---------------------------------------------------------------- transport */
 
 .transport {
-  position: sticky; bottom: 0; align-self: end; display: flex; align-items: center; gap: 1rem;
+  position: sticky; bottom: 0; align-self: end; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1rem;
   margin: 0 -1.5rem; padding: 0.6rem 1.5rem 0.7rem;
   background: var(--well); border-top: 1px solid var(--rule);
 }
 .play {
-  width: 2.5rem; height: 2.5rem; border-radius: 50%; border: 1px solid var(--ice);
+  flex: none; width: 2.5rem; height: 2.5rem; border-radius: 50%; border: 1px solid var(--ice);
   background: var(--ice); cursor: pointer; display: grid; place-items: center; padding: 0;
 }
 .play svg { width: 0.9rem; height: 0.9rem; fill: var(--steel); }
 .play:disabled { background: var(--panel); border-color: var(--rule); cursor: default; }
 .play:disabled svg { fill: var(--dim); }
-.pos { min-width: 3.5rem; font-size: var(--s1); font-weight: 500; color: var(--ice); }
+.pos { min-width: 3.5rem; font-size: var(--s1); font-weight: 500; color: var(--ice); white-space: nowrap; }
 /* blind A/B: the switch, the vote (enabled once both sides were heard) and the answer */
 .blind-sw { display: inline-flex; align-items: center; gap: 0.5rem; flex: none; color: var(--dim); }
 .vote { display: inline-flex; align-items: center; gap: 0.4rem; flex: none; }
@@ -405,12 +410,29 @@ input[type="range"]:disabled, input[type="number"]:disabled, .toggle:disabled,
 .consent p { margin: 0 0 0.6rem; color: var(--dim); font-size: var(--s-1); line-height: 1.5; }
 .consent .url { color: var(--ice); user-select: all; }
 .consent-buttons { display: flex; gap: 0.6rem; margin-top: 0.8rem; }
-.stats { display: flex; gap: 0; margin: 0 0 0 auto; }
-.stats div { display: flex; flex-direction: column; gap: 0.1rem; padding: 0 1.25rem; border-left: 1px solid var(--rule); }
+/* the stats wrap as whole stats, right-aligned; a before value sits under its value */
+.stats { display: flex; flex-wrap: wrap; justify-content: flex-end; row-gap: 0.4rem; min-width: 0; margin: 0 0 0 auto; }
+.stats div { display: flex; flex-direction: column; gap: 0.1rem; padding: 0 1rem; border-left: 1px solid var(--rule); }
 .stats dt { color: var(--dim); font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.12em; }
-.stats dd { display: flex; gap: 0.4rem; align-items: baseline; margin: 0; font-size: var(--s1); font-weight: 600; white-space: nowrap; }
+.stats dd { margin: 0; font-size: var(--s1); font-weight: 600; white-space: nowrap; }
+.stats dd small { display: block; }
 .stats dd.short { color: var(--amber); }
-.stats dd small { color: var(--dim); font-size: var(--s-1); font-weight: 400; }
+.stats dd small, .stats .svc { color: var(--dim); font-size: var(--s-1); font-weight: 400; }
+.stats .svc { margin: 0 0.3rem 0 0.6rem; }
+.stats .svc:first-child { margin-left: 0; }
+/* Flags n: the count opens the engine's flag texts above the transport */
+.flags-n {
+  background: none; border: 1px solid var(--amber); border-radius: var(--r); color: var(--amber);
+  font-weight: 600; padding: 0 0.5rem; line-height: 1.35; cursor: pointer;
+}
+.flags-n[aria-expanded="true"] { background: color-mix(in srgb, var(--amber) 14%, transparent); }
+.flag-list {
+  position: absolute; bottom: calc(100% + 0.5rem); right: 1.5rem; z-index: 5; width: min(34rem, calc(100% - 3rem));
+  margin: 0; padding: 0.75rem 1rem 0.75rem 2rem; list-style: disc;
+  background: var(--panel); border: 1px solid var(--rule-hi); border-radius: var(--r);
+  box-shadow: 0 8px 28px rgb(0 0 0 / 0.5); color: var(--ice); font-size: var(--s-1); line-height: 1.5;
+}
+.flag-list li::marker { color: var(--amber); }
 
 /* below this the brand and the controls no longer fit one row: the brand gets its own */
 @media (max-width: 1180px) {
@@ -419,11 +441,37 @@ input[type="range"]:disabled, input[type="number"]:disabled, .toggle:disabled,
   .mark { width: 96px; height: 48px; }
 }
 
+/* the transport wraps (above); narrower, the stats drop their before values to stay short */
+@media (max-width: 1240px) {
+  .stats dd small { display: none; }
+  .stats div { padding: 0 0.75rem; }
+}
+
 @media (max-width: 1100px) {
-  .stats { min-width: 0; flex-wrap: wrap; gap: 0.5rem 0; }
-  .stats dd { flex-wrap: wrap; }
   .spec-head { flex-wrap: wrap; }
   .spec-legend { flex-basis: 100%; }
+  .stats div { padding: 0 0.55rem; }
+  .stats dt { letter-spacing: 0.08em; }
+}
+
+/* The controls and the list follow their own width in rem (container queries), so they
+   also re-flow at a larger text size, where the window's px width does not change */
+.controls, .list { container-type: inline-size; }
+/* the sliders get the full width: Character and Loudness go under the targets */
+@container (max-width: 70rem) {
+  .controls-body { grid-template-columns: minmax(0, 1fr); gap: 1.25rem; }
+}
+@container (max-width: 56rem) {
+  .controls-body { gap: 1rem; }
+  .summary { flex-wrap: wrap; gap: 0.25rem 1rem; }
+  .row { grid-template-columns: 6rem minmax(0, 1fr) 3.5rem; }
+  .row { row-gap: 0.2rem; padding-bottom: 0.6rem; }
+  .row .got { grid-column: 2 / 4; }
+  .row .got:empty { display: none; }
+  .macro { grid-template-columns: 6rem minmax(0, 1fr) 3.5rem; row-gap: 0.2rem; }
+  .macro .got { grid-column: 2 / 4; }
+  .trk { grid-template-columns: minmax(6rem, 1fr) 6.5rem repeat(3, 3.5rem) 1.5rem; }
+  .trk > :nth-child(5), .trk > :nth-child(6) { display: none; }
 }
 
 /* ---------------------------------------------------------------- narrow */
@@ -431,14 +479,6 @@ input[type="range"]:disabled, input[type="number"]:disabled, .toggle:disabled,
 @media (max-width: 900px) {
   .app { padding: 0 1rem; }
   .bar, .transport { margin: 0 -1rem; padding-left: 1rem; padding-right: 1rem; }
-  .trk { grid-template-columns: minmax(6rem, 1fr) 6.5rem repeat(3, 3.5rem) 1.5rem; }
-  .trk > :nth-child(5), .trk > :nth-child(6) { display: none; }
-  .controls-body { grid-template-columns: 1fr; gap: 1rem; }
-  .summary { flex-wrap: wrap; gap: 0.25rem 1rem; }
-  .row { grid-template-columns: 6rem minmax(0, 1fr) 3.5rem; }
-  .row { row-gap: 0.2rem; padding-bottom: 0.6rem; }
-  .row .got { grid-column: 2 / 4; }
-  .row .got:empty { display: none; }
   .stats { flex-wrap: wrap; gap: 0.5rem 0; margin-left: 0; }
   .transport { flex-wrap: wrap; gap: 0.75rem 1rem; }
   .seg.wide button { padding: 0.4rem 0.3rem; }
