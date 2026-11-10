@@ -78,7 +78,8 @@ def keyed_planner_analysis(fs: int = 44100, bars_per_section: int = 2):
 
 def dense_track(fs: int = 44100, seconds: float = 8.0, seed: int = 5):
     """A dense, low-crest stereo track (a harmonic stack on 55 Hz plus pink noise, through
-    a tanh), sample peak -6 dBFS: material whose budgets reach the -7.7 dBFS RMS target."""
+    a tanh), sample peak -6 dBFS: material whose budgets reach the default RMS target
+    (planner.DEFAULT_TARGET_RMS_DBFS)."""
     from scipy.signal import lfilter
     n = int(seconds * fs)
     t = np.arange(n) / fs

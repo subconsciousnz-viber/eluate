@@ -74,7 +74,8 @@ def test_summary_with_and_without_a_report(tmp_path, capsys):
 def test_engine_flags_name_no_files():
     """Audit 13 #4: the shell grant-checks the input but passes the page's flags through,
     so no engine command may take a flag whose value is a path (--master-ref lives on the
-    CLI only). Except the ones the shell owns: -o, and master's --stems / --mix (Open
+    CLI only). Except the ones the shell owns: -o, and master's and stems-sum's --stems /
+    --mix (Open
     stems), which the shell refuses from the page and appends itself from the stem set
     the user picked (lib.rs engine_args, page_args_ok)."""
     from pathlib import Path

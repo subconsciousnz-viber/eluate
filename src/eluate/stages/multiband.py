@@ -219,7 +219,7 @@ SOLVE_ITER = 80
 BRACKET_STEP_DB = 6.0
 BRACKET_MAX_DB = 48.0
 # the compressor threshold's step-down never goes further than this below the band
-# channel's loudest-section 1 s RMS (threshold_for_peak_gr; audit 2026-11-10 S2-3): at
+# channel's body (threshold_for_peak_gr; audit 2026-11-10 S2-3): at
 # 2:1 a threshold 12 dB under the band's body already takes 6 dB, the per-sample clamp,
 # off everything, so a lower one only turns the band down. The body is body_level_db: the
 # band's median 1 s RMS at the loud hits, which neither one outlier hit nor a long quiet

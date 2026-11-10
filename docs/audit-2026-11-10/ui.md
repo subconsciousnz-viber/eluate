@@ -7,7 +7,7 @@ Method: code tracing; `node --check ui/app.js` (OK); headless Edge (puppeteer-co
 in the scratch dir with a synthetic `data.js` that follows `uidata.from_render`'s schema, plus a
 harness page (`page/app.html` + `page/mock.js`) that fakes `window.__TAURI__` so the app-only state
 machine (list, queue, Delete, blind votes, consent) can be driven by emitting engine events.
-Scripts: `audit/ui/gen.js`, `shots.js`, `test.js`, `test2.js`, `contrast.js`; screenshots `audit/ui/shot-*.png`.
+Scripts (the audit's session scratch, not in the repository): `audit/ui/gen.js`, `shots.js`, `test.js`, `test2.js`, `contrast.js`; screenshots `audit/ui/shot-*.png`.
 
 Severity: S1 wrong numbers / wrong state / data loss / privacy promise broken; S2 broken interaction or
 a11y blocker; S3 misleading or missing must-know state; S4 code quality; S5 nit.

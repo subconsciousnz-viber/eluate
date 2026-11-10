@@ -145,9 +145,10 @@ Contract:
 - Multiband (spec 3.5 item 3): per band and M / S, a 400 ms frame peak level
   P(t) = rms_dbfs + crest_db from the analysis crest pass (gated frames).
   threshold = p90(P) - MB_THRESHOLD_BELOW_P90_DB at ratio MB_RATIO (about 1 dB
-  of compressor GR at the p90 frame peak; the stage caps GR at 3 dB). Ceiling
-  = p99(P) + MB_CEILING_ABOVE_P99_DB (a transient catcher on the loudest 1 %
-  of frames). Attack / release per band from MB_ATTACK_MS / MB_RELEASE_MS.
+  of compressor GR at the p90 frame peak; the stage caps GR at 3 dB). The record's
+  ceiling_db is None: the band ceilings are solved for their budget in
+  multiband.design_budget (ceiling_for_peak_gr). Attack / release per band from the
+  character preset (character_settings: mb_attack_ms / mb_release_ms).
   Makeup: mid 0 dB on every band (tone carries the spectral target); side
   makeup per the maintainer's rule (MultibandPlan.side_makeup: +2 dB x (1 -
   decoherence) on bands centred at or above 2 kHz, 0 below), decoherence from
@@ -211,10 +212,10 @@ Contract:
   slope): per band b >= 1 (the sub never), drive_b = the band's deficit below
   the target slope line (`band_deficits`: the mean over the band's input EQ fit
   nodes of the target line minus the LTAS, on the analysed spectrum, i.e.
-  before the input EQ), rounded to SAT_STEP_DB (0.5 dB), at most
-  SAT_MAX_DRIVE_DB (2 dB); bands on or above the line get none
-  (`saturation_drive_db`). M and S alike, except the high-mid S band, which
-  keeps the width drive at SAT_MAX_DRIVE_DB. Wet share 1 on every band. The
+  before the input EQ), rounded to SAT_STEP_DB (0.5 dB), at most the profile's
+  sat_max_db (SAT_MAX_DRIVE_DB, 2 dB; 1 dB under stems); bands on or above the line
+  get none (`saturation_drive_db`). M and S alike, except the high-mid S band, which
+  keeps the width drive at that maximum. Wet share 1 on every band. The
   record (`plan_saturate`, plan_record["saturation"]) holds each band's
   deficit and drive. The input EQ still corrects the level, so a dull band
   gets both.
@@ -224,7 +225,8 @@ Contract:
   stage; without a budget record the threshold rule `glue_threshold_audio`
   (p95 of the 400 ms frame peak minus 6 dB) applies. FET-style: ratio 2
   (GLUE_RATIO), knee 3 dB, attack 0.1 to 0.8 ms and release from the character
-  preset, makeup 0 dB, clean curve.
+  preset (the applied attack never under glue.ATTACK_FLOOR_MS, 3 ms; live asks 20 ms),
+  makeup 0 dB, clean curve.
 - Limiter (spec 3.5 item 7, chunk 4): ceiling controls.ceiling_dbtp
   (CEILING_DBTP, -0.3 dBTP; STREAMING_CEILING_DBTP, -1 dBTP, with
   controls.streaming or controls.cd); target_rms_dbfs = controls.rms_target (the master's
@@ -459,7 +461,8 @@ SPECLIM_TOP_ALLOW_DB = 3.5       # (at 2 dB it ducked the top band on 7 to 12 % 
 
 # Character presets (docs/gain-staging.md 7; ms, bands low to high, extra bands use the
 # last value). clip_knee_db 0 would be hard; every preset is soft, at least 0.5 dB (maintainer,
-# 2026-10-23: a hard knee's aliasing, docs/quality-review-2026-10-22.md 3).
+# 2026-10-23: a hard knee's aliasing, docs/quality-review-2026-10-22.md 3, the maintainer's
+# private notes, not in the public tree).
 # band_lookahead_ms: the band ceilings' and the frequency-dependent limiter's lookahead
 # (maintainer, 2026-10-23; quality review 1: at 2 ms a 3 to 6 dB cut on a 40 to 60 Hz band lands
 # inside a tenth of a cycle, amplitude modulation heard as distortion at 100 to 500 Hz).
@@ -2031,7 +2034,8 @@ def plan_saturate(analysis: dict, controls: Controls):
     """(SaturatePlan | None, record): harmonics are the inverse of the slope
     (docs/gain-staging.md 6). Per band b >= 1 (the sub never), drive_b =
     saturation_drive_db(the band's deficit, band_deficits), on M and S alike; the high-mid
-    S band keeps the width rule, at SAT_MAX_DRIVE_DB. The wet share is 1 on every band
+    S band keeps the width rule, at the profile's sat_max_db (SAT_MAX_DRIVE_DB except
+    under stems). The wet share is 1 on every band
     (the drive alone sets the amount). None under preserve_mix."""
     controls = resolve(analysis, controls)
     xo = list(controls.crossovers_hz)
@@ -2289,10 +2293,10 @@ def xover_phases(mode: str, crossovers_hz) -> str | list[str]:
     """The crossovers' phase modes (bands.split) for a plan: "minimum" makes the lowest
     crossover Linkwitz-Riley and the rest zero phase (2026-11-10, filter-maths audit F1: the
     zero-phase lowest crossover pre-rang a kick by -15 dB 6 to 10 ms ahead once the sub band
-    was gained -6 dB; spec 3.1 named minimum "the expected winner"); "zero" keeps every
-    crossover zero phase (the plans made before). The band sum is then the lowest
-    crossover's allpass: flat magnitude, no broadband lag, the sub band's group delay
-    that of an LR4 at the crossover (bands.py)."""
+    was gained -6 dB; spec 3.1 named minimum "the expected winner"); "zero" (the default,
+    and the plans made before) keeps every crossover zero phase. Under "minimum" the band
+    sum is the lowest crossover's allpass: flat magnitude, no broadband lag, the sub band's
+    group delay that of an LR4 at the crossover (bands.py)."""
     if mode not in XOVER_PHASES:
         raise ValueError(f"xover_phase must be one of {XOVER_PHASES}")
     n = len(crossovers_hz)
@@ -2485,7 +2489,8 @@ def glue_threshold_audio(y: np.ndarray, fs: float) -> float:
 
 def solve_clipper(y: np.ndarray, fs: float, lp: LimiterPlan,
                   hits: dict | None = None) -> LimiterPlan:
-    """The whole-signal clipper's threshold solved on its input y (the glue's output) so the
+    """The whole-signal clipper's threshold solved on its input y (the glue's output, or the
+    frequency-dependent limiter's when it runs) so the
     output peak (the 8x peak after the curve and its band-limit) falls by lp.clip_target_db
     (maintainer, 2026-10-18): over hits, on the average peak with the outlier capped at
     CLIP_MAX_GR_DB (solver.clip_threshold_for_average_peak, maintainer 2026-10-19); without
@@ -2604,7 +2609,8 @@ def clamp_limiter_gain(lp: LimiterPlan, requested_db: float) -> LimiterPlan:
 def design_limiter(y: np.ndarray, fs: float, lp: LimiterPlan,
                    requested_db: float | None = None, hits: dict | None = None) -> LimiterPlan:
     """Clipper threshold, then the limiter's input gain within its budget, on the glue's
-    output y (chain order), both over hits. requested_db, when given, is the gain asked
+    output y (the frequency-dependent limiter's when it runs; chain order), both over hits.
+    requested_db, when given, is the gain asked
     for; else, with lp.target_rms_dbfs, the gain at which the proxy limiter's output
     reaches that reading on the maintainer's meter (solver.gain_for_rms, uncalibrated: the solver
     calibrates the proxy on real renders); else lp.requested_gain_db or lp.input_gain_db.
@@ -2883,7 +2889,8 @@ def plan_from_analysis(analysis: dict, controls: Controls, x: np.ndarray | None 
 
 
 def realise(plan: Plan, x: np.ndarray, fs: int, pre=None) -> Plan:
-    """Design the audio-dependent envelopes (multiband, glue) from their design records,
+    """Design the audio-dependent envelopes (multiband, glue, the frequency-dependent
+    limiter) from their design records,
     and the clipper threshold and limiter gain (chunk 3), each solved in chain order on
     the previous stage's real output.
 

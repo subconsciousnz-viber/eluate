@@ -15,8 +15,9 @@ Contract:
   at least n. At "render" n (1-based), `measured` holds the seconds the renders before it
   took; later renders are timed from them (the mean of the measured later renders, else
   LATER_RENDER x the measured first), not from the fit.
-- Constants, fitted on this machine (32 cores, Windows 11) from the eight run.json /
-  solve.json in work/renders whose controls record the threads (2026-10-21 to 10-23):
+- Constants, fitted on the maintainer's machine (32 cores, Windows 11) from the eight
+  run.json / solve.json in work/renders (the maintainer's private run data, not in the
+  public tree) whose controls record the threads (2026-10-21 to 10-23):
   the kicktest renders A and C of Tracks B and E (128 s and 202 s excerpts, 30 threads)
   and the *_s2 renders of Tracks A, C, F and G (full tracks, 230 to 356 s, 6 threads). Per phase,
   the mean seconds per million frames at each thread count, the line A + B / threads

@@ -17,6 +17,9 @@ its tables. `ELUATE_REPO=<path>` measures another checkout (for instance a workt
 reproduce the "before" column); by default it measures this one. `drive.py` uses the stages' newer
 parameters (limiter aim / hold / re-limit, band detector windows, ceiling release, crossover phase)
 when the code under test has them and the original calls otherwise, so one harness reads both.
+Where the code has the crossover phase, the harness always drives the minimum-phase lowest
+crossover (`--xover-phase minimum`, the default when it was written), not the planner's current
+zero-phase default.
 
 | exp | what |
 |---|---|

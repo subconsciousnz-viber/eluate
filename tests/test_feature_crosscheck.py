@@ -4,8 +4,8 @@
 # Copyright (C) 2026 subconsciousnz-viber
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Cross-checks of features/ against independent implementations from the maintainer's
-drumbusmaximus repository (docs/reuse-survey.md item 4). The reference functions
-below are copied verbatim in logic (comments trimmed) and used only here:
+drumbusmaximus repository (docs/reuse-survey.md item 4, the maintainer's private notes, not
+in the public tree). The reference functions below are copied verbatim in logic (comments trimmed) and used only here:
 `correlation` (stereo.py), `magnitude_spectrum` + `dominant_peak` (spectral.py)
 and `frame_f0` (pitch.py, McLeod NSDF with first-peak selection)."""
 

@@ -1,7 +1,7 @@
 # Eluate audit: audio-rate gain and per-sample nonlinearities
 
 Branch audit/2026-11-10, 2026-11-10. Read-only audit; nothing in the repo was modified.
-Harness: `<scratch>/audit/audio-rate/run.py`
+Harness: `<scratch>/audit/audio-rate/run.py` (kept in the repository as `tools/audio_rate/run.py`)
 (`python run.py h1|h2|h3|h4|h5|h6|h7|fixes|mbkick|shape|all`, helpers in `harness/`, results in `out/*.md|json`, logs in `logs/`).
 Every stage is driven as the planner drives it (`planner.character_settings` mirrored without an analysis dict:
 `CHARACTER_PRESETS` timings, `LOW_BAND_RELEASE_MIN_MS`, `LIMITER_RELEASE_MIN_MS`, `multiband.design_budget` with the

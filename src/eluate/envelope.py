@@ -55,9 +55,10 @@ Contract:
   active-set polish that solves the identified equality-constrained system
   exactly, corrects the active set until the KKT sign conditions hold, and
   falls back to the interior-point point if they never do. Measured on 240k
-  points: see audit/brief-02.md section C.3. A primal-dual active-set method
-  cycles on this problem (Q is not an M-matrix) and projected Newton needs
-  hundreds of iterations at long lengths; both were tried and dropped. On exit
+  points: see audit/brief-02.md section C.3 (the maintainer's private notes, not
+  in the public tree). A primal-dual active-set method cycles on this problem
+  (Q is not an M-matrix) and projected Newton needs hundreds of iterations at
+  long lengths; both were tried and dropped. On exit
   g = clip(h - max(z, 0), g_min, h), so the bound holds whether or not the
   solver converged (reported in the returned info).
 - `roughness(g)` = sum of squared second differences, used to compare variants.

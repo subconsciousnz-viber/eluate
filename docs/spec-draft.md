@@ -16,7 +16,8 @@ accepted findings from `audit/01-research-review.md` (review of
 >    `planner.DEFAULT_TARGET_RMS_DBFS` = -4.1); S95 is still reported. GS §17, §18; retirement
 >    list in GS §14.2.
 > 2. **True-peak ceiling** (3.6): the default is -0.3 dBTP on the 8x meter, 24-bit output;
->    -1 dBTP with the worst-of-4x/8x/32x meter applies only under `--streaming`. GS §3
+>    -1 dBTP with the worst-of-4x/8x/32x meter applies only under `--streaming` (24-bit) and
+>    `--cd` (44.1 kHz, 16-bit TPDF; both since 2026-11-10). GS §3
 >    "Ceiling", §11 "Ceiling and export".
 > 3. **Solver method** (3.6 "Method", 1 "solver loop"): the lever classes, coordinate descent
 >    and nearest-feasible-point reporting are retired; the solver is a fixed sequence of planned,
@@ -32,7 +33,8 @@ accepted findings from `audit/01-research-review.md` (review of
 > 6. **`saturate`** (3.5 item 5): drive is capped at 2 dB (`planner.SAT_MAX_DRIVE_DB`) and set
 >    from the band deficit; the harmonic-vs-linear blend is retired. GS §6, §14.2.
 > 7. **`glue`** (3.5 item 6): default `glue_mode="serial"`, FET-style, 2:1, 0.4 ms attack
->    (`planner.GLUE_ATTACK_MS`); parallel is an option. GS §13, §18.
+>    (`planner.GLUE_ATTACK_MS`; since 2026-11-10 the applied attack is never under 3 ms,
+>    `glue.ATTACK_FLOOR_MS`, GS §21); parallel is an option. GS §13, §18.
 > 8. **Crossovers** (9): default 100 / 400 / 1600 / 6400 Hz, and without `--xover` they are
 >    key-locked to the track's tonic. Corrected in 9 below. GS §4, §11.
 > 9. **Licence** (8, 9): decided, AGPL-3.0-or-later (`LICENSE`, `pyproject.toml`). Corrected
@@ -42,8 +44,10 @@ accepted findings from `audit/01-research-review.md` (review of
 >    corrected; the environment table in 0 is also stale (the pinned set is Python 3.12 and
 >    `requirements/lock-*.txt`, see `requirements/README.md`).
 >
-> References to `audit/NN-*.md` below point to the maintainer's internal review logs, which
-> are not part of the public tree; they are kept as the historical record.
+> References to `audit/NN-*.md` and `audit/brief-NN.md` below point to the maintainer's
+> internal review logs, and `docs/audit-protocol.md` and `tools/audit_dispatch.py` (section 6)
+> to the maintainer's internal audit process; none of them is part of the public tree. They are
+> kept as the historical record.
 
 ## 0. Environment (verified 2026-10-17)
 
@@ -369,8 +373,8 @@ eluate render   work/plan.json -o master.wav [--input in.wav]
 eluate master   in.wav -o out/ [--stems a.wav b.wav ...] [--mix M] [controls]   # analyse + plan + solve + render + report + A/B
 eluate report   out/    [--master-ref ref.wav]
 
-controls: --tilt DB/OCT  --target-rms DBFS  --preserve  --xover F1,F2,F3,F4  --subside HZ
-          --profile {electronic,live}  --streaming  --character {auto,transparent,slow,moderate,fast,aggressive}
+controls: --tilt DB/OCT  --target-rms DBFS  --preserve  --xover F1,F2,F3,F4  --xover-phase {zero,minimum}
+          --subside HZ  --profile {electronic,live}  --streaming | --cd  --character {auto,transparent,slow,moderate,fast,aggressive}
           --makeup {peak,rms,auto}  --glue-mode {serial,parallel}  --[no-]kick-detective  --[no-]speclim
           --crest-mode {loss,report,floor}  --crest-floor  --side-band0-exempt  --tp-meter {worst,8x}
           --threads N

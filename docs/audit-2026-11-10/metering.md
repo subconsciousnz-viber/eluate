@@ -2,7 +2,7 @@
 
 Scope: `src/eluate/meter.py`, `features/loudness.py`, `stages/output.py`, `io.py`, `evaluate.py`, `uidata.py`, the limiter's true-peak envelopes (`stages/limiter.py`), `solver.true_peaks`, and the tests `test_meter.py`, `test_evaluate.py` and `test_io.py`. The tests give 138 passed and 64 skipped; the skips are the official EBU files, which are absent, so every EBU case below was rebuilt synthetically. Read-only: nothing in the repo was changed.
 
-Scripts and raw outputs are in `audit/metering/` next to this file, one pair (`*.py` / `*.out`) per check:
+Scripts and raw outputs were in `audit/metering/` (the audit's session scratch, not in the repository), one pair (`*.py` / `*.out`) per check:
 
 | Script | What it checks |
 |---|---|

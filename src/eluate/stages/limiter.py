@@ -93,8 +93,8 @@ is computed here.
    x the ceiling at the worst sample), and the re-limit holds the worst of the three
    (docs/gain-staging.md 21). The solver's blocked limiter (solver.limit_blocked) calls
    `relimit` and reads `aim` and `hold_samples`, so the two paths stay identical.
-7. Last resort: if max(8x, 32x) true peak still exceeds C, one global trim
-   onto C, reported in info["trim_db"]; never seen in the tests.
+7. Last resort: if the worst of the 8x, 32x and 4x Annex 2 readings still exceeds C, one
+   global trim onto C, reported in info["trim_db"]; never seen in the tests.
 info["detector_peak_dbfs"] is the peak of the limiter's 8x detector (after the
 input gain, the clipper and the band-limit): the limiter's own peak GR is
 max(0, that - (ceiling_dbtp - aim_margin_db)), exactly, since box_smooth keeps the

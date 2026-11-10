@@ -138,7 +138,8 @@ BASS_FMIN, BASS_FMAX = 30.0, 250.0
 BASS_FRAME = 512  # 128 ms at 4 kHz
 BASS_HOP = 40  # 10 ms
 SHS_NFFT = 8192
-SHS_H = 4  # 6 or 8 measured worse (audit/brief-04.md D.22)
+SHS_H = 4  # 6 or 8 measured worse (audit/brief-04.md D.22, the maintainer's private notes,
+#            not in the public tree)
 HIGH_ROOT_HZ = 130.0
 # Calibration (audit 04 F3): P(estimate within 50 cents of the true root) per raw
 # confidence bin, measured on frames in the second half of each beat of six

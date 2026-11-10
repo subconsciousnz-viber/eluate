@@ -1,13 +1,14 @@
 """Memory guard for a render (maintainer, 2026-10-22: a render must respect the machine's
-memory; docs/macos-report-verdicts.md 7).
+memory; docs/macos-report-verdicts.md 7, the maintainer's private notes, not in the public
+tree).
 
 Contract:
 - `estimate_mb(frames, threads)`: a `master` run's peak resident memory in MiB for a
   track of `frames` stereo frames: MIB_PER_MFRAME per million frames plus BASE_MIB, plus
   THREADED_MIB when threads > 1. Fitted to run.json `peak_memory_mb` (PeakWorkingSetSize,
   Windows) against duration_s x fs: one thread, the four VA premasters at 11.0 to
-  15.7 M frames (work/renders/*_gA and *_wp4, 2026-10-21; least squares 180.6 MiB per
-  M frames + 238 MiB, within 3%); threaded, the same four at --threads 6 (*_s2: 409 to
+  15.7 M frames (work/renders/*_gA and *_wp4, the maintainer's private run data, not in
+  the public tree; 2026-10-21; least squares 180.6 MiB per M frames + 238 MiB, within 3%); threaded, the same four at --threads 6 (*_s2: 409 to
   542 MiB over one thread) and Track A at --threads 30 (2026-10-22: 2861 MiB, 631 over
   one thread); THREADED_MIB rounds the largest up. So a 6 min 44.1 kHz track needs about
   3.0 GB on one thread, 10 min at 96 kHz about 10 GB.

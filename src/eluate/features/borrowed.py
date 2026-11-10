@@ -3,7 +3,8 @@
 # Provenance: the maintainer's own code, carried over from their TRANSMUTATION and
 # drumbusmaximus / SKIN projects (no third-party code; relicensed with the rest of Eluate,
 # audit features F22).
-"""Detector code borrowed from the maintainer's sibling repositories (docs/reuse-survey.md).
+"""Detector code borrowed from the maintainer's sibling repositories (docs/reuse-survey.md,
+the maintainer's private notes, not in the public tree).
 
 Origins (copied, not imported; the maintainer holds the copyright):
 - `detect_onsets`, `superflux`: TRANSMUTATION engine/transients.py `detect_onsets`

@@ -7,7 +7,7 @@ experiments ran four scripts concurrently, so wall-clock figures below are conte
 Synthetic signals only (`fixtures/synthetic.sectioned_track` tiled, made truly stereo with
 panned pads, decorrelated hats and -42 dBFS pink noise; impulse trains; silence; DC).
 
-Scripts and logs: `scratchpad/audit/planner-solver/` (`common.py`, `mono_sweep.py`,
+Scripts and logs (the audit's session scratch, not in the repository): `scratchpad/audit/planner-solver/` (`common.py`, `mono_sweep.py`,
 `edge_cases.py`, `cli_master.py`, `misc.py`, `followup1..3.py`, `paths.py`, `*.log`,
 work dirs `out_ref`, `out_low`, `out_hot`, `out_ref_preserve`, `out_silence`, `out_half`).
 

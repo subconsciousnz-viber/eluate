@@ -51,7 +51,8 @@ The desktop app's page (`desktop/` wraps it). In a browser it draws `data.js` if
   opens unblinded. A vote the shell could not save says "Vote not saved." and is not shared.
 - Sharing votes (maintainer, 2026-10-26): off unless the user says yes in the panel shown after
   their first vote (or on switching Share votes on); the answer is kept in the app's
-  storage. A shared vote (the local record with its UUID, minus `v`) is queued by the shell
+  storage. A shared vote (rebuilt by the shell from the local record's known fields, votes.rs
+  `wire_vote`: its UUID, the time cut to the minute, numbers rounded) is queued by the shell
   and sent to https://jective.nz/api/eluate/votes in batches, retried when offline
   (desktop/src-tauri/src/votes.rs); switching sharing off deletes what is still waiting.
 - Tilt under Live moves from the mix's own slope, not from -4.5 dB/oct

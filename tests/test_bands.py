@@ -134,7 +134,8 @@ def test_edges_with_50ms_linear_fade(fs):
     """50 ms linear fade at both ends: gate -70 dB (met by edge='zero').
 
     edge='odd' is recorded, not gated: it measures about -52 dB on this
-    stimulus (audit/brief-02.md D.9)."""
+    stimulus (audit/brief-02.md D.9, the maintainer's private notes, not in the
+    public tree)."""
     x = _edge_stimulus(fs)
     nf = int(0.05 * fs)
     w = np.ones(x.size)

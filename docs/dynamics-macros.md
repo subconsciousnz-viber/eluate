@@ -170,8 +170,9 @@ meters per band. Maintainer to rule.
 ## 7. Calibration on the maintainer's masters (local, numbers only)
 
 The 17 premaster and master pairs (§9 of gain-staging.md) are the training data
-for this mapping. A local script (`work/corpus/calibrate.py`, like `measure.py`:
-audio never leaves the machine, it writes numbers only) would measure §3's
+for this mapping. A local script (`work/corpus/calibrate.py`, like `measure.py`
+in the maintainer's private run data, not in the public tree: audio never leaves
+the machine, it writes numbers only) would measure §3's
 descriptors on each premaster and master, then:
 1. read J_H(ref) and the typical tail T at each stage position (checks the §2
    hypothesis that the maintainer's +1.5 dB is the law at a typical tail);

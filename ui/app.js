@@ -366,7 +366,7 @@ async function cancelJobs() {
   queueOn = false; queueFirst = null; analysePending.length = 0;
   const waits = [];
   if (IS_APP && slots.analyse) {
-    slots.analyse.track.noAuto = true;   // not analysed again by itself until its Tempo changes
+    slots.analyse.track.noAuto = true;   // not analysed again by itself until its Tempo or crossovers change
     waits.push(TAURI.core.invoke("stop_job", { slot: "analyse" }).catch(() => {}));
   }
   if (IS_APP && renderJobs().length) waits.push(TAURI.core.invoke("stop_job", { slot: "render" }).catch(() => {}));
@@ -388,7 +388,7 @@ function restorePrior(t) {
 }
 
 // After its preview, a track that will need rendering is analysed in the analyse slot,
-// one at a time and never while the queue runs; a Tempo change runs it again.
+// one at a time and never while the queue runs; a Tempo or crossover change runs it again.
 function wantAnalyse(t) {
   if (!IS_APP || queueOn || t.noAuto || !tracks.includes(t) || !needsRender(t)) return;
   const a = slots.analyse;
@@ -735,8 +735,9 @@ function markChanged() {
 /* ------------------------------------------------------------------ targets */
 
 // Auto's timing preset for a tempo (planner.character_choice): slow only for a tempo the user
-// gave, a detected one under 70 BPM stays moderate. A fallback: the render says which it used
-// (D.character.preset).
+// gave, a detected one under 70 BPM stays moderate. A fallback without the planner's 1 % band
+// around 70 and 140 BPM that reads moderate (planner.AUTO_BPM_TOL): the render says which it
+// used (D.character.preset).
 function timingFor(bpm, given) {
   return bpm < 70 ? (given ? "Slow" : "Moderate") : bpm <= 140 ? "Moderate" : "Fast";
 }
@@ -1360,9 +1361,10 @@ async function castVote(choice) {
 }
 
 // Sharing votes with jective.nz (maintainer, 2026-10-26): off unless the user says yes in the
-// consent panel; the answer is kept in the app's storage. A shared vote is the local one
-// minus its `v` (the endpoint's envelope carries the schema); the shell queues and sends it
-// (votes.rs). Switching sharing off deletes what is still waiting to be sent.
+// consent panel; the answer is kept in the app's storage. A shared vote is rebuilt by the shell
+// from the local one's known fields (votes.rs wire_vote: time cut to the minute, numbers
+// rounded, anything else dropped; the endpoint's envelope carries the schema); the shell
+// queues and sends it. Switching sharing off deletes what is still waiting to be sent.
 const CONSENT_KEY = "eluate.shareVotes";
 let pendingShare = null;                  // the vote that prompted the question
 

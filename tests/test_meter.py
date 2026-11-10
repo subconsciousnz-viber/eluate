@@ -466,8 +466,8 @@ def test_measure_summary_keys():
 
 
 def test_crest_db_is_the_corpus_reading():
-    """meter.crest_db equals work/corpus/measure.py's crest (sample peak minus the p95 of
-    the 1 s RMS at a 100 ms hop, plain dBFS, windows above -70 dBFS), the reading the
+    """meter.crest_db equals work/corpus/measure.py's crest (the maintainer's private run
+    data, not in the public tree; sample peak minus the p95 of the 1 s RMS at a 100 ms hop, plain dBFS, windows above -70 dBFS), the reading the
     maintainer's masters were surveyed with; measure() carries the same value."""
     rng = np.random.default_rng(7)
     x = syn.pink_noise(FS * 12, FS, seed=5)

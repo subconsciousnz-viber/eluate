@@ -896,8 +896,6 @@ fn open_log(app: AppHandle, granted: State<'_, Granted>, path: String) -> Result
     app.opener().open_path(p.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())
 }
 
-/// Debug builds only (scripts/smoke.mjs): grants `paths` as a drop would and sends the
-/// page the same `inputs` event, since a native dialog or drop cannot be scripted.
 /// Debug builds only (scripts/smoke.mjs): pick_stems without its dialogs.
 #[cfg(debug_assertions)]
 #[tauri::command]
@@ -907,6 +905,8 @@ fn smoke_stems(app: AppHandle, stems: Vec<String>, mix: Option<String>) -> Value
     register_set(&app.state::<Granted>(), stems, mix)
 }
 
+/// Debug builds only (scripts/smoke.mjs): grants `paths` as a drop would and sends the
+/// page the same `inputs` event, since a native dialog or drop cannot be scripted.
 #[cfg(debug_assertions)]
 #[tauri::command]
 fn smoke_grant(app: AppHandle, paths: Vec<String>) -> Value {

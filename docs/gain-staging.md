@@ -9,12 +9,14 @@ saturation as the inverse of the slope, §14). The maintainer's answers of
 2026-10-18 to the chunk 2 and 3 questions are in §14.1. Budgets read on the
 average peak since 2026-10-19 (§3, built in §15); audible maxima in §16; the
 loudness target on the maintainer's Ozone meter in §17; compressor budgets on the meter
-reading, FET-style glue and frequency-dependent limiting in §18. Where §2 to §8
+reading, FET-style glue and frequency-dependent limiting in §18; the M/S top end of
+the input EQ in §19, the clipper above the sub in §20, the 2026-11-10 audit's
+audio-rate fixes in §21 and the live profile calibration in §22. Where §2 to §8
 give older values (glue 3:1 / 30 ms, outlier caps of budget + 1.5, the 1 s RMS
 target of -7.7), §16 to §18 supersede them.**
 Numbers marked (corpus) wait on the
-corpus survey in `work/corpus/` (`measure.py`, results not committed: maintainer
-audio).
+corpus survey in `work/corpus/` (`measure.py`; the maintainer's private run data, not
+in the public tree: maintainer audio).
 
 ## 1. Why
 
@@ -176,7 +178,8 @@ line get none. *Assumption: the input EQ still corrects level; the saturator
 (unity small-signal gain, so it adds harmonic density rather than level) acts on
 the deficit measured before the EQ, so a dull band gets both. Drive is in the
 engine's own units until the Saturn calibration is done
-(`work/calibration/saturn/calibration_tones.wav` is ready for it).*
+(`work/calibration/saturn/calibration_tones.wav`, the maintainer's private run data,
+not in the public tree, is ready for it).*
 
 ## 7. Character presets
 
@@ -218,8 +221,8 @@ Notes on the applied values (the table had gone stale; audio-rate audit F8):
 Low-band release never below 25 ms (one 40 Hz cycle) in any preset: faster
 than that, the gain moves inside the bass waveform and distorts.
 
-Band lookahead (maintainer, 2026-10-23; docs/quality-review-2026-10-22.md items 1 and 3, with
-the clipper knee floor): the lookahead of the multiband's band ceilings
+Band lookahead (maintainer, 2026-10-23; docs/quality-review-2026-10-22.md items 1 and 3, the
+maintainer's private notes, not in the public tree; with the clipper knee floor): the lookahead of the multiband's band ceilings
 (`MultibandPlan.ceiling_lookahead_ms`) and of the frequency-dependent limiter
 (`LimiterPlan.speclim_lookahead_ms`), per band, ms. It was 2 ms on every band; a 3 to 6 dB
 cut on a 40 to 60 Hz band then lands inside a tenth of a cycle (amplitude modulation,
@@ -243,8 +246,8 @@ the output peak, after the band-limit (built in chunk 4).
 ## 9. Corpus survey (2026-10-18)
 
 44 unique premasters and 18 of the maintainer's masters (17 matched to their
-premaster), from the folders the maintainer listed (`work/corpus/paths.txt`, audio
-not in the repo). Metric: 1 s RMS (sliding, plain dBFS, a full-scale sine
+premaster), from the folders the maintainer listed (`work/corpus/paths.txt`, the
+maintainer's private run data, not in the public tree; audio not in the repo). Metric: 1 s RMS (sliding, plain dBFS, a full-scale sine
 reads -3.01), loudest section = p95 of the 1 s RMS; crest = sample peak minus
 that; band crest = p99 of the 400 ms frame peak minus the band's p95 1 s RMS,
 crossovers 100 / 400 / 1600 / 6400.
@@ -387,7 +390,7 @@ Deviations, with reasons:
    a third of an octave: E2 (82.4 Hz) sits half a semitone above the
    crossover. Built as specified; the maintainer to rule.
 3. **24-bit output is rounded without dither.** §3 names dither only for the
-   16-bit streaming option.
+   16-bit streaming option (since 2026-11-10 the 16-bit export is `--cd`).
 4. **Plan version 0.5.** Plans saved by earlier code no longer load. That is
    the existing rule; re-run `master`.
 
@@ -806,7 +809,8 @@ Track A masters matches the p95 of the 300 ms series (-5.2 and -5.4), not its ma
   `rms_meter_max_dbfs`.
 - The loudness target (`Targets.rms_dbfs`, `--target-rms`, the solver's measure and
   proxy) reads it. **Default -4.1**, the median of the maintainer's 18 masters on this
-  reading (range -5.0 to -3.7; `work/corpus/meter300.py`). Genre presets kept their
+  reading (range -5.0 to -3.7; `work/corpus/meter300.py`, the maintainer's private run
+  data, not in the public tree). Genre presets kept their
   offsets here until they were retired the next day (§14). The old -7.7 was the same
   corpus median on the 1 s / p95 / plain reading, so this changes the scale, not the
   intent.
@@ -949,7 +953,7 @@ clipper's work). A 1 to 2 dB soft clip on a sine is -27 to -21 dB THD where the 
   after the split: with the sub reaching the limiter, the Annex 2 reading sat 0.0003 dB over.
   The two gs8 renders predate this change (their ceiling render handled it).
 
-## 21. Built 2026-11-10: audio-rate hygiene and the minimum-phase lowest crossover
+## 21. Built 2026-11-10: audio-rate hygiene and the minimum-phase lowest crossover (a toggle)
 
 From the 2026-11-10 audits (audio-rate gain, filter maths, planner S4-6). Every change that
 alters the sound is a plan field the planner writes for new plans; a plan without the
@@ -999,7 +1003,8 @@ against fb082d1), except ms_link plans (item 6, < -70 dB).
    flushed and silent blocks skipped, in bands, inputeq and notch.
 10. **Saturate**: documented only (two-tone leakage below the band, pinned at 2 dB drive).
 
-Measured, before (fb082d1 / the audit) -> after (this branch):
+Measured, before (fb082d1 / the audit) -> after (the DSP fix branch, where minimum phase
+was then the default):
 
 | what | before | after |
 |---|---|---|
@@ -1009,7 +1014,7 @@ Measured, before (fb082d1 / the audit) -> after (this branch):
 | limiter 3 dB GR, aggressive, 30 / 40 Hz: ripple, H3 | 0.49 / 0.37 dB, -36.5 / -38.8 dB | 0.000 dB, < -190 dB |
 | sub-band compressor aggressive 30 Hz: ripple / THD | 0.22 dB / -44.7 dB | 0.000 dB / -205 dB |
 | band ceiling 6 dB, aggressive 30 Hz: ripple / THD | 0.48 dB / -39.3 dB | 0.000 dB / -207 dB |
-| 100 Hz crossover, kick after silence, sub -6 dB: pre-ring | -14.9 dB re kick peak, 6.3 ms over -40 dB | none (0 before the onset) |
+| 100 Hz crossover, kick after silence, sub -6 dB: pre-ring | -14.9 dB re kick peak, 6.3 ms over -40 dB | none with `--xover-phase minimum` (0 before the onset); unchanged at the zero-phase default |
 | ms_link, 2nd-difference spikes > 0.5 dB/ms^2 (test signal) | 15 | 0 (output -100 dB re signal) |
 | notch 12000 / 19695 Hz Q 2 at 44.1 kHz | accepted as disjoint | merged |
 | re-limit on the 30 s loop (share of samples below unity / > 0.01 dB) | 100 % / - (0.44 dB) | 93 % / 24 % (0.39 dB) |
@@ -1025,7 +1030,7 @@ Full `eluate master` of the synthetic 30 s electronic loop (48 kHz, planner audi
 | | meter RMS | integrated LUFS | crest | LRA | limiter average / outlier GR | glue net | re-limit | renders |
 |---|---|---|---|---|---|---|---|---|
 | fb082d1 | -6.00 | -11.48 | 9.08 | 3.86 | 3.0 / 4.82 | 1.50 | 1 pass, 0.44 dB | 1 |
-| this branch | -5.75 | -11.14 | 8.85 | 3.63 | 3.0 / 3.55 | 1.50 | 1 pass, 0.39 dB | 1 |
+| DSP fix branch | -5.75 | -11.14 | 8.85 | 3.63 | 3.0 / 3.55 | 1.50 | 1 pass, 0.39 dB | 1 |
 
 Both renders are held by the limiter's average budget (target -4.1 not reached); the branch
 gets 0.4 dB more limiter gain inside the same budget. Cost of each fix at equal gain on the

@@ -109,7 +109,7 @@ adding `"rpm"` back to `targets` is the whole change.
   refuses (400/415) three times moves to `vote-outbox.rejected.jsonl` beside it. Switching
   sharing off (`clear_outbox`) deletes both and stops a running sender before its next
   post; a POST already on the wire (15 s at most) cannot be recalled. The consent text in
-  ui/index.html should say a shared vote also carries its time (to the minute), the
+  ui/index.html says a shared vote also carries its time (to the minute), the
   listening time and number of A/B switches, and Eluate's version and OS.
 - `engine/eluate-engine.spec`, `engine/entry.py`: the frozen engine. The shell
   sets `NUMBA_CACHE_DIR` to the app cache (librosa's numba cache needs a writable dir).

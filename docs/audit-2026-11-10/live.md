@@ -330,7 +330,8 @@ Tests that pin the old numbers and must move: `tests/test_profiles.py` lines 27 
 `test_live_clipper_only_under_fast_and_aggressive` (becomes "never under auto"), and the
 `calibrated` asserts (lines 19, 68, 71). Current fast tier: 12 passed (195 s).
 
-**Applied 2026-11-10** (maintainer approved B.4 as written; branch of audit/2026-11-10).
+**Applied 2026-11-10** (maintainer approved B.4 as written; on a branch of the sprint branch
+audit/2026-11-10, since merged to `main`).
 Landed in `planner.PROFILES["live"]`, `planner`, `evaluate`, `processlog`, `cli`, the README,
 `docs/gain-staging.md` §22 and the UI's live loudness default (`ui/app.js`):
 

@@ -36,14 +36,15 @@ Contract:
   -8.4 dB low-band deviation in the first 10 ms of a full-scale 45 Hz cosine,
   fc 60 Hz) but differs from the zero-padded reference by -52 dB on a 50 ms
   linear fade with strong content near fc, failing the -70 dB gate; see
-  audit/brief-02.md D.9.
+  audit/brief-02.md D.9 (the maintainer's private notes, not in the public
+  tree).
   Minimum-phase crossovers are causal and start from rest, i.e. the same
   silence assumption. Inputs shorter than 2 samples raise ValueError, as does
   NaN or Inf.
 - `split_iter(...)` yields the same bands one at a time (bit-identical) and holds
   just the current band and the residual, for every phase mode (since 2026-11-10,
-  when the planner made the lowest crossover minimum phase; before, a minimum-phase
-  crossover computed the whole split first). `split` fills a preallocated output
+  when the planner gained the minimum-phase lowest crossover, `--xover-phase minimum`;
+  before, a minimum-phase crossover computed the whole split first). `split` fills a preallocated output
   from it. Zero-phase
   filtering runs one column at a time (sosfilt treats columns independently,
   so the result is unchanged) to hold one padded column, not all. The edge "zero"

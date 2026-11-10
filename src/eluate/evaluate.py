@@ -134,7 +134,8 @@ FLAG_SECTION_IGNORE_LU = 20.0  # sections this far below the loudest are not jud
 FLAG_LRA_LU = 5.0
 FLAG_SUB_DB = 3.0
 FLAG_CORR_DROP = 0.25
-FLAG_CREST_DB = 7.1           # the maintainer's masters' lowest crest (meter.crest_db, work/corpus)
+FLAG_CREST_DB = 7.1           # the maintainer's masters' lowest crest (meter.crest_db, work/corpus;
+                              # the maintainer's private run data, not in the public tree)
 # Live profile flags (live audit 2026-11-10 A5, A7; maintainer approved B.4). Micro-dynamics:
 # Dynameter's minimum-PSR presets (Competitive 10, Limited 8) and Katz's "PLR 12 is good".
 LIVE_PSR_FLAG_DB = 10.0       # PSR p95 after below this: flagged

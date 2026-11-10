@@ -4,7 +4,7 @@ Scope: desktop/src-tauri (lib.rs, votes.rs, configs, capabilities, Cargo), deskt
 src/eluate/app_engine.py (protocol side), ui/app.js (vote payload, IPC calls), tools/third_party_notices.py,
 THIRD_PARTY_NOTICES.txt, .github/workflows/tests.yml, origin/macos-linux-installers.
 
-Commands run (logs in this folder): `node desktop/scripts/stage-ui.mjs` + the CI engine placeholder,
+Commands run (logs in the audit's session scratch, not in the repository): `node desktop/scripts/stage-ui.mjs` + the CI engine placeholder,
 `cargo test --locked` (cargo-test.log), `cargo clippy --all-targets` (clippy.log), a scratch crate probing
 Windows `canonicalize` (canon/), a scratch crate checking serde_json / `lines()` behaviour (jsonpanic/),
 crates.py (Cargo graph vs THIRD_PARTY_NOTICES), engine import timings from .venv.

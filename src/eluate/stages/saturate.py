@@ -32,9 +32,9 @@ Contract: `apply(x, fs, plan) -> y`, pure, stereo (n, 2) in, float64 (n, 2) out.
   band level change -0.19 / -2.03 / -6.83 dB. So "the sub band never saturates" holds
   for the sub band's own signal, while a band 1 driven past about 6 dB injects
   sub-region products at -50 dB and worse; the planner's drives stay near 2 dB.
-  Behaviour unchanged (documented only); the split stays zero phase (the multiband's
-  lowest crossover is minimum phase for new plans, saturate's is not: its change is
-  small and its pre-ring with it).
+  Behaviour unchanged (documented only); the split stays zero phase (under
+  `--xover-phase minimum` the multiband's lowest crossover is minimum phase, saturate's
+  is not: its change is small and its pre-ring with it).
 - The knee is scaled to a robust band level (gated RMS x sqrt 2, the peak of a
   sine at that RMS), never the whole-track peak, so one spike does not mute the
   saturator. G < 1e-12, h = 0, or a band with no block above the gate leaves

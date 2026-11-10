@@ -56,7 +56,9 @@ def mb_plan(character: str, profile: str = "electronic", crossovers=XO, makeup: 
 
 
 def new_mb_fields(crossovers, nb) -> dict:
-    """plan_multiband_record's 2026-11-10 fields when the src has them (else nothing)."""
+    """plan_multiband_record's 2026-11-10 fields when the src has them (else nothing). The
+    crossover phase is always "minimum" here (`--xover-phase minimum`, the default when the
+    harness was written; speclim_plan does the same); the planner's default is zero phase."""
     out = {}
     if hasattr(mb, "default_detector_window_ms"):
         out["detector_window_ms"] = mb.default_detector_window_ms(list(crossovers))
@@ -73,7 +75,9 @@ def mb_realise(x, fs, plan: MultibandPlan, hits) -> MultibandPlan:
 
 
 def mb_total_gain_db(plan: MultibandPlan, k: int, c: int, n: int, fs: float) -> np.ndarray:
-    """The gain band k channel c gets in multiband._stream (dB, audio rate)."""
+    """The gain band k channel c gets in multiband._stream (dB, audio rate). Under ms_link
+    this takes the M / S minimum at audio rate, the stage's behaviour before 2026-11-10;
+    the stage now takes it on the control grid (multiband.linked_reduction_db)."""
     makeup = plan.makeup()
     if plan.ms_link:
         red = []

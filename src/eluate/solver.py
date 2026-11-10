@@ -14,7 +14,7 @@ Contract:
   prepended as one synthetic sample, which reproduces the recursion
   h[n] = min(u[n], a h[n-1]) in dB). Then the local re-limit and the
   last-resort trim run on the decimated base-rate output as in limiter.py
-  (8x true-peak envelope and 32x FFT envelope, both base-rate arrays).
+  (8x true-peak, 32x FFT and 4x Annex 2 envelopes, all base-rate arrays).
   Agreement with limiter.apply_with_info: equal up to FFT-convolution and
   log-domain rounding (tested: max abs difference < 1e-9 on synthetic
   signals with clipping and re-limiting). info has the same keys.
@@ -26,7 +26,7 @@ Contract:
   Memory: the 8x arrays are per block (block + margins, about 16 MB per
   array at the default block; 40 to 50 MB per block in flight, at most
   parallel.BLOCK_CAP at once); the peak is set by the base-rate re-limit
-  pass (8x true-peak envelope, 32x FFT envelope, box smoother on whole-track
+  pass (8x true-peak, 32x FFT and 4x Annex 2 envelopes, box smoother on whole-track
   base-rate arrays). Measured before the memory pass at about 180 bytes per
   input sample against about 970 for limiter.apply_with_info (tracemalloc,
   48 s at 44.1 kHz); see brief-07 revision 3 for the current figure.

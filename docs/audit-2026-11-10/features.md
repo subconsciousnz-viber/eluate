@@ -1,6 +1,6 @@
 # Eluate audit: analysis features (src/eluate/features/, noise.py, planner consumption)
 
-Branch audit/2026-11-10, read-only. All signals were synthetic: fixtures/synthetic.py, fixtures/e_signals.py, and the audit's own generator `audit/features/gen.py`, which builds kick + off-beat hats + bass root per bar + pad triads, plus an ambient pad. Scripts and logs are in `audit/features/` next to this file. Each finding cites its script.
+Branch audit/2026-11-10, read-only. All signals were synthetic: fixtures/synthetic.py, fixtures/e_signals.py, and the audit's own generator `audit/features/gen.py`, which builds kick + off-beat hats + bass root per bar + pad triads, plus an ambient pad. Scripts and logs were in `audit/features/` (the audit's session scratch, not in the repository). Each finding cites its script.
 
 Timing caveat: most experiments ran in parallel with each other on 12 cores, so their wall times are inflated. The clean timing table comes from `finish.py`, run alone after a numba warm-up.
 
