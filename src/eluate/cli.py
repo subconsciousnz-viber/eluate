@@ -83,13 +83,15 @@ Contract:
   uidata resample the premaster the same way; metering audit 2026-11-10 finding 6);
   `render` resamples its input to the plan's rate when they differ; the loudness
   target --target-rms R (the master's RMS on the maintainer's Ozone meter: 300 ms,
-  AES17, loudest passage; default planner.DEFAULT_TARGET_RMS_DBFS = -4.1);
+  AES17, loudest passage; default the profile's: planner.DEFAULT_TARGET_RMS_DBFS = -4.1
+  for electronic, -11.5 for live, planner.PROFILES);
   dynamics: --character
   auto|transparent|slow|moderate|fast|aggressive, --makeup peak|rms|auto,
   --glue-mode serial|parallel, --kick-detective / --no-kick-detective (default
   auto: on for the slow and transparent characters), --speclim / --no-speclim
   (frequency-dependent limiting before the clipper, default on), --profile
-  electronic|live (planner.PROFILES; live is phase 1, uncalibrated); --threads N (engine
+  electronic|live (planner.PROFILES; live is calibrated on synthetic fixtures and published
+  statistics, planner.PROVISIONAL_CALIBRATION); --threads N (engine
   threads, eluate.parallel; default all cores but two, recorded in run.json's controls;
   the master and plan are bit-identical at any N). Once the completion marker is cleared,
   `master` runs eluate.memory.guard on the input's frame count (soundfile.info, nothing
@@ -727,7 +729,8 @@ def _add_controls(p):
     p.add_argument("--tilt", type=float, default=0.0, help="dB/oct around -4.5, +-3")
     p.add_argument("--target-rms", type=float, default=None,
                    help="master RMS on the Ozone meter: 300 ms, AES17, loudest passage (default "
-                        f"{planner.DEFAULT_TARGET_RMS_DBFS:g})")
+                        f"{planner.PROFILES['electronic']['target_rms_dbfs']:g} electronic / "
+                        f"{planner.PROFILES['live']['target_rms_dbfs']:g} live)")
     p.add_argument("--preserve", action="store_true")
     p.add_argument("--xover", type=_xover, default=None)
     p.add_argument("--xover-phase", default="minimum", choices=planner.XOVER_PHASES,
@@ -736,7 +739,8 @@ def _add_controls(p):
     p.add_argument("--subside", type=float, default=None)
     p.add_argument("--crest-mode", default="report", choices=planner.CREST_MODES)
     p.add_argument("--profile", default="electronic", choices=planner.USER_PROFILES,
-                   help="live: a live or acoustic recording (phase 1, uncalibrated)")
+                   help="live: a live or acoustic recording ("
+                        f"{planner.PROVISIONAL_CALIBRATION})")
     p.add_argument("--crest-floor", type=_xover, default=None,
                    help="per-band crest floors, dB, for --crest-mode floor")
     p.add_argument("--side-band0-exempt", action="store_true")

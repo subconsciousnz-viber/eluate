@@ -37,9 +37,22 @@ Contract:
   loudness | tilt | tp | section | lra | sub | stereo (with "band") | crest |
   crest_loss | noise, "value", "target", "tol", "short", "text"}: loudness, tilt and
   tp are the solver's constraints as measured (their text is the miss line), the
-  rest the FLAG_* heuristics; `flags` is the text of the short heuristic ones. The
+  rest the FLAG_* heuristics; `flags` is the text of the short heuristic ones. Under
+  the live profile (plan record profile "live"; live audit 2026-11-10 A5, A7) the lra
+  check's tolerance is LIVE_LRA_DROP_LU (3 LU) when the premaster's LRA is above
+  LIVE_LRA_WIDE_LU (12), and `_live_checks` adds, each with a "level" (amber / flag /
+  info): psr (PSR p95 after below LIVE_PSR_FLAG_DB 10 dB, amber below LIVE_PSR_AMBER_DB
+  8), plr (PLR after below LIVE_PLR_FLAG_DB 12), crest_drop (crest_db lost past
+  LIVE_CREST_DROP_DB 3), slope_reference (informational: the master's stereo slope more
+  than LIVE_SLOPE_TOL 2 dB/oct from planner.REFERENCE_SLOPE, with the Tilt that would aim
+  at it; under live the solver's slope target is the mix's own), and the provenance
+  flags clipper_live (a clipper rendered under live), notches_tonal (notches rendered on
+  sustained material or on "musical" candidates) and beat_grid (sustained material: no
+  beat grid, 400 ms hits). Electronic and stems reports get none of them. The
   crest reading is meter.crest_db (`crest_db` in before / after). `noise` holds
-  noise.assess of the premaster's and the master's floors. `warnings` holds
+  noise.assess of the premaster's and the master's floors. report.md names a
+  non-electronic profile (an uncalibrated one with planner.PROVISIONAL_CALIBRATION) and
+  sustained material (plan record "sustained"). `warnings` holds
   the solver's structured warnings (budget warnings and the loudness shortfall;
   the plan's budget warnings without a solve) and `loudness` the target and the
   RMS and S95 before and after: `*_rms_dbfs` and `*_rms_aes17_dbfs` both hold the
@@ -119,6 +132,15 @@ FLAG_LRA_LU = 5.0
 FLAG_SUB_DB = 3.0
 FLAG_CORR_DROP = 0.25
 FLAG_CREST_DB = 7.1           # the maintainer's masters' lowest crest (meter.crest_db, work/corpus)
+# Live profile flags (live audit 2026-11-10 A5, A7; maintainer approved B.4). Micro-dynamics:
+# Dynameter's minimum-PSR presets (Competitive 10, Limited 8) and Katz's "PLR 12 is good".
+LIVE_PSR_FLAG_DB = 10.0       # PSR p95 after below this: flagged
+LIVE_PSR_AMBER_DB = 8.0       # ... below this: amber (the agreed minimum)
+LIVE_PLR_FLAG_DB = 12.0       # PLR after below this: flagged
+LIVE_LRA_WIDE_LU = 12.0       # LRA before above this: wide-range material, whose
+LIVE_LRA_DROP_LU = 3.0        # ... loudness range may drop at most this (else FLAG_LRA_LU)
+LIVE_CREST_DROP_DB = 3.0      # crest (meter.crest_db) lost by the master: flagged
+LIVE_SLOPE_TOL = 2.0          # dB/oct around planner.REFERENCE_SLOPE: informational (A5)
 
 # Delivery (metering audit 2026-11-10, finding 1). The reference loudness each platform
 # normalises a track to (BS.1770 integrated LUFS) and the true-peak advice. These are the
@@ -517,10 +539,15 @@ def _checks(rep: dict) -> list[dict]:
                     + (f"; {len(louder)} now louder than it" if louder else "") + ".")
         out.append(_check("section", max(d for d, _ in rises), 0.0, FLAG_SECTION_LU, moved, text))
     b, a = rep.get("before") or {}, rep.get("after") or {}
+    live = _profile_name(rep) == "live"
     if b.get("lra_lu") is not None and a.get("lra_lu") is not None:
-        out.append(_check("lra", a["lra_lu"], b["lra_lu"], FLAG_LRA_LU,
-                          b["lra_lu"] - a["lra_lu"] > FLAG_LRA_LU,
-                          f"Loudness range: {b['lra_lu']:.1f} -> {a['lra_lu']:.1f} LU."))
+        # live: a wide-range premaster (LRA above LIVE_LRA_WIDE_LU) may lose at most 3 LU
+        wide = live and b["lra_lu"] > LIVE_LRA_WIDE_LU
+        tol = LIVE_LRA_DROP_LU if wide else FLAG_LRA_LU
+        out.append(_check("lra", a["lra_lu"], b["lra_lu"], tol, b["lra_lu"] - a["lra_lu"] > tol,
+                          f"Loudness range: {b['lra_lu']:.1f} -> {a['lra_lu']:.1f} LU"
+                          + (f" (live, wide-range material: flagged past a {tol:g} LU drop)"
+                             if wide else "") + "."))
     t = rep.get("tilt") or {}
     sb, sa = ((t.get("sub_shelf_before") or {}).get("stereo"),
               (t.get("sub_shelf_after") or {}).get("stereo"))
@@ -576,6 +603,86 @@ def _checks(rep: dict) -> list[dict]:
                 + (f"masters louder than {CODEC_LOUD_ABOVE_LUFS:g} LUFS" if loud
                    else "lossy delivery") + " (platform rules, approximate).")
         out.append(_check("delivery", tpm, limit, 0.0, short, text))
+    if live:
+        out += _live_checks(rep)
+    return out
+
+
+def _profile_name(rep: dict) -> str:
+    return (((rep.get("planner") or {}).get("profile") or {}).get("name")) or "electronic"
+
+
+def _live_checks(rep: dict) -> list[dict]:
+    """The live profile's own checks (module contract; live audit 2026-11-10 A5, A7), each
+    with a "level": "amber" (PSR p95 below LIVE_PSR_AMBER_DB), "flag" (the dynamics and
+    provenance flags) or "info" (where the mix sits against the reference slope, the beat
+    grid not trusted). Only what the report already measured or the planner recorded."""
+    from eluate.planner import REFERENCE_SLOPE, SUSTAINED_HITS_SOURCE, TILT_MAX
+    b, a = rep.get("before") or {}, rep.get("after") or {}
+    pl = rep.get("planner") or {}
+    out = []
+    psr = a.get("psr_p95_db")
+    if psr is not None:
+        amber = psr < LIVE_PSR_AMBER_DB
+        out.append(_check("psr", psr, LIVE_PSR_FLAG_DB, 0.0, psr < LIVE_PSR_FLAG_DB,
+                          f"PSR p95 {psr:.1f} dB (before {_f(b.get('psr_p95_db'), 1)}): "
+                          + (f"below the {LIVE_PSR_AMBER_DB:g} dB minimum" if amber else
+                             f"below {LIVE_PSR_FLAG_DB:g} dB")
+                          + ", the loud passages are dense for live material.",
+                          level="amber" if amber else "flag"))
+    plr = a.get("plr_db")
+    if plr is not None:
+        out.append(_check("plr", plr, LIVE_PLR_FLAG_DB, 0.0, plr < LIVE_PLR_FLAG_DB,
+                          f"PLR {plr:.1f} dB (before {_f(b.get('plr_db'), 1)}): below "
+                          f"{LIVE_PLR_FLAG_DB:g} dB for live material.", level="flag"))
+    if a.get("crest_db") is not None and b.get("crest_db") is not None:
+        drop = b["crest_db"] - a["crest_db"]
+        out.append(_check("crest_drop", drop, 0.0, LIVE_CREST_DROP_DB, drop > LIVE_CREST_DROP_DB,
+                          f"Crest: {b['crest_db']:.1f} -> {a['crest_db']:.1f} dB, "
+                          f"{drop:.1f} dB lost (live: flagged past {LIVE_CREST_DROP_DB:g} dB).",
+                          level="flag"))
+    t = rep.get("tilt") or {}
+    sa = (t.get("after") or {}).get("stereo")
+    if sa is not None:
+        d = sa - REFERENCE_SLOPE
+        sb = (t.get("before") or {}).get("stereo")
+        tilt = None if sb is None else REFERENCE_SLOPE - sb
+        hint = ("" if tilt is None else
+                f"; Tilt {tilt:+.1f} would aim at it" if abs(tilt) <= TILT_MAX else
+                f"; that is beyond the Tilt range (+-{TILT_MAX:g})")
+        out.append(_check("slope_reference", sa, REFERENCE_SLOPE, LIVE_SLOPE_TOL,
+                          abs(d) > LIVE_SLOPE_TOL,
+                          f"Tone: the master's slope is {sa:.2f} dB/oct, {abs(d):.1f} dB/oct "
+                          f"{'darker' if d < 0 else 'brighter'} than the {REFERENCE_SLOPE:g} "
+                          f"dB/oct reference (live keeps the mix's own slope{hint}).",
+                          level="info"))
+    clip = (rep.get("chain") or {}).get("clipper") or pl.get("clipper") or {}
+    mode = clip.get("mode")
+    if mode is not None:
+        why = (pl.get("clipper") or {}).get("reason") or (pl.get("character") or {}).get(
+            "clipper_reason")
+        out.append(_check("clipper_live", 1.0 if mode != "off" else 0.0, 0.0, 0.0, mode != "off",
+                          f"Clipper on under live ({mode}"
+                          + (f"; {why}" if why else "") + ").", level="flag"))
+    su = pl.get("sustained") or {}
+    merged = pl.get("merged_notches")
+    if merged is not None:
+        rows = rep.get("notches") or []
+        musical = {r.get("merged_into") for r in rows
+                   if r.get("rendered") and r.get("flag") == "musical"}
+        n = len(merged) if su.get("sustained") else len(musical - {None})
+        what = "sustained tonal material" if su.get("sustained") else '"musical" candidates'
+        out.append(_check("notches_tonal", n, 0, 0, n > 0,
+                          f"{n} notch(es) rendered on {what} under live.", level="flag"))
+    if su.get("applies"):
+        hits = (rep.get("budget") or {}).get("hits")
+        no_grid = bool(su.get("sustained")) and hits in (None, SUSTAINED_HITS_SOURCE)
+        rate = su.get("onsets_per_s")
+        out.append(_check("beat_grid", rate, su.get("threshold_onsets_per_s"), 0.0, no_grid,
+                          f"No beat grid: sustained material ({_f(rate)} onsets/s < "
+                          f"{su.get('threshold_onsets_per_s')}); budgets read on 400 ms frames, "
+                          "lower budgets, no notches, no frequency-dependent limiting.",
+                          level="info"))
     return out
 
 
@@ -911,6 +1018,8 @@ def _what_was_done_md(rep: dict) -> list[str]:
     if "sidestrip" in c:
         items.append(f"Side strip: side channel high-passed below "
                      f"{c['sidestrip']['fc_hz']:.0f} Hz.")
+    elif c and (pr.get("sidestrip") or {}).get("rule") and pr["sidestrip"].get("used_hz") is None:
+        items.append(f"Side strip: off ({pr['sidestrip']['rule']}).")
     ch = pr.get("character") or {}
     if "multiband" in c:
         m = c["multiband"]
@@ -1037,8 +1146,13 @@ def report_md(rep: dict) -> str:
     L = ["# Master report", ""]
     pr = (rep.get("planner") or {}).get("profile") or {}
     if pr.get("name") and pr["name"] != "electronic":
+        from eluate.planner import PROVISIONAL_CALIBRATION
         L += [f"Profile: {pr['name']}" + ("" if pr.get("calibrated") else
-              " (phase 1: the live profile defaults are uncalibrated)") + ".", ""]
+              f" ({PROVISIONAL_CALIBRATION}; not yet on the maintainer's own live masters)")
+              + ".", ""]
+    su = (rep.get("planner") or {}).get("sustained") or {}
+    if su.get("sustained"):
+        L += [f"Material: {su.get('reason')}.", ""]
     s = rep.get("solver") or {}
     warns = rep.get("warnings") or []
     miss = [m for m in (s.get("misses") or []) if m.get("name") != "rms"

@@ -12,7 +12,7 @@ const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
 // Profiles (planner.PROFILES): the loudness default and the slider range differ
 const PROFILES = {
   electronic: { loud: -4.1, range: [-9, -2] },
-  live: { loud: -10, range: [-14, -6] },         // phase 1, uncalibrated (R9)
+  live: { loud: -11.5, range: [-14, -6] },       // live audit 2026-11-10 B.4 (synthetic fixtures)
 };
 const DEFAULT_LOUD = PROFILES.electronic.loud;
 const TILT_REF = -4.5;
