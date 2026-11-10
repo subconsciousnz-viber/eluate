@@ -441,8 +441,13 @@ def test_subside_request_is_recorded_with_the_clip(pana):
     assert planner.subside_hz(a, planner.Controls(subside_hz=20.0)) == 60.0
     sc = planner.sidestrip_choice(a, planner.Controls(subside_hz=90.0))
     assert sc["used_hz"] == 90.0 and not sc["clipped"]
+    # live (audit 2026-11-10 A10): 60 Hz only on a decoherent sub; this fixture's is mono
     sc = planner.sidestrip_choice(a, planner.Controls(profile="live"))
-    assert sc["rule"] == "live profile" and sc["used_hz"] == 60.0
+    assert sc["rule"].startswith("live profile: off") and sc["used_hz"] is None
+    b = {**a, "plan_inputs": {**a["plan_inputs"], "band_decoherence":
+                              [0.5] + list(a["plan_inputs"]["band_decoherence"][1:])}}
+    sc = planner.sidestrip_choice(b, planner.Controls(profile="live"))
+    assert sc["rule"].startswith("live profile: sub band decoherence") and sc["used_hz"] == 60.0
     rec = planner.plan_record(a, planner.Controls(subside_hz=20.0))
     assert rec["sidestrip"]["clipped"] and rec["controls"]["subside_hz"] == 20.0
     lines = []

@@ -330,6 +330,62 @@ Tests that pin the old numbers and must move: `tests/test_profiles.py` lines 27 
 `test_live_clipper_only_under_fast_and_aggressive` (becomes "never under auto"), and the
 `calibrated` asserts (lines 19, 68, 71). Current fast tier: 12 passed (195 s).
 
+**Applied 2026-11-10** (maintainer approved B.4 as written; branch of audit/2026-11-10).
+Landed in `planner.PROFILES["live"]`, `planner`, `evaluate`, `processlog`, `cli`, the README,
+`docs/gain-staging.md` §22 and the UI's live loudness default (`ui/app.js`):
+
+- `target_rms_dbfs` -11.5; `calibrated` False with the text "calibrated on synthetic fixtures
+  and published statistics" (`planner.PROVISIONAL_CALIBRATION`) in report.md, the process log
+  and `--profile`'s help; `--target-rms` help names both defaults (A8, A15).
+- Clipper (A1): the explicit-character gate, not `()`: `clipper_presets` stays
+  ("fast", "aggressive") and `character_settings` turns the clipper on only when the user
+  chose that character, never on an auto resolution.
+- Side strip (A10): `sidestrip_hz` None; 60 Hz only when `band_decoherence[0] >= 0.3`, else no
+  side strip (the plan's sidestrip section is None; the record says why). The A10 alternative
+  "or band-0 correlation < 0.5" was not added (B.4 names the decoherence rule only).
+- Input EQ (A3): `eq_bounds` 1.0 / 1.0 / 1.0; at Tilt 0 exactly, no low, presence or air shelf
+  (M or S) and no band shelf; the bell only on a low-mid run of bell shape whose excess is above
+  4 dB, at Q 2 or more (A3's "narrow (Q >= 2) excesses above +4 dB"; B.4 says "narrow bell").
+- Notches (A2): `notch_flags` ("resonance",) under live; electronic and stems keep both flags.
+- Sustained (B.4, A6): `sustained_onsets_per_s` 0.5 on `transients.onsets_per_s` (now also in
+  `plan_inputs`; an analysis without it reads the transients' value, else not sustained). When
+  sustained: multiband 0.5 / 0.75 / 0.75 / 1.0, glue 0.5, limiter 1.0 / 2.0, speclim off, notches
+  off, 400 ms hits with the source "400 ms frames (no beat grid: sustained material)";
+  `plan_record["sustained"]` records the rate, the threshold, the overrides and the reason.
+- Report (A5, A7): live-only checks `psr` (< 10 dB, amber < 8), `plr` (< 12), the `lra`
+  check's tolerance 3 LU when LRA before > 12 (5 LU otherwise, as for electronic),
+  `crest_drop` (> 3 dB on `meter.crest_db`), `live_loudness` (informational: B.4's sanity
+  ranges, S-max -13.5..-11.0, integrated -16.5..-13.5 for LRA <= 12 or -18.5..-15.0 for
+  LRA > 15, their union in between), `slope_reference` (informational, |after slope -
+  (-4.5)| > 2 dB/oct, with the Tilt that would aim at it) and the provenance flags
+  `clipper_live`, `notches_tonal`, `beat_grid`. PSR p95 and PLR were already measured
+  (`meter.measure`, report before / after); no new meter code.
+- Electronic and stems: the plan (unrealised, realised and rendered), the plan record (apart
+  from the new "sustained" entry) and the targets are bit-identical before and after on the
+  synthetic short track and dense track (default, fast, transparent, Tilt +1, stems).
+- End to end (`eluate master --profile live`, synthetic, 44.1 kHz): a 20 s held A minor chord
+  reads 0.05 onsets/s, sustained; sub decoherence 0.03, no side strip; 400 ms hits; EQ high-pass
+  plus a -1.0 dB Q 2 bell at 500 Hz; -11.5 met, -12.9 LUFS integrated; flags PSR 9.4 (premaster
+  8.8), PLR 9.4, slope -9.3 dB/oct (informational) and "no beat grid". The e_signals short
+  track (4.3 onsets/s) keeps the table, the high-pass only at Tilt 0, no flag.
+
+Deviations, with reasons:
+
+1. Four profile keys beyond B.4's two (`notch_flags`, `sustained_onsets_per_s`):
+   `sustained` (the override values), `eq_tilt0` (the Tilt-0 rule and its 4 dB / Q 2),
+   `sidestrip_decoherent` (60 Hz / 0.3); every profile sets every key (None = off), so the
+   numbers live in the table like the others.
+2. The glue stage's serial net range (`glue.SERIAL_RANGE_DB`) now starts at 0.5 dB (was 1.0):
+   the sustained glue budget of 0.5 was outside it and the solve raised. Validation only; no
+   other profile asks below 1.
+3. A tempo the user gives (`--bpm`) still sets the hits on sustained material (spec 3.2a: the
+   user's grid is used); only the detected grid is replaced by 400 ms frames.
+4. The sustained rule does not change the auto character: the character reason can still
+   quote a detected tempo on rubato material (A14). Not in B.4's table.
+5. Not done (outside B.4's numbers or an open question): A4 (`ms_link` solve on the linked
+   detector or report the applied GR, open question D.8), A6's `grid_informative` change for
+   every profile, A9, A11, A13; the 0.1.0-beta release notes are left as released.
+
 ### B.5 Remaining evidence tables
 
 T4 listen-proxies (live rows; electronic for contrast):

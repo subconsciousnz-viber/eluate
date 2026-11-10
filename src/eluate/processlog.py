@@ -5,7 +5,9 @@ Contract:
   source.json, plan.json with plan.npz, limiter_gr.npz; run.json when present) and
   writes out/process-log.md and out/process-log.html (the same content). No audio is
   read and nothing is re-rendered.
-- Content, in order: the settings used; the result in a few sentences; every stage of
+- Content, in order: the settings used (the profile, with planner.PROVISIONAL_CALIBRATION
+  for one not calibrated on reference masters, and the live profile's sustained-material
+  decision); the result in a few sentences; every stage of
   the chain in signal order with what it measured, what it decided and why, and what held
   it back; the renders the solver made; the sections, with each section's level against
   the loudest section before and after and the average gain reduction each dynamics
@@ -43,6 +45,7 @@ from eluate.plan import INPUTEQ_HS_MID_MAX_DB as HS_MID_MAX
 from eluate.plan import INPUTEQ_HS_SIDE_MAX_DB as HS_SIDE_MAX
 from eluate.plan import INPUTEQ_MAX_DB as EQ_MAX
 from eluate.plan import Plan
+from eluate.planner import PROVISIONAL_CALIBRATION
 
 
 def _f(v, d=1, sign=False):
@@ -166,10 +169,12 @@ def _settings(d: Doc, rep, src, run):
                          + (f" ({tp['relation']})" if tp.get("relation") else "")
                          + ": the given tempo sets every budget's hits, check --bpm"
                          if abs(dev) > (tp.get("tolerance_pct") or 3.0) else ", in agreement"))
+    su = (rep.get("planner") or {}).get("sustained") or {}
     d.ul([
         f"Profile: {pr.get('name', 'electronic')}" + ("" if pr.get("calibrated", True) else
-            " (phase 1: the live profile defaults are uncalibrated; they are the architect's "
-            "numbers until live reference masters are measured)") + ".",
+            f" ({PROVISIONAL_CALIBRATION}: the live audit's fixtures and the published "
+            "loudness and dynamics statistics, until live reference masters are measured)")
+        + "." + (f" Material: {su.get('reason')}." if su.get("sustained") else ""),
         f"Loudness target: {_f(lo.get('target_rms_dbfs'))} dB RMS on the 300 ms meter (AES17, "
         "read over the loudest passage).",
         f"Tilt: {_f(c.get('tilt_db', 0.0), 1, True)} dB/oct around the -4.5 dB/oct reference, so the "
@@ -288,8 +293,11 @@ def _chain(d: Doc, rep):
             f"{_f((sc.get('range_hz') or [60, 150])[0], 0)} to "
             f"{_f((sc.get('range_hz') or [60, 150])[1], 0)} Hz)"
             if sc.get("clipped") and sc.get("rule") == "--subside" else "")
-    d.p(f"The side channel was high-passed below {_f(s.get('fc_hz'), 0)} Hz{clip}, so the low end "
-        "is mono. The mid is not touched.")
+    if s.get("fc_hz") is None and sc.get("rule") and sc.get("used_hz") is None:
+        d.p(f"Off: the side channel keeps its low end ({sc['rule']}).")
+    else:
+        d.p(f"The side channel was high-passed below {_f(s.get('fc_hz'), 0)} Hz{clip}, so the "
+            "low end is mono. The mid is not touched.")
 
     mb = ch.get("multiband") or {}
     d.h(3, "5. Multiband compression (mid and side, per band)")

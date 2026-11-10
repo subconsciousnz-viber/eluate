@@ -1022,3 +1022,30 @@ branch's realised plan (meter RMS, turning one off): limiter hold 0.15 dB, aim m
 0.005 dB, minimum-phase lowest crossover 0.05 dB (zero phase reads louder, same envelopes);
 the detector windows 0 to 0.08 dB and the glue floor 0 (budget met) per the audit's chain
 runs. Listening decides the hold's 0.15 dB.
+
+## 22. Built 2026-11-10: the live profile calibration
+
+The live audit's B.4 (`docs/audit-2026-11-10/live.md`; maintainer approved), in
+`planner.PROFILES["live"]`. Electronic and stems plans are bit-identical to before.
+
+- **Target -11.5** on the maintainer's meter (was -10): about -14.5 LUFS integrated on band
+  material and -17 on wide classical, PSR about 12 dB at the loud passage. "calibrated" stays
+  False; the report, process log and CLI say "calibrated on synthetic fixtures and published
+  statistics" (`planner.PROVISIONAL_CALIBRATION`) until live masters are measured.
+- **Clipper** only when the user chooses the fast or aggressive character, never under auto.
+- **Side strip** 60 Hz only when the sub band's decoherence is at least 0.3, else none.
+- **Input EQ** bounds +-1 dB; at Tilt 0 the 25 Hz Butterworth high-pass and a narrow bell
+  (low-mid excess above 4 dB, Q 2 or more) only: no low, presence or air shelf, no band shelf.
+- **Notches** on "resonance" candidates only (never "musical").
+- **Sustained material** (`transients.onsets_per_s` < 0.5, now also in `plan_inputs`):
+  multiband 0.5 / 0.75 / 0.75 / 1.0 dB (comp / comp max / total / band limit), glue 0.5 dB,
+  limiter 1.0 / 2.0 dB (average / outlier), no frequency-dependent limiting, no notches, 400 ms
+  hits ("no beat grid: sustained material") unless the user gave a tempo;
+  `plan_record["sustained"]` records the decision.
+- **Report flags** under live: PSR p95 below 10 dB (amber below 8), PLR below 12, an LRA drop
+  past 3 LU on a premaster above 12 LU, a crest drop past 3 dB, B.4's loudness sanity ranges
+  (informational: S-max -13.5 to -11 LUFS, integrated -16.5 to -13.5 or, above 15 LU of LRA,
+  -18.5 to -15), the master's slope more than
+  2 dB/oct from the -4.5 reference (informational, with the Tilt that would aim at it), and the
+  provenance flags clipper on, notches on tonal material, no beat grid
+  (`evaluate._live_checks`).
