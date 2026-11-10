@@ -694,7 +694,7 @@ class Controls:
     speclim: bool = True                     # frequency-dependent limiting before the clipper
     profile: str = "electronic"              # PROFILES
     threads: int = parallel.DEFAULT_THREADS  # engine threads (eluate.parallel); no effect on the result
-    xover_phase: str = "minimum"             # the lowest crossover: minimum (LR4) | zero (XOVER_PHASES)
+    xover_phase: str = "zero"                # the lowest crossover: zero (default, the maintainer's blind-test pick) | minimum (LR4)
 
     def __post_init__(self):
         self.threads = int(self.threads)

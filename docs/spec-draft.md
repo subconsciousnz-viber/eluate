@@ -146,9 +146,11 @@ Package name `eluate` (maintainer, 2026-10-21; it was `offmaster` until then).
   HP `1 - |H_lp|^2` is exactly the squared Butterworth high-pass (audit F2).
 - Zero-phase splits pre-ring symmetrically once bands get different gains (audit F1). Default is
   `zero` for all crossovers except the lowest, which is decided by listening in gate D with
-  `minimum` as the expected winner. **Decided 2026-11-10** (filter-maths audit F1, docs/gain-staging.md
-  21): new plans make the lowest crossover of the multiband and the frequency-dependent limiter
-  `minimum` (`--xover-phase {minimum,zero}`, default minimum, recorded in the plan); the zero-phase
+  `minimum` as the expected winner. **Decided 2026-11-10** (filter-maths audit F1 and the final audit,
+  docs/gain-staging.md 21): zero phase stays the default (the maintainer's blind-test pick; the LR4
+  allpass raises the peaks of clipped, low-crest material by 1.6 to 5.8 dB), and
+  `--xover-phase minimum` makes the lowest crossover of the multiband and the frequency-dependent
+  limiter `minimum` (recorded in the plan); the zero-phase
   100 Hz split pre-rang a kick by -14.9 dB re its peak 6 ms early at -6 dB of sub GR, the LR4 puts
   nothing before the onset; the band sum is the LR4 allpass (flat magnitude, 5.3 / 4.5 ms of group
   delay at 50 / 100 Hz, none above 1 kHz). Saturate's split stays zero phase; saved plans keep

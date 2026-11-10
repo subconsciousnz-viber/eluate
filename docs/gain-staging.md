@@ -981,8 +981,15 @@ against fb082d1), except ms_link plans (item 6, < -70 dB).
 5. **Glue attack floor** `glue.ATTACK_FLOOR_MS` 3 ms (three control samples); `attack_ms`
    keeps the preset's request, `GluePlan.attack_applied_ms` the applied value.
 6. **ms_link** takes the M / S minimum on the 1 ms grid, then one PCHIP (no C0 kinks).
-7. **Lowest crossover minimum phase** (`--xover-phase {minimum,zero}`, default minimum;
-   `planner.xover_phases`): Linkwitz-Riley at the lowest crossover of the multiband and of
+7. **Lowest crossover minimum phase, as a toggle** (`--xover-phase {zero,minimum}`,
+   default zero; `planner.xover_phases`). Zero phase is the maintainer's pick from blind
+   tests and what 0.1.0-beta shipped; the sprint first made minimum the default, and the
+   final audit put zero back: the minimum-phase band sum is an allpass, and with no gain
+   applied at all it raised the true peak by +1.6 to +4.8 dB on synthetic tracks clipped
+   6 dB and +5.8 dB on the dense low-crest fixture (-0.8 to +1.8 dB on unclipped ones), so
+   a loud premaster loses that much limiter headroom (the dense fixture ended 1.7 dB short
+   of its target, `test_solve_meets_the_rms_target_when_the_budgets_suffice`). With
+   `--xover-phase minimum`: Linkwitz-Riley at the lowest crossover of the multiband and of
    speclim, zero phase above; saturate's split stays zero phase; saved plans keep their phase.
    The neutral band sum is the LR4 allpass: |H| flat to 4e-12 dB, group delay 5.3 / 4.5 /
    1.3 / 0.05 ms at 50 / 100 / 200 / 1000 Hz, none above. `bands.split_iter` streams it.

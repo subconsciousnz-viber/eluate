@@ -218,19 +218,21 @@ def test_multiband_record(ana):
     sm = mb.side_makeup()
     assert sm[0] == 0.0 and sm[1] == 0.0
     assert sm[4] == pytest.approx(2.0 * (1 - rec["decoherence"][4]))
-    # 2026-11-10: per-band ceiling release, detector windows from the crossovers, the lowest
-    # crossover minimum phase; the record flows into the plan, --xover-phase zero keeps zero
+    # 2026-11-10: per-band ceiling release, detector windows from the crossovers; the lowest
+    # crossover zero phase by default, minimum phase with --xover-phase minimum; the record
+    # flows into the plan
     xo = rec["crossovers_hz"]
     assert rec["ceiling_release_ms"] == [[r, r] for r in (100.0, 80.0, 50.0, 50.0, 50.0)]
     assert rec["detector_window_ms"] == planner.mb_stage.default_detector_window_ms(xo)
     assert rec["detector_window_ms"][0] == 25.0 and all(w >= 2.0 for w in rec["detector_window_ms"])
-    assert rec["phase"] == ["minimum", "zero", "zero", "zero"]
+    assert rec["phase"] == "zero"
     assert (mb.ceiling_release_ms, mb.detector_window_ms, mb.phase) == (
         rec["ceiling_release_ms"], rec["detector_window_ms"], rec["phase"])
     assert ch["limiter_hold_ms"] == planner.LIMITER_HOLD_MS == 25.0
     assert ch["glue_attack_floor_ms"] == 3.0 and ch["glue_attack_applied_ms"] >= 3.0
-    zp = planner.plan_multiband_record(a, planner.Controls(xover_phase="zero"))
-    assert zp["phase"] == "zero" and planner.multiband_unrealised(zp).phase == "zero"
+    mp = planner.plan_multiband_record(a, planner.Controls(xover_phase="minimum"))
+    assert mp["phase"] == ["minimum", "zero", "zero", "zero"]
+    assert planner.multiband_unrealised(mp).phase == mp["phase"]
     with pytest.raises(ValueError):
         planner.Controls(xover_phase="linear")
     # an old record without the new keys still loads, with the old defaults

@@ -733,9 +733,11 @@ def _add_controls(p):
                         f"{planner.PROFILES['live']['target_rms_dbfs']:g} live)")
     p.add_argument("--preserve", action="store_true")
     p.add_argument("--xover", type=_xover, default=None)
-    p.add_argument("--xover-phase", default="minimum", choices=planner.XOVER_PHASES,
+    p.add_argument("--xover-phase", default="zero", choices=planner.XOVER_PHASES,
                    help="the lowest crossover of the multiband and the frequency-dependent "
-                        "limiter: minimum (Linkwitz-Riley, no pre-ring; default) or zero phase")
+                        "limiter: zero phase (default) or minimum (Linkwitz-Riley: no pre-ring "
+                        "on kicks, but an allpass that can raise the peaks of an already "
+                        "clipped or limited premaster by several dB)")
     p.add_argument("--subside", type=float, default=None)
     p.add_argument("--crest-mode", default="report", choices=planner.CREST_MODES)
     p.add_argument("--profile", default="electronic", choices=planner.USER_PROFILES,

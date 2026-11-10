@@ -35,10 +35,12 @@ Contract: `apply(x, fs, plan) -> y`, pure, stereo (n, 2) in, float64 (n, 2) out.
   at 0 dB the output equals the input to double precision (zero-phase bands
   sum exactly); with a minimum-phase crossover the sum is an allpass
   (bands.py). A band whose gain is identically 1 is passed bit-identically, so
-  the sum of the untouched bands is exactly the input's. The planner makes the lowest
-  crossover minimum phase for new plans (planner.xover_phases, `--xover-phase`;
-  filter-maths audit F1: the zero-phase 100 Hz crossover pre-rang a kick by -15 dB
-  6 to 10 ms ahead once the sub band was gained -6 dB); a hand-built MultibandPlan
+  the sum of the untouched bands is exactly the input's. The planner can make the lowest
+  crossover minimum phase (planner.xover_phases, `--xover-phase minimum`; zero phase is
+  the default, the maintainer's blind-test pick; filter-maths audit F1: the zero-phase
+  100 Hz crossover pre-rang a kick by -15 dB 6 to 10 ms ahead once the sub band was
+  gained -6 dB; final audit: the minimum-phase sum is an allpass that raised the true
+  peak of clipped, low-crest material by 1.6 to 5.8 dB before any gain); a hand-built MultibandPlan
   and every saved plan keep the phase they record (default "zero").
 
 `design(x, fs, threshold_db, ...)` builds both envelope sets with envelope.py:
