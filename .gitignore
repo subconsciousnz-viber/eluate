@@ -15,6 +15,7 @@ fixtures/ebu/
 # manifest of their paths; private. Only the example manifest is committed.
 fixtures/premasters/*
 !fixtures/premasters/manifest.example.toml
+premaster corpus/
 
 # Audio of any kind
 *.wav
