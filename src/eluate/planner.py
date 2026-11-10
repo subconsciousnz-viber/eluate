@@ -96,7 +96,8 @@ Contract:
   chain run to the glue input and the glue envelope designed there
   (glue.design). The solver realises with its own stage cache.
 - Notches (spec 3.3, 3.5 item 1): one per analysis notch with flag
-  "resonance" or "musical". Depth G(t) = -depth_scale * min(6, NOTCH_FRACTION
+  "resonance" or "musical" (the profile's notch_flags: live "resonance" only, none on
+  sustained material). Depth G(t) = -depth_scale * min(6, NOTCH_FRACTION
   * (excess(t) - 6 dB)) dB: half of the excess above the analysis detection
   threshold, capped at the stage's -6 dB, scaled by the analysis depth scale
   (1 resonance, 0.5 from 80 to 150 Hz, 0.25 musical). On the real premasters
@@ -137,7 +138,8 @@ Contract:
   rendered merged notches separately (`plan_notches` third value). The kick mask
   (notch.kick_mask) comes from `usable_kick_onsets`: none when the list is
   empty or sparser than KICK_MIN_RATE_HZ (0.5 kicks/s) over the track.
-- Sidestrip: controls.subside_hz, else 100 Hz when the sub band's
+- Sidestrip: controls.subside_hz, else the profile's rule (live: 60 Hz when the sub
+  band's decoherence is at least 0.3, else no side strip), else 100 Hz when the sub band's
   decoherence is below 0.1, else the analysis suggestion; clipped to
   [60, 150] Hz (spec 3.5 item 2).
 - Multiband (spec 3.5 item 3): per band and M / S, a 400 ms frame peak level
@@ -275,13 +277,26 @@ Contract:
   of loudness for a compliance figure only the lossy-encode and CD paths need).
 - Profiles (PROFILES, Controls.profile; sprint 2026-10-21 sections 5 and 6): every
   number above that differs by material comes from the profile: "electronic" (the
-  values above), "live" (phase 1, uncalibrated: lower budgets, the clipper only under
-  the fast and aggressive characters, saturation off, M/S-linked multiband, side strip
-  at 60 Hz, a narrow input EQ with a 25 Hz Butterworth high-pass, the tone target the
-  mix's own slope + Tilt (target_slope) with no sub pull, the residual corrected only
-  inside SLOPE_RANGE_HZ and the fit's error weighted by audibility (audibility_weights),
-  the slope reported but not solved for) and "stems" (the sum of a stem set,
-  `eluate master --stems`: tighter ranges). Electronic plans are unchanged by the table.
+  values above), "live" and "stems" (the sum of a stem set, `eluate master --stems`:
+  tighter ranges). Electronic plans are unchanged by the table.
+  "live" (calibrated on synthetic fixtures and published statistics, live audit
+  2026-11-10 B.4, maintainer approved; "calibrated" stays False until the maintainer's
+  own live masters are measured, PROVISIONAL_CALIBRATION): target -11.5 on the meter
+  (integrated about -14.5 LUFS on band material), lower budgets, saturation off,
+  M/S-linked multiband, the clipper only when the user chooses the fast or aggressive
+  character (never under auto, A1), no notch on a "musical" candidate (notch_flags, A2),
+  the side strip at 60 Hz only when the sub band's decoherence is at least 0.3 (else
+  none, A10; `sidestrip_choice`), a narrow input EQ (+-1 dB) with a 25 Hz Butterworth
+  high-pass that at Tilt 0 is the high-pass and a narrow bell only (eq_tilt0, A3:
+  `fit_inputeq`), the tone target the mix's own slope + Tilt (target_slope) with no sub
+  pull, the residual corrected only inside SLOPE_RANGE_HZ and the fit's error weighted by
+  audibility (audibility_weights), the slope reported but not solved for. Sustained
+  material (`sustained_choice`: transients.onsets_per_s below the profile's
+  sustained_onsets_per_s, 0.5) takes the profile's "sustained" overrides (`profile_for`:
+  multiband 0.5 / 0.75 / 0.75 / 1.0 dB, glue 0.5, limiter 1.0 / 2.0, no frequency-
+  dependent limiting, no notches) and 400 ms hits (`plan_hits`, "no beat grid: sustained
+  material", unless the user gave the tempo); plan_record["sustained"] records the
+  decision.
 """
 
 from __future__ import annotations
@@ -521,9 +536,21 @@ CREST_LIMITS_DB = (1.5, 2.0)    # sub, low; every higher band 3 dB (spec 3.6)
 CREST_LIMIT_HIGH_DB = 3.0
 
 # Profiles (sprint 2026-10-21 section 5; maintainer R8, 2026-10-21): every number that differs
-# between electronic music and a live or acoustic recording. "live" is phase 1: its
-# loudness default and crest tables are not calibrated on live masters yet (R9), and the
-# report and the process log say so. None keeps the electronic (module) value.
+# between electronic music and a live or acoustic recording. "live" is calibrated on
+# synthetic fixtures and published statistics (live audit 2026-11-10, B.4, maintainer
+# approved), not yet on the maintainer's own live masters, so its "calibrated" stays False
+# and the report and the process log say how it was calibrated (PROVISIONAL_CALIBRATION).
+# None keeps the electronic (module) value.
+PROVISIONAL_CALIBRATION = "calibrated on synthetic fixtures and published statistics"
+NOTCH_FLAGS = ("resonance", "musical")   # the analysis flags a notch is rendered for
+# live, at Tilt 0 (live audit A3): the input EQ is the high-pass and a narrow bell only,
+# the bell only for a low-mid excess of more than LIVE_BELL_GATE_DB at Q LIVE_BELL_Q_MIN or more
+LIVE_BELL_GATE_DB = 4.0
+LIVE_BELL_Q_MIN = 2.0
+# live (live audit A10): the side strip only when the sub band is decoherent
+LIVE_SIDESTRIP_HZ = 60.0
+LIVE_SIDESTRIP_DECOHERENCE_MIN = 0.3
+SUSTAINED_HITS_SOURCE = "400 ms frames (no beat grid: sustained material)"
 PROFILES = {
     "electronic": {
         "calibrated": True,
@@ -549,11 +576,16 @@ PROFILES = {
         "eq_weighting": None,               # the fit's error unweighted (raw dB per node)
         "eq_residual_window": False,        # the residual corrects up to EQ_FIT_RANGE_HZ's top
         "eq_hpf": None,                     # INPUTEQ_HPF_FC_HZ, Q from the sub (hpf_q)
+        "eq_tilt0": None,                   # every section at Tilt 0 too
         "slope": "constraint",
+        "sidestrip_decoherent": None,       # no conditional side strip
+        "notch_flags": NOTCH_FLAGS,         # every analysis flag is rendered
+        "sustained_onsets_per_s": None,     # no sustained rule
+        "sustained": None,
     },
     "live": {
-        "calibrated": False,
-        "target_rms_dbfs": -10.0,           # uncalibrated until R9
+        "calibrated": False,                # PROVISIONAL_CALIBRATION until the maintainer's masters
+        "target_rms_dbfs": -11.5,           # live audit B.4: integrated ~ -14.5 LUFS on band material
         "mb_budget": {"comp_gr_db": 1.0, "comp_gr_max_db": 1.5, "total_normal_db": 1.5,
                       "limit_max_db": 1.5, "ratio_max": 1.5},
         "ms_link": True,                    # the image is the room: it must not move
@@ -561,7 +593,9 @@ PROFILES = {
         "saturate": False,
         "glue_net_db": 1.0,
         "glue_attack_ms": 20.0,
-        "clipper_presets": ("fast", "aggressive"),   # maintainer: off unless asked for
+        # only when the user chooses one of these characters, never under auto (live audit
+        # A1: auto resolved a 140.1 BPM rock band to fast and clipped it); character_settings
+        "clipper_presets": ("fast", "aggressive"),
         "clip_target_db": CLIP_TARGET_DB,
         "clip_sample_cap_db": CLIP_SAMPLE_CAP_DB,
         "sat_max_db": SAT_MAX_DRIVE_DB,
@@ -571,12 +605,30 @@ PROFILES = {
         "limiter_max_gr_db": 1.5,
         "limiter_outlier_cap_db": 3.0,
         "limiter_timing": "transparent",
-        "sidestrip_hz": 60.0,               # maintainer: on, below 60 Hz (room ambience above stays)
-        "eq_bounds": {"gain_db": 1.5, "hs_mid_db": 2.0, "hs_side_db": 2.0},
+        "sidestrip_hz": None,               # sidestrip_decoherent decides (live audit A10)
+        "eq_bounds": {"gain_db": 1.0, "hs_mid_db": 1.0, "hs_side_db": 1.0},   # live audit A3
         "eq_weighting": EQ_WEIGHT_PHON,     # the fit's error weighted by audibility (ISO 226)
         "eq_residual_window": True,         # the residual corrects only inside SLOPE_RANGE_HZ
         "eq_hpf": {"fc_hz": 25.0, "q": EQ_HPF_Q_BUTTERWORTH},   # rumble only: flat above 63 Hz
+        # at Tilt 0 the high-pass and a narrow bell only (live audit A3: the LTAS's departure
+        # from a line is the instrumentation, not an error)
+        "eq_tilt0": {"shelves": False, "bell_gate_db": LIVE_BELL_GATE_DB,
+                     "bell_q_min": LIVE_BELL_Q_MIN},
         "slope": "report",                  # the mix's own slope is the target (Tilt moves it); no sub pull
+        # the side strip at 60 Hz only when the sub band is decoherent (a spaced pair's LF
+        # decorrelation is the room; a panned bass keeps its image); else off
+        "sidestrip_decoherent": {"fc_hz": LIVE_SIDESTRIP_HZ,
+                                 "min_decoherence": LIVE_SIDESTRIP_DECOHERENCE_MIN},
+        "notch_flags": ("resonance",),      # never on "musical" candidates (live audit A2)
+        # sustained material (strings, organ, choir): transients.onsets_per_s below this
+        # (`sustained_choice`); the overrides below then replace the profile's values
+        # (`profile_for`), the notches are off and the hits are 400 ms frames (`plan_hits`)
+        "sustained_onsets_per_s": 0.5,
+        "sustained": {"mb_budget": {"comp_gr_db": 0.5, "comp_gr_max_db": 0.75,
+                                    "total_normal_db": 0.75, "limit_max_db": 1.0},
+                      "glue_net_db": 0.5, "limiter_max_gr_db": 1.0,
+                      "limiter_outlier_cap_db": 2.0, "speclim_allow_db": None,
+                      "notch_flags": ()},
     },
     # the sum of a stem set (WP6, section 6.2): tighter ranges, so a sum that cannot reach
     # the target within them is the signal that a stem needs correcting (phase B)
@@ -605,7 +657,12 @@ PROFILES = {
         "eq_weighting": None,
         "eq_residual_window": False,
         "eq_hpf": None,
+        "eq_tilt0": None,
         "slope": "constraint",
+        "sidestrip_decoherent": None,
+        "notch_flags": NOTCH_FLAGS,
+        "sustained_onsets_per_s": None,
+        "sustained": None,
     },
 }
 PROFILE_NAMES = tuple(PROFILES)
@@ -769,6 +826,76 @@ def _check_floors(floors, crossovers_hz) -> None:
                          f"from the crossovers {list(crossovers_hz)}), got {len(floors)}")
 
 
+# ---------------------------------------------------------------- sustained material
+
+def analysis_onsets_per_s(analysis: dict) -> float | None:
+    """The analysis's onset rate (transients.onsets_per_s, onsets per second over the
+    non-silent span): plan_inputs["onsets_per_s"], else analysis["transients"]; None when
+    the analysis predates it or the value is not finite."""
+    pi = analysis.get("plan_inputs") or {}
+    v = pi.get("onsets_per_s")
+    if v is None:
+        v = (analysis.get("transients") or {}).get("onsets_per_s")
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def sustained_choice(analysis: dict, controls: Controls) -> dict:
+    """The sustained-material rule (live audit 2026-11-10 B.4; plan_record["sustained"]):
+    {"applies" (the profile has the rule), "sustained", "onsets_per_s", "threshold_onsets_per_s",
+    "overrides" (the profile values it replaced, {} when not sustained), "reason"}.
+    sustained = onsets_per_s < the profile's sustained_onsets_per_s (live 0.5: a bowed string
+    ensemble read 0.09, the jazz, folk and rock fixtures 1.9 to 3.8). One boolean from a
+    feature the analysis already computes, not a user-facing preset; an unknown onset rate
+    (an analysis without it) is not sustained."""
+    prof = controls.prof
+    thr = prof["sustained_onsets_per_s"]
+    rate = analysis_onsets_per_s(analysis)
+    out = {"applies": thr is not None, "sustained": False, "onsets_per_s": rate,
+           "threshold_onsets_per_s": thr, "overrides": {}}
+    if thr is None:
+        return dict(out, reason=f"{controls.profile} profile: no sustained-material rule")
+    if rate is None:
+        return dict(out, reason="onset rate unknown (an analysis made before it): not sustained")
+    if rate < float(thr):
+        ov = {k: (list(v) if isinstance(v, tuple) else dict(v) if isinstance(v, dict) else v)
+              for k, v in (prof["sustained"] or {}).items()}
+        return dict(out, sustained=True, overrides=ov,
+                    reason=(f"{rate:.2f} onsets/s < {float(thr):g}: sustained material, lower "
+                            "budgets, no frequency-dependent limiting, no notches, no beat grid"))
+    return dict(out, reason=f"{rate:.2f} onsets/s >= {float(thr):g}: the profile's table")
+
+
+def is_sustained(analysis: dict, controls: Controls) -> bool:
+    return bool(sustained_choice(analysis, controls)["sustained"])
+
+
+def profile_for(analysis: dict, controls: Controls) -> dict:
+    """controls.prof with the profile's "sustained" overrides applied when the material is
+    sustained (`sustained_choice`); mb_budget is merged key by key. The profile itself
+    otherwise (every electronic and stems plan)."""
+    prof = controls.prof
+    if not is_sustained(analysis, controls):
+        return prof
+    ov = prof["sustained"] or {}
+    out = {**prof, **ov}
+    if "mb_budget" in ov:
+        out["mb_budget"] = {**prof["mb_budget"], **ov["mb_budget"]}
+    return out
+
+
+def notch_flag_reason(analysis: dict, controls: Controls) -> str:
+    """Why a candidate whose flag the profile does not render is skipped (`plan_notches`)."""
+    prof = profile_for(analysis, controls)
+    if not prof["notch_flags"]:
+        return "no notches on sustained material (" + controls.profile + " profile)"
+    return (f"the {controls.profile} profile renders only "
+            + " and ".join(f'"{f}"' for f in prof["notch_flags"]) + " candidates")
+
+
 # ---------------------------------------------------------------- input and crossovers
 
 def input_gain(x: np.ndarray, fs: float) -> tuple[float, float | None]:
@@ -904,12 +1031,24 @@ def sidestrip_choice(analysis: dict, controls: Controls) -> dict:
     """The side strip's corner and where it came from (plan_record["sidestrip"]):
     {"requested_hz" (controls.subside_hz, None when not given), "rule_hz" (the value before
     the clip), "used_hz" (clipped to SUBSIDE_RANGE_HZ), "clipped", "rule"}. A clipped
-    request is reported, never silently replaced (hygiene F18)."""
+    request is reported, never silently replaced (hygiene F18). Under a profile with
+    sidestrip_decoherent (live: 60 Hz from a sub-band decoherence of 0.3, live audit A10)
+    and no --subside, a sub band below that decoherence gets no side strip: rule_hz and
+    used_hz are None and the rule says why."""
     pi = analysis["plan_inputs"]
+    dc = controls.prof["sidestrip_decoherent"]
     if controls.subside_hz is not None:
         fc, rule = float(controls.subside_hz), "--subside"
     elif controls.prof["sidestrip_hz"] is not None:
         fc, rule = float(controls.prof["sidestrip_hz"]), f"{controls.profile} profile"
+    elif dc is not None:
+        d0, lim = float(pi["band_decoherence"][0]), float(dc["min_decoherence"])
+        if not d0 >= lim:
+            return {"requested_hz": None, "rule_hz": None, "used_hz": None, "clipped": False,
+                    "rule": (f"{controls.profile} profile: off, sub band decoherence {d0:.2f} "
+                             f"< {lim:g}"), "range_hz": list(SUBSIDE_RANGE_HZ)}
+        fc, rule = float(dc["fc_hz"]), (f"{controls.profile} profile: sub band decoherence "
+                                        f"{d0:.2f} >= {lim:g}")
     elif float(pi["band_decoherence"][0]) < SUBSIDE_DECOHERENCE_MIN:
         fc, rule = SUBSIDE_DEFAULT_HZ, "default (sub band not decoherent)"
     else:
@@ -920,20 +1059,23 @@ def sidestrip_choice(analysis: dict, controls: Controls) -> dict:
             "range_hz": list(SUBSIDE_RANGE_HZ)}
 
 
-def subside_hz(analysis: dict, controls: Controls) -> float:
-    """controls.subside_hz, else the profile's (live: 60 Hz), else the analysis suggestion,
-    except SUBSIDE_DEFAULT_HZ when
+def subside_hz(analysis: dict, controls: Controls) -> float | None:
+    """controls.subside_hz, else the profile's fixed corner, else the profile's conditional
+    one (live: 60 Hz when the sub band's decoherence is at least 0.3, else None: no side
+    strip), else the analysis suggestion, except SUBSIDE_DEFAULT_HZ when
     the sub band's decoherence is below SUBSIDE_DECOHERENCE_MIN (the suggestion read
     150 Hz on every real track); clipped to SUBSIDE_RANGE_HZ (`sidestrip_choice` records
     the request and the clip)."""
     return sidestrip_choice(analysis, controls)["used_hz"]
 
 
-def crest_exempt(crossovers_hz, fc_sub: float) -> list[list[int]]:
+def crest_exempt(crossovers_hz, fc_sub: float | None) -> list[list[int]]:
     """S views the sidestrip removes on purpose: bands whose upper edge is at or below
     2 fc_sub (the squared order-2 high-pass is -12 dB at fc / 2 and the band's S
     level falls toward the -60 dBFS crest gate, so its crest is the strip's, not a
-    loss the solver can steer). View index 1 = S."""
+    loss the solver can steer). View index 1 = S. No side strip (fc_sub None): none."""
+    if fc_sub is None:
+        return []
     return [[b, 1] for b, f in enumerate(crossovers_hz) if f <= 2.0 * fc_sub]
 
 
@@ -1128,9 +1270,12 @@ def _group_edges(grp: list[tuple], fs: float | None = None) -> tuple[float, floa
     return min(a for a, _ in e), max(b for _, b in e)
 
 
-def plan_notches(analysis: dict, kick: bool = True) -> tuple[NotchPlan, list[dict], list[dict]]:
+def plan_notches(analysis: dict, kick: bool = True, flags=NOTCH_FLAGS,
+                 flag_reason: str | None = None) -> tuple[NotchPlan, list[dict], list[dict]]:
     """NotchPlan, a report row per analysis notch (rendered or why not) and the merged
-    notches actually rendered (members, f0, Q, peak excess)."""
+    notches actually rendered (members, f0, Q, peak excess). flags: the analysis flags
+    rendered (the profile's notch_flags: every one by default; live "resonance" only, none
+    on sustained material); a candidate with another flag is reported with flag_reason."""
     meta, pi = analysis["meta"], analysis["plan_inputs"]
     fs, n, hop = float(meta["fs"]), int(meta["n"]), float(meta["hop_s"])
     dur = n / fs
@@ -1165,6 +1310,8 @@ def plan_notches(analysis: dict, kick: bool = True) -> tuple[NotchPlan, list[dic
         elif near:
             row["reason"] = (f"within {NOTCH_MUSICAL_GUARD_CENTS:.0f} cents of the key's tonic "
                              f"or fifth (pitch class {sorted(near)})")
+        elif r["flag"] not in flags:
+            row["reason"] = flag_reason or f"flag {r['flag']!r} is not rendered"
         elif not notch_rendered(r["channel"]):
             row["reason"] = f"channel {r['channel']!r} is not rendered"
         elif integ <= 0.0 or not f0 < fs / 2:
@@ -1291,7 +1438,9 @@ def inputeq_design(analysis: dict, controls: Controls) -> dict:
     nodes from EQ_FIT_RANGE_HZ, each node's residual from the measured fit line
     (stereo LTAS minus the OLS line over 100 Hz to 10 kHz, the line features/tilt.py
     fits), the measured and target slopes and the sub shelf. Nodes more than
-    EQ_GATE_DB below the loudest node are left out (band-limited material)."""
+    EQ_GATE_DB below the loudest node are left out (band-limited material). Under a
+    profile with eq_tilt0 (live) at Tilt 0 exactly, design["tilt0"] restricts the fit to the
+    high-pass and a narrow bell (`fit_inputeq`)."""
     from eluate.features import tilt as tilt_feature
     pi = analysis["plan_inputs"]
     c = np.asarray(pi["ltas_centres_hz"], dtype=np.float64)
@@ -1316,7 +1465,7 @@ def inputeq_design(analysis: dict, controls: Controls) -> dict:
     fl = pi.get("noise_floor_db")
     out["noise"] = {"floor_db": (None if fl is None or not math.isfinite(fl)
                                  else float(_quant(fl, EQ_INPUT_QUANT_DB))),
-                    "gain_db": quiet_gain_db(controls)}
+                    "gain_db": quiet_gain_db(controls, profile_for(analysis, controls))}
     dec = pi.get("band_decoherence")
     out["top_decoherence"] = (float(_quant(dec[-1], EQ_INPUT_QUANT_DECOHERENCE))
                               if dec is not None and len(dec) else None)
@@ -1328,6 +1477,8 @@ def inputeq_design(analysis: dict, controls: Controls) -> dict:
         out["weight_phon"] = float(controls.prof["eq_weighting"])
     if controls.prof["eq_residual_window"]:
         out["residual_window"] = True
+    if controls.prof["eq_tilt0"] is not None and controls.tilt_db == 0.0:
+        out["tilt0"] = dict(controls.prof["eq_tilt0"])
     # the side spectrum for the M/S top end: its residual from the same fit line, after
     # aligning its level to the stereo spectrum over EQ_SIDE_ALIGN_HZ (the side's shape,
     # not its level, decides its shelf). None when the analysis predates it or the side
@@ -1428,13 +1579,14 @@ def _range_mean(nodes, v, rng) -> float | None:
     return float(np.mean(v[sel])) if np.any(sel) else None
 
 
-def quiet_gain_db(controls: Controls) -> float:
+def quiet_gain_db(controls: Controls, prof: dict | None = None) -> float:
     """The master's predicted gain over a quiet passage of the normalised audio: the
     loudness target over R_ref (AES17) plus the lift the compressors give what they leave
     alone, the sum of the profile's average budgets (multiband, glue, clipper, limiter).
     On Track G (2026-10-20) the floor rose 29 dB with +6 dB of shelving; this predicts 19.
-    """
-    prof = controls.prof
+    prof: the profile in effect (`profile_for`, sustained overrides applied), else
+    controls.prof."""
+    prof = controls.prof if prof is None else prof
     b = {**mb_stage.default_budget(controls.makeup), **prof["mb_budget"]}
     glue = glue_stage.SERIAL_GR_DB if prof["glue_net_db"] is None else prof["glue_net_db"]
     clip = prof["clip_target_db"] if prof["clipper_presets"] is None else 0.0
@@ -1539,7 +1691,12 @@ def fit_inputeq(design: dict, fs: float, phase: str = "zero") -> tuple[InputEqPl
     shelf (corner EQ_PRES_FC_HZ) and an air shelf (EQ_AIR_FC_HZ), each boost capped by
     top_caps (its own range's deficit, the noise headroom; T4, T12); the presence and
     air boosts together within the noise headroom. The side gets its own pair
-    (_fit_side_shelves)."""
+    (_fit_side_shelves).
+
+    design["tilt0"] (live at Tilt 0, live audit 2026-11-10 A3): the high-pass and a narrow
+    bell only. No low, presence or air shelf (M or S) and no band shelf; the bell only on a
+    low-mid run of bell shape whose excess is above tilt0["bell_gate_db"], its Q at least
+    tilt0["bell_q_min"]. The record's "tilt0" holds the rule."""
     from scipy.optimize import least_squares
 
     from eluate.stages import inputeq as eq_stage
@@ -1562,6 +1719,14 @@ def fit_inputeq(design: dict, fs: float, phase: str = "zero") -> tuple[InputEqPl
     excess = run["excess_db"]
     use_bell = run["shape"] == "bell"
     use_bs = run["shape"] == "band shelf"
+    rule0 = design.get("tilt0")
+    shelves = rule0 is None or bool(rule0.get("shelves", True))
+    bell_q = INPUTEQ_BELL_Q_RANGE
+    if rule0 is not None:
+        use_bs = False
+        use_bell = use_bell and excess > float(rule0.get("bell_gate_db", EQ_BELL_GATE_DB))
+        bell_q = (max(INPUTEQ_BELL_Q_RANGE[0], float(rule0.get("bell_q_min", 0.0))),
+                  INPUTEQ_BELL_Q_RANGE[1])
     bounds = design.get("bounds") or {}
     G = float(bounds.get("gain_db", INPUTEQ_MAX_DB))
     caps = top_caps(design, nodes, D, fs)
@@ -1572,9 +1737,12 @@ def fit_inputeq(design: dict, fs: float, phase: str = "zero") -> tuple[InputEqPl
     hi = [G, math.log2(INPUTEQ_LOW_SHELF_FC_RANGE[1]), cp, math.log2(pr[1]), ca, math.log2(ar[1])]
     bell_fc = (max(INPUTEQ_BELL_FC_RANGE[0], EQ_LOW_MID_RUN_HZ[0]),
                min(INPUTEQ_BELL_FC_RANGE[1], EQ_LOW_MID_RUN_HZ[1]))
+    if not shelves:                               # tilt0: the shelves' gains pinned at 0
+        for a in (0, 2, 4):
+            lo[a] = hi[a] = 0.0
     if use_bell:
-        lo += [-cut, math.log2(bell_fc[0]), math.log2(INPUTEQ_BELL_Q_RANGE[0])]
-        hi += [0.0, math.log2(bell_fc[1]), math.log2(INPUTEQ_BELL_Q_RANGE[1])]
+        lo += [-cut, math.log2(bell_fc[0]), math.log2(bell_q[0])]
+        hi += [0.0, math.log2(bell_fc[1]), math.log2(bell_q[1])]
     if use_bs:
         lo += [-cut, math.log2(INPUTEQ_BAND_SHELF_LO_RANGE[0]), INPUTEQ_BAND_SHELF_WIDTH_OCT[0]]
         hi += [0.0, math.log2(min(INPUTEQ_BAND_SHELF_LO_RANGE[1], EQ_LOW_MID_RUN_HZ[1])),
@@ -1643,7 +1811,11 @@ def fit_inputeq(design: dict, fs: float, phase: str = "zero") -> tuple[InputEqPl
         c = cp if k == "hs" else ca
         if rp[k + "_gain"] > c:
             rp[k + "_gain"] = math.floor(c * 10.0) / 10.0
-    side, side_rec = _fit_side_shelves(design, dc, nodes, q, hp_fc, rp, hp_extra, fs, w)
+    if shelves:
+        side, side_rec = _fit_side_shelves(design, dc, nodes, q, hp_fc, rp, hp_extra, fs, w)
+    else:                                         # tilt0: no shelf on M, S or the lows
+        rp.update(ls_gain=0.0, hs_gain=0.0, air_gain=0.0)
+        side = side_rec = None
     if side is not None:
         rp.update(side)
     eq = _eq_from_params(q, rp, fs, hp_fc)
@@ -1655,6 +1827,8 @@ def fit_inputeq(design: dict, fs: float, phase: str = "zero") -> tuple[InputEqPl
     fsel = (nodes >= SLOPE_RANGE_HZ[0] - 1e-9) & (nodes <= SLOPE_RANGE_HZ[1] + 1e-9)
     eq_slope = float(np.polyfit(np.log2(nodes[fsel]), full[fsel], 1)[0]) if fsel.sum() > 1 else 0.0
     at_bound = _at_bound(rp, G, caps, side_rec)
+    if not shelves:
+        at_bound = [s for s in at_bound if "shelf" not in s]
     rec = {**dc, "fit_nodes_hz": nodes.tolist(), "fit_deficit_db": D.tolist(),
            "fit_db": fit.tolist(), "eq_response_db": full.tolist(),
            "residual_rms_db": float(np.sqrt(np.mean(err ** 2))) if err.size else 0.0,
@@ -1668,6 +1842,8 @@ def fit_inputeq(design: dict, fs: float, phase: str = "zero") -> tuple[InputEqPl
            "predicted_slope_db_oct": float(design["measured_slope"]) + eq_slope,
            "rotation": float(design.get("rotation", 0.0)),
            "sections": inputeq_sections(eq), "text": inputeq_text(eq)}
+    if rule0 is not None:
+        rec["tilt0"] = dict(rule0)
     return eq, rec
 
 
@@ -2031,7 +2207,9 @@ def character_settings(analysis: dict, controls: Controls, nb: int | None = None
     band_lookahead_ms (per band) is the band ceilings' lookahead, from the character like
     the rest of the multiband timing; speclim_lookahead_ms the frequency-dependent
     limiter's, from the limiter timing (the profile's limiter_timing preset when it sets
-    one, the live profile's transparent, else the character's)."""
+    one, the live profile's transparent, else the character's). The clipper is on unless
+    the profile lists clipper_presets (live: fast, aggressive), which then turn it on only
+    when the user chose that character (controls.character), never under auto."""
     if nb is None:
         nb = len(resolve(analysis, controls).crossovers_hz) + 1
     pi = analysis.get("plan_inputs") or {}
@@ -2045,7 +2223,10 @@ def character_settings(analysis: dict, controls: Controls, nb: int | None = None
     prof = controls.prof
     if not prof["kick"]:
         kd, kd_why = False, f"off: {controls.profile} profile"
-    clip = prof["clipper_presets"] is None or name in prof["clipper_presets"]
+    # a profile that lists clipper presets (live) clips only when the user chose one of them,
+    # never on an auto resolution (live audit 2026-11-10 A1: auto read 140.1 BPM as fast)
+    clip = prof["clipper_presets"] is None or (controls.character != "auto"
+                                               and name in prof["clipper_presets"])
     lim_t = CHARACTER_PRESETS[prof["limiter_timing"]] if prof["limiter_timing"] else pr
     glue_att = prof["glue_attack_ms"] if prof["glue_attack_ms"] is not None \
         else pr["glue_attack_ms"]
@@ -2066,15 +2247,17 @@ def character_settings(analysis: dict, controls: Controls, nb: int | None = None
             "clipper": ("off" if not clip else
                         "kick detective (less aggressive)" if kd else "whole signal"),
             "clipper_reason": ("on" if prof["clipper_presets"] is None else
-                               f"{controls.profile} profile: on under "
-                               + " and ".join(prof["clipper_presets"]))}
+                               f"{controls.profile} profile: on only when the character "
+                               "is chosen as " + " or ".join(prof["clipper_presets"])
+                               + ", never under auto")}
 
 
 def plan_multiband_record(analysis: dict, controls: Controls) -> dict:
     """Multiband design record from the analysis and the controls: timing and knee from
     the character preset, the budget targets (chunk 3; the thresholds, ratios and
     ceilings are solved on the multiband's input at realise), and as starting values
-    the analysis's thresholds (p90 of the band's 400 ms peak - 2 dB)."""
+    the analysis's thresholds (p90 of the band's 400 ms peak - 2 dB). The budget is the
+    profile's in effect (`profile_for`: the live sustained budget on sustained material)."""
     xo = list(resolve(analysis, controls).crossovers_hz)
     nb = len(xo) + 1
     lv = band_peak_levels(analysis)
@@ -2097,7 +2280,8 @@ def plan_multiband_record(analysis: dict, controls: Controls) -> dict:
             "ceiling_db": None, "crossovers_hz": xo,
             "decoherence": dec, "mid_makeup_db": [0.0] * nb,
             "side_makeup_db": controls.prof["side_makeup_db"],
-            "budget": {**mb_stage.default_budget(controls.makeup), **controls.prof["mb_budget"]},
+            "budget": {**mb_stage.default_budget(controls.makeup),
+                       **profile_for(analysis, controls)["mb_budget"]},
             "ms_link": controls.prof["ms_link"], "character": ch["preset"]}
 
 
@@ -2159,12 +2343,17 @@ def plan_hits(analysis: dict, controls: "Controls") -> HitsPlan:
     (the user's, else the analysis's octave-checked one; sprint S3: a 2-beat hit's
     maximum is the louder beat, which moved every budget 0.85 to 0.94 dB toward less GR):
     a grid whose median interval is k beats (k >= 2, within HITS_SUBDIVIDE_TOL) is
-    subdivided k times, and the source says so."""
+    subdivided k times, and the source says so. Sustained material under a profile with
+    the rule (`sustained_choice`, live; audit A6: a rubato string ensemble got a "tracked"
+    105 BPM grid 825 ms off its chords) reads 400 ms frames, source
+    SUSTAINED_HITS_SOURCE, unless the user gave the tempo."""
     pi = analysis.get("plan_inputs") or {}
     beats = pi.get("beat_times")
     if beats is not None:
         beats = [b for b in np.asarray(beats, dtype=np.float64).ravel() if math.isfinite(b)]
     tempo, t_src = plan_tempo(analysis, controls)
+    if t_src != "user" and is_sustained(analysis, controls):
+        return HitsPlan(beats_s=None, source=SUSTAINED_HITS_SOURCE)
     if beats is not None and len(beats) >= 2 and (t_src == "user" or pi.get("grid_informative")):
         src = "user bpm" if t_src == "user" else "analysis beat grid"
         b = np.asarray(beats)
@@ -2645,8 +2834,11 @@ def plan_from_analysis(analysis: dict, controls: Controls, x: np.ndarray | None 
     controls = resolve(analysis, controls)
     meta, pi = analysis["meta"], analysis["plan_inputs"]
     fs = int(round(float(meta["fs"])))
-    notch, _, _ = plan_notches(analysis, kick=controls.prof["kick"])
-    side = SidestripPlan(subside_hz(analysis, controls))
+    prof = profile_for(analysis, controls)
+    notch, _, _ = plan_notches(analysis, kick=prof["kick"], flags=prof["notch_flags"],
+                               flag_reason=notch_flag_reason(analysis, controls))
+    fc_side = subside_hz(analysis, controls)
+    side = None if fc_side is None else SidestripPlan(fc_side)
     mb = multiband_unrealised(plan_multiband_record(analysis, controls))
     sat, _ = plan_saturate(analysis, controls)   # the FIR tone stage is off (chunk 2)
     inputeq, _ = plan_inputeq(analysis, controls, fs)
@@ -2658,7 +2850,6 @@ def plan_from_analysis(analysis: dict, controls: Controls, x: np.ndarray | None 
     s95 = float(pi["s95_lufs"])
     lvl = (float(inp["r_ref_dbfs"]) if inp is not None else s95) + meter.AES17_OFFSET_DB
     gain0 = controls.rms_target - lvl if math.isfinite(lvl) else 0.0
-    prof = controls.prof
     onsets = usable_kick_onsets(analysis) if prof["kick"] else []
     ch = character_settings(analysis, controls)
     clip = ({} if ch["clipper"] == "off" else
@@ -2736,19 +2927,23 @@ def realise(plan: Plan, x: np.ndarray, fs: int, pre=None) -> Plan:
 
 
 def plan_record(analysis: dict, controls: Controls) -> dict:
-    """Everything the planner decided, for the report (JSON-safe)."""
+    """Everything the planner decided, for the report (JSON-safe). "sustained" is
+    `sustained_choice` (every profile; "applies" False without the rule); the glue,
+    limiter and notch entries are the profile in effect's (`profile_for`)."""
     xo_rec = crossover_choice(analysis, controls)
     controls = resolve(analysis, controls)
-    _, rows, merged = plan_notches(analysis, kick=controls.prof["kick"])
+    prof = profile_for(analysis, controls)
+    _, rows, merged = plan_notches(analysis, kick=prof["kick"], flags=prof["notch_flags"],
+                                   flag_reason=notch_flag_reason(analysis, controls))
     tone = tone_deficit(analysis, controls)
     _, sat = plan_saturate(analysis, controls)
     fs = float(analysis["meta"]["fs"])
     _, eq = plan_inputeq(analysis, controls, fs)
     ch = character_settings(analysis, controls)
-    prof = controls.prof
     net = glue_stage.SERIAL_GR_DB if prof["glue_net_db"] is None else prof["glue_net_db"]
     return {"controls": controls.to_dict(), "crossovers": xo_rec,
             "profile": {"name": controls.profile, "calibrated": prof["calibrated"]},
+            "sustained": sustained_choice(analysis, controls),
             "input": analysis["meta"].get("input"),
             "output": asdict(controls.output_plan()), "ceiling_dbtp": controls.ceiling_dbtp,
             "notches": rows, "merged_notches": merged,

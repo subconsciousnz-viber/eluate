@@ -74,7 +74,8 @@ track one hit (the maximum, the chunk 3 reading). The wet path's GR curve is
   bisection. floor_db: the wet path's GR clamp (the required gain floored there
   before the release hull), how the outlier cap is held.
 - `design_budget(x, fs, mode, ..., hits=None)`: "serial" (the default): mix 1, the
-  threshold solved for a net average peak GR of net_db (1.5 dB, range 1 to 2),
+  threshold solved for a net average peak GR of net_db (1.5 dB, range 0.5 to 2;
+  below 1 only the live profile's sustained material asks, 0.5, live audit 2026-11-10 B.4),
   every GR read on the meter reading (envelope.stage_gr, 2026-10-19), the wet GR
   clamped per sample at SAMPLE_MAX_GR_DB and the outlier reported against
   OUTLIER_CAP_DB (4 dB on the meter reading);
@@ -99,8 +100,8 @@ from eluate.plan import CONTROL_RATE_HZ, Envelope, GluePlan, control_length
 from eluate.stages import resample
 from eluate.stages.multiband import _frame_peaks, to_env32
 
-SERIAL_GR_DB = 1.5              # net peak GR, serial (range 1 to 2)
-SERIAL_RANGE_DB = (1.0, 2.0)
+SERIAL_GR_DB = 1.5              # net peak GR, serial (range 0.5 to 2)
+SERIAL_RANGE_DB = (0.5, 2.0)    # 0.5: live, sustained material (live audit 2026-11-10 B.4)
 WET_GR_DB = 3.0                 # wet-path peak GR, parallel (range 2 to 4)
 WET_RANGE_DB = (2.0, 4.0)
 WARN_DB = 0.5                   # = envelope.AVERAGE_WARN_DB

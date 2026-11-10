@@ -44,7 +44,9 @@ fcs_from_key=None)`:
   decoherence (finite; `band_decoherence_measurable` flags the defaults), the
   side-strip crossover suggestion, the notch list (flag "resonance" or
   "musical", depth scale, channel M / S / both, Q at half the dB gain with
-  its uncertainty), kick onsets with their scores, per-band spectral flatness
+  its uncertainty), kick onsets with their scores, the onset rate
+  (`onsets_per_s`, transients.onsets_per_s: the planner's sustained-material rule,
+  live audit 2026-11-10 B.4), per-band spectral flatness
   (finite, flagged), key (combined edma mode / edmm tonic, with both
   profiles' labels and scores), bass root per beat with confidence and the
   keyeq gate (NSDF agreement), tempo (octave-checked), whether the beat grid is
@@ -166,6 +168,7 @@ def analyse(x: np.ndarray, fs: float, fcs=_bands.DEFAULT_CROSSOVERS, hop_s: floa
                                        "excess_db", "flag", "depth_scale", "channel")}
                     for r in out["resonance"]["resonances"] if r["flag"] in ("resonance", "musical")],
         "kick_onsets": tr["kick_onsets"], "kick_score": tr["kick_score"],
+        "onsets_per_s": tr["onsets_per_s"],
         "band_flatness": tl["flatness"], "band_flatness_measurable": tl["flatness_measurable"],
         "key": out["pitch"]["key"], "key_confidence": out["pitch"]["key"].get("confidence"),
         "bass_root_midi": br.get("root_midi"), "bass_confidence": br.get("confidence"),
