@@ -39,3 +39,6 @@ desktop/src-tauri/target/
 desktop/src-tauri/gen/
 ui/data.js
 trash/
+
+# audio-rate harness results (tools/audio_rate/README.md)
+tools/audio_rate/out/
