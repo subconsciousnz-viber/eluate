@@ -70,12 +70,13 @@ Copyright (C) 2026 the Eluate contributors
 
 ## Appendix
 
-- **Profiles:** `electronic` is the default; `--profile live` uses gentler processing
-  and remains uncalibrated. Stems mode automatically uses a separate profile with
-  tighter processing limits.
+- **Profiles:** `electronic` is the default; `--profile live` uses gentler processing,
+  calibrated on synthetic fixtures and published statistics (not yet on reference live
+  masters). Stems mode automatically uses a separate profile with tighter processing limits.
 - **Loudness:** `--target-rms` measures the loudest passage using 300 ms AES17 RMS,
-  not integrated LUFS. The electronic default is -4.1 dBFS. Processing limits can
-  prevent reaching a target; reports record shortfalls.
+  not integrated LUFS. The electronic default is -4.1 dBFS, the live default -11.5 dBFS
+  (about -14.5 LUFS integrated on band material). Processing limits can prevent reaching a
+  target; reports record shortfalls.
 - **Delivery:** default output is 24-bit PCM with a -0.3 dBTP ceiling;
   `--streaming` keeps 24-bit PCM and lowers the ceiling to -1 dBTP, and `--cd`
   (2026-11-10) resamples the input to 44.1 kHz before the chain and writes 16-bit
