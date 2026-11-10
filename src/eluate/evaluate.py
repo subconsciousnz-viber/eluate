@@ -43,7 +43,10 @@ Contract:
   LIVE_LRA_WIDE_LU (12), and `_live_checks` adds, each with a "level" (amber / flag /
   info): psr (PSR p95 after below LIVE_PSR_FLAG_DB 10 dB, amber below LIVE_PSR_AMBER_DB
   8), plr (PLR after below LIVE_PLR_FLAG_DB 12), crest_drop (crest_db lost past
-  LIVE_CREST_DROP_DB 3), slope_reference (informational: the master's stereo slope more
+  LIVE_CREST_DROP_DB 3), live_loudness (informational: the master's integrated loudness
+  outside LIVE_INTEGRATED_RANGE_LUFS for the premaster's LRA or its short-term maximum
+  outside LIVE_SMAX_RANGE_LUFS, B.4's sanity ranges; target a list [low, high]),
+  slope_reference (informational: the master's stereo slope more
   than LIVE_SLOPE_TOL 2 dB/oct from planner.REFERENCE_SLOPE, with the Tilt that would aim
   at it; under live the solver's slope target is the mix's own), and the provenance
   flags clipper_live (a clipper rendered under live), notches_tonal (notches rendered on
@@ -141,6 +144,11 @@ LIVE_LRA_WIDE_LU = 12.0       # LRA before above this: wide-range material, whos
 LIVE_LRA_DROP_LU = 3.0        # ... loudness range may drop at most this (else FLAG_LRA_LU)
 LIVE_CREST_DROP_DB = 3.0      # crest (meter.crest_db) lost by the master: flagged
 LIVE_SLOPE_TOL = 2.0          # dB/oct around planner.REFERENCE_SLOPE: informational (A5)
+# the sanity ranges B.4 prints for a live master (informational): short-term max, and
+# integrated by the premaster's LRA (<= 12 LU, > 15 LU; in between the union)
+LIVE_SMAX_RANGE_LUFS = (-13.5, -11.0)
+LIVE_INTEGRATED_RANGE_LUFS = {"narrow": (-16.5, -13.5), "wide": (-18.5, -15.0)}
+LIVE_LRA_NARROW_LU, LIVE_LRA_WIDE_RANGE_LU = 12.0, 15.0
 
 # Delivery (metering audit 2026-11-10, finding 1). The reference loudness each platform
 # normalises a track to (BS.1770 integrated LUFS) and the true-peak advice. These are the
@@ -641,6 +649,17 @@ def _live_checks(rep: dict) -> list[dict]:
                           f"Crest: {b['crest_db']:.1f} -> {a['crest_db']:.1f} dB, "
                           f"{drop:.1f} dB lost (live: flagged past {LIVE_CREST_DROP_DB:g} dB).",
                           level="flag"))
+    i, sm, lra = a.get("integrated_lufs"), a.get("short_term_max_lufs"), b.get("lra_lu")
+    if i is not None and sm is not None:
+        nar, wid = LIVE_INTEGRATED_RANGE_LUFS["narrow"], LIVE_INTEGRATED_RANGE_LUFS["wide"]
+        rng = (nar if lra is None or lra <= LIVE_LRA_NARROW_LU else
+               wid if lra > LIVE_LRA_WIDE_RANGE_LU else (wid[0], nar[1]))
+        lo, hi = LIVE_SMAX_RANGE_LUFS
+        out.append(_check("live_loudness", i, list(rng), 0.0,
+                          not (rng[0] <= i <= rng[1] and lo <= sm <= hi),
+                          f"Loudness: integrated {i:.1f} LUFS (live range {rng[0]:g} to "
+                          f"{rng[1]:g} for this loudness range), short-term max {sm:.1f} LUFS "
+                          f"(live range {lo:g} to {hi:g}).", level="info"))
     t = rep.get("tilt") or {}
     sa = (t.get("after") or {}).get("stereo")
     if sa is not None:
@@ -659,8 +678,9 @@ def _live_checks(rep: dict) -> list[dict]:
     clip = (rep.get("chain") or {}).get("clipper") or pl.get("clipper") or {}
     mode = clip.get("mode")
     if mode is not None:
-        why = (pl.get("clipper") or {}).get("reason") or (pl.get("character") or {}).get(
-            "clipper_reason")
+        # the character's clipper rule (the record's clipper reason is the kick detective's)
+        why = (pl.get("character") or {}).get("clipper_reason") or (
+            pl.get("clipper") or {}).get("reason")
         out.append(_check("clipper_live", 1.0 if mode != "off" else 0.0, 0.0, 0.0, mode != "off",
                           f"Clipper on under live ({mode}"
                           + (f"; {why}" if why else "") + ").", level="flag"))

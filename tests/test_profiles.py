@@ -490,6 +490,18 @@ def test_live_report_flags():
     rep = _live_rep(lra_lu=6.5)
     rep["before"]["lra_lu"] = 10.0                               # not wide: the 5 LU rule
     assert not checks(rep)["lra"]["short"] and checks(rep)["lra"]["tol"] == evaluate.FLAG_LRA_LU
+    # B.4's sanity ranges (informational): S-max -13.5..-11, integrated by the LRA
+    rep = _live_rep(integrated_lufs=-14.5, short_term_max_lufs=-12.3)
+    rep["before"]["lra_lu"] = 8.0
+    assert not checks(rep)["live_loudness"]["short"]
+    rep["after"]["integrated_lufs"] = -12.5                      # above -13.5
+    lv = checks(rep)["live_loudness"]
+    assert lv["short"] and lv["level"] == "info" and lv["target"] == [-16.5, -13.5]
+    rep["before"]["lra_lu"], rep["after"]["integrated_lufs"] = 20.0, -16.0
+    assert not checks(rep)["live_loudness"]["short"]
+    assert checks(rep)["live_loudness"]["target"] == [-18.5, -15.0]
+    rep["after"]["short_term_max_lufs"] = -10.0                  # above -11
+    assert checks(rep)["live_loudness"]["short"]
     rep = _live_rep()
     rep["tilt"] = {"before": {"stereo": -7.1}, "after": {"stereo": -7.2}}
     s = checks(rep)["slope_reference"]
@@ -499,7 +511,11 @@ def test_live_report_flags():
     assert not checks(rep)["slope_reference"]["short"]
     rep = _live_rep()
     rep["chain"] = {"clipper": {"mode": "whole signal"}}
-    assert checks(rep)["clipper_live"]["short"]
+    rep["planner"]["character"] = {"clipper_reason": "live profile: on only when chosen"}
+    rep["planner"]["clipper"] = {"mode": "whole signal", "reason": "off: live profile"}
+    c = checks(rep)["clipper_live"]
+    assert c["short"] and c["text"] == ("Clipper on under live (whole signal; live profile: on "
+                                        "only when chosen).")
     rep = _live_rep()
     rep["planner"]["sustained"].update(sustained=True, onsets_per_s=0.09)
     rep["planner"]["merged_notches"] = [{"f0_hz": 2014.0}]

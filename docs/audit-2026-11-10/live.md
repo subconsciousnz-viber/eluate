@@ -354,7 +354,9 @@ Landed in `planner.PROFILES["live"]`, `planner`, `evaluate`, `processlog`, `cli`
   `plan_record["sustained"]` records the rate, the threshold, the overrides and the reason.
 - Report (A5, A7): live-only checks `psr` (< 10 dB, amber < 8), `plr` (< 12), the `lra`
   check's tolerance 3 LU when LRA before > 12 (5 LU otherwise, as for electronic),
-  `crest_drop` (> 3 dB on `meter.crest_db`), `slope_reference` (informational, |after slope -
+  `crest_drop` (> 3 dB on `meter.crest_db`), `live_loudness` (informational: B.4's sanity
+  ranges, S-max -13.5..-11.0, integrated -16.5..-13.5 for LRA <= 12 or -18.5..-15.0 for
+  LRA > 15, their union in between), `slope_reference` (informational, |after slope -
   (-4.5)| > 2 dB/oct, with the Tilt that would aim at it) and the provenance flags
   `clipper_live`, `notches_tonal`, `beat_grid`. PSR p95 and PLR were already measured
   (`meter.measure`, report before / after); no new meter code.

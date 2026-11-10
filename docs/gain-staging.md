@@ -1043,7 +1043,9 @@ The live audit's B.4 (`docs/audit-2026-11-10/live.md`; maintainer approved), in
   hits ("no beat grid: sustained material") unless the user gave a tempo;
   `plan_record["sustained"]` records the decision.
 - **Report flags** under live: PSR p95 below 10 dB (amber below 8), PLR below 12, an LRA drop
-  past 3 LU on a premaster above 12 LU, a crest drop past 3 dB, the master's slope more than
+  past 3 LU on a premaster above 12 LU, a crest drop past 3 dB, B.4's loudness sanity ranges
+  (informational: S-max -13.5 to -11 LUFS, integrated -16.5 to -13.5 or, above 15 LU of LRA,
+  -18.5 to -15), the master's slope more than
   2 dB/oct from the -4.5 reference (informational, with the Tilt that would aim at it), and the
   provenance flags clipper on, notches on tonal material, no beat grid
   (`evaluate._live_checks`).
