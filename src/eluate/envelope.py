@@ -487,6 +487,27 @@ def loud_hits(x: np.ndarray, fs: float, edges_s) -> np.ndarray:
     return mask
 
 
+def hit_levels_db(x: np.ndarray, fs: float, edges_s) -> np.ndarray:
+    """Per hit, the 1 s RMS of x (dBFS) in the window centred nearest the hit's centre: the
+    level loud_hits ranks the hits by, here for any signal on the same hits (a band's body
+    at the loud hits, multiband.body_level_db). Empty when there is no hit or no window."""
+    e = np.asarray(edges_s, dtype=np.float64)
+    nh = e.size - 1
+    if nh <= 0:
+        return np.zeros(0)
+    t_end, db = meter.rms_series(x, fs)
+    if db.size == 0:
+        return np.zeros(0)
+    centres = t_end - meter.RMS_WINDOW_S / 2.0
+    mid = 0.5 * (e[:-1] + e[1:])
+    j = np.clip(np.searchsorted(centres, mid), 1, max(1, centres.size - 1))
+    if centres.size > 1:
+        j = np.where(np.abs(centres[j - 1] - mid) <= np.abs(centres[j] - mid), j - 1, j)
+    else:
+        j = np.zeros(nh, dtype=np.int64)
+    return db[j]
+
+
 def has_loud(hits: dict | None) -> bool:
     """False only when hits carries a loud mask with no True (module contract): the budget
     solves then compress nothing. None (the maximum reading) counts as loud."""

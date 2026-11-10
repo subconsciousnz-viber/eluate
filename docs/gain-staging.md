@@ -746,11 +746,15 @@ Deviations and assumptions, with reasons:
    gets +3" did on the meter's reading.
 6. **The threshold search has a floor** (2026-11-10, audit S2-3): the multiband
    compressor's threshold never goes more than `multiband.BRACKET_BELOW_LEVEL_DB`
-   (12 dB) below the band channel's body, the median of its gated 1 s RMS
-   (`multiband.body_level_db`; at 2:1 that already takes the 6 dB clamp off the
-   body). Not the loudest-section p95: in a 16 s loop one +12 dB hit lifts the p95
-   by 9 dB and the median by 0.1, and the p95 floor stopped an ordinary 3 dB target
-   at 2.84 dB. A sparse band whose meter-smoothed
+   (12 dB) below the band channel's body: the median, over the loud hits, of its
+   1 s RMS at each hit (`multiband.body_level_db`; at 2:1 that already takes the
+   6 dB clamp off the body). Not one figure over the whole track: the
+   loudest-section p95 follows one outlier in a short file (a +12 dB hit in a 16 s
+   loop lifts it 9 dB, and the floor stopped an ordinary 3 dB target at 2.84 dB),
+   and the median of every gated window follows the quiet part of a track whose
+   band is quiet for more than half of it (a 12 s intro before 8 s of sparse hits:
+   23 dB under the loud section, the search back down at -73.5 dBFS). The loud
+   hits' median moves with neither. A sparse band whose meter-smoothed
    average cannot read its target was driven 48 dB down into its leakage floor
    (GR on 100 % of the time, every hit at the clamp) and reported "ok"; it now
    stops at the floor, warns `kind: "unreachable"` and reads "target unreachable"

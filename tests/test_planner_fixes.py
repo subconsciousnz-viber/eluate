@@ -170,8 +170,8 @@ def test_multiband_threshold_never_sinks_below_the_band_level_floor():
     bb = bands.split(bands.to_ms(xs), FS, [100.0, 400.0, 1600.0, 6400.0])
     for k in (2, 4):
         v = bb[k, :, 0]
-        body = mb.body_level_db(v, FS)
-        # the body is the median, at most a little under the loudest section here
+        body = mb.body_level_db(v, FS, hits)
+        # the band's level at the loud hits: a little under the loudest section here
         assert 0.0 <= meter.rms_1s(v, FS)["loud_section_dbfs"] - body < 1.0
         sol = mb.threshold_for_peak_gr(v, FS, 2.5, 2.0, 10.0, 100.0, 6.0, 1000.0, hits)
         assert sol["bound"] == "level floor"
@@ -183,6 +183,34 @@ def test_multiband_threshold_never_sinks_below_the_band_level_floor():
     # a dense band reaches its target with the floor out of the way
     sol0 = mb.threshold_for_peak_gr(bb[0, :, 0], FS, 2.5, 2.0, 30.0, 200.0, 6.0, 1000.0, hits)
     assert sol0["bound"] is None and sol0["peak_gr_db"] == pytest.approx(2.5, abs=0.01)
+
+
+def test_threshold_floor_follows_the_loud_hits_not_a_quiet_intro():
+    """The floor's body is the band's level at the loud hits (multiband.body_level_db). A
+    median over every gated window followed a quiet intro instead: 12 s of hiss before 8 s
+    of the sparse pattern put it 23 dB under the loud section and the search ran to
+    -73.5 dBFS, the descent the floor exists to stop (final audit 2026-11-10)."""
+    n, lead = 20 * FS, 12 * FS
+    rng = np.random.default_rng(9)
+    x = 0.05 * np.sin(2 * np.pi * 110 * np.arange(n) / FS)
+    x[:lead] += 10 ** (-50.0 / 20) * rng.standard_normal(lead)
+    for b in np.arange(12.1, 20.0, 0.5):
+        i0, m = int(b * FS), int(0.01 * FS)
+        x[i0:i0 + m] += (0.6 + 0.3 * rng.random()) * np.exp(-np.arange(m) / (0.002 * FS))
+    xs = np.stack([x, x * 0.9], axis=1)
+    hits = envelope.hits_for(xs, FS, np.arange(0, 20.0, 0.5))
+    v = bands.split(bands.to_ms(xs), FS, [100.0, 400.0, 1600.0, 6400.0])[2, :, 0]
+    _, db = meter.rms_series(v, FS)
+    loud = meter.rms_1s(v, FS)["loud_section_dbfs"]
+    assert loud - np.median(db[db > meter.RMS_GATE_DBFS]) > 20.0      # the intro owns the median
+    body = mb.body_level_db(v, FS, hits)
+    assert 0.0 <= loud - body < 1.5
+    sol = mb.threshold_for_peak_gr(v, FS, 2.5, 2.0, 10.0, 100.0, 6.0, 1000.0, hits)
+    assert sol["bound"] == "level floor" and sol["threshold_db"] > -62.0
+    assert sol["threshold_db"] == pytest.approx(body - mb.BRACKET_BELOW_LEVEL_DB, abs=1e-6)
+    # without hits the body is the loudest-section 1 s RMS
+    assert mb.body_level_db(v, FS) == pytest.approx(loud)
+    assert mb.body_level_db(np.zeros(2 * FS), FS) == -np.inf
 
 
 def test_design_budget_reports_an_unreachable_band_as_such():

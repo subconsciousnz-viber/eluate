@@ -219,10 +219,10 @@ BRACKET_MAX_DB = 48.0
 # the compressor threshold's step-down never goes further than this below the band
 # channel's loudest-section 1 s RMS (threshold_for_peak_gr; audit 2026-11-10 S2-3): at
 # 2:1 a threshold 12 dB under the band's body already takes 6 dB, the per-sample clamp,
-# off everything, so a lower one only turns the band down. The body is body_level_db (the
-# median gated 1 s RMS), not the loudest-section p95: in a 16 s loop one +12 dB hit lifts
-# the p95 by 9 dB, which stopped an ordinary 3 dB target at 2.84
-# (test_multiband_outlier_spike_is_capped); the median moves 0.1 dB
+# off everything, so a lower one only turns the band down. The body is body_level_db: the
+# band's median 1 s RMS at the loud hits, which neither one outlier hit nor a long quiet
+# section moves (test_multiband_outlier_spike_is_capped,
+# test_threshold_floor_follows_the_loud_hits_not_a_quiet_intro)
 BRACKET_BELOW_LEVEL_DB = 12.0
 UNREACHABLE_TOL_DB = 0.05        # an average this far short at the floor is "unreachable"
 
@@ -577,12 +577,30 @@ def _loud_top_db(det: np.ndarray, rate_hz: float, hits: dict | None) -> float:
     return float(20.0 * np.log10(hv[sel].min()))
 
 
-def body_level_db(v: np.ndarray, fs: float) -> float:
-    """The band channel's body for the threshold floor: the median of its 1 s RMS series
-    over the windows above meter.RMS_GATE_DBFS (dBFS); -inf when none passes the gate."""
-    _, db = meter.rms_series(np.asarray(v, dtype=np.float64), fs)
-    g = db[db > meter.RMS_GATE_DBFS]
-    return float(np.median(g)) if g.size else -np.inf
+def body_level_db(v: np.ndarray, fs: float, hits: dict | None = None) -> float:
+    """The band channel's body for the threshold floor (dBFS): the median, over the loud
+    hits, of its 1 s RMS in the window nearest each hit (envelope.hit_levels_db; windows
+    under meter.RMS_GATE_DBFS left out), i.e. the band's level where the budget is read.
+    Without hits, or with no loud hit above the gate, the band's loudest-section 1 s RMS
+    (meter.rms_1s, the p95); -inf when no window passes the gate.
+
+    Why not one figure over the whole track (2026-11-10): the p95 follows one outlier in a
+    short file (a +12 dB hit in a 16 s loop lifts it 9 dB, and the floor then stopped an
+    ordinary 3 dB target at 2.84); the median over all gated windows follows the quiet
+    part of a track whose band is quiet for more than half of it (a 12 s intro before 8 s
+    of sparse hits put it 23 dB under the loud section, and the search ran to -73.5 dBFS,
+    the descent the floor exists to stop). The loud hits' median moves with neither."""
+    v = np.asarray(v, dtype=np.float64)
+    if isinstance(hits, dict) and hits.get("loud") is not None:
+        lv = envelope.hit_levels_db(v, fs, hits["edges_s"])
+        loud = np.asarray(hits["loud"], dtype=bool)
+        if lv.size == loud.size:
+            lv = lv[loud]
+            lv = lv[lv > meter.RMS_GATE_DBFS]
+            if lv.size:
+                return float(np.median(lv))
+    p95 = meter.rms_1s(v, fs)["loud_section_dbfs"]
+    return float(p95) if np.isfinite(p95) else -np.inf
 
 
 def threshold_for_peak_gr(v: np.ndarray, fs: float, target_db: float, ratio: float,
@@ -637,7 +655,7 @@ def threshold_for_peak_gr(v: np.ndarray, fs: float, target_db: float, ratio: flo
     # the meter reading averages the GR, so the target can need a threshold below the
     # peak-reading bracket: step down until it is reached, never past the floor
     if floor_db is None:
-        body = body_level_db(v, fs)
+        body = body_level_db(v, fs, hits)
         floor_db = body - BRACKET_BELOW_LEVEL_DB if np.isfinite(body) else -np.inf
     floor = max(lo - BRACKET_MAX_DB, float(floor_db))
     kind = "level floor" if float(floor_db) > lo - BRACKET_MAX_DB else "bracket floor"
@@ -818,7 +836,7 @@ def design_budget(x: np.ndarray, fs: float, plan: MultibandPlan,
         lvl = meter.rms_1s(v, fs)["loud_section_dbfs"] if np.any(v) else -np.inf
         # the threshold search never goes further than BRACKET_BELOW_LEVEL_DB under the
         # band's body (threshold_for_peak_gr, S2-3)
-        body = body_level_db(v, fs) if np.any(v) else -np.inf
+        body = body_level_db(v, fs, hits) if np.any(v) else -np.inf
         floor_db = body - BRACKET_BELOW_LEVEL_DB if np.isfinite(body) else None
 
         def comp(target, v=v, det=det, k=k, c=c):
