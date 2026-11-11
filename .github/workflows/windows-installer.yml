@@ -1,0 +1,175 @@
+name: windows installer
+
+# The release path on Windows, end to end: the frozen engine (PyInstaller), the NSIS
+# installer (npm run build), a silent per-user install, a master from the installed engine,
+# a launch of the installed app, the uninstall, and the batch smoke (scripts/smoke.mjs) in a
+# debug build. tests.yml only compiles and unit-tests the shell against a placeholder
+# engine, so nothing there builds or runs what users install.
+#
+# Run it from the Actions tab (Run workflow) before a release or after changes to the shell,
+# the engine spec or the engine's dependencies. It also runs on a pull request that edits
+# this file, so changes to it are tried before they merge.
+
+on:
+  workflow_dispatch:
+    inputs:
+      smoke:
+        description: "Also run the batch smoke (scripts/smoke.mjs) in a debug build"
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - .github/workflows/windows-installer.yml
+
+concurrency:
+  group: windows-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    name: engine, installer, install, smoke
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      SCRATCH: ${{ github.workspace }}\ci-scratch
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements/lock-*.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+
+      # build-engine.mjs and smoke.mjs both use the repo's .venv, as on a developer machine.
+      - name: Repo .venv from the Windows lock
+        shell: bash
+        run: |
+          python -m venv .venv
+          .venv/Scripts/python -m pip install -q --upgrade pip
+          .venv/Scripts/python -m pip install -q -r requirements/lock-win-x64-py312.txt -r requirements/lock-dev-win-x64-py312.txt
+          .venv/Scripts/python -m pip install -q -e . --no-deps
+          .venv/Scripts/python -m pip check
+
+      - name: npm ci
+        working-directory: desktop
+        run: npm ci --no-audit --no-fund
+
+      - name: Frozen engine (npm run engine)
+        working-directory: desktop
+        shell: bash
+        run: |
+          start=$(date +%s)
+          npm run engine
+          echo "engine build: $(( $(date +%s) - start )) s"
+          echo "engine size: $(du -sh dist-engine/eluate-engine | cut -f1)"
+
+      - name: Test track
+        shell: bash
+        run: |
+          mkdir -p "$SCRATCH"
+          .venv/Scripts/python -c "
+          import sys, soundfile as sf
+          from fixtures.e_signals import short_track
+          x, _ = short_track(44100)
+          sf.write(sys.argv[1], x, 44100, subtype='PCM_24')
+          " "$SCRATCH/track.wav"
+
+      # Start-up time of the frozen engine, first and second run (summary of a track with no
+      # render yet only starts the engine and answers state "none"): part of the desktop
+      # audit's open question 1. Then a full master, the same call the shell makes.
+      - name: Frozen engine masters the test track
+        shell: bash
+        env:
+          NUMBA_CACHE_DIR: ${{ github.workspace }}\ci-scratch\numba
+        run: |
+          E=desktop/dist-engine/eluate-engine/eluate-engine.exe
+          for i in 1 2; do
+            start=$(date +%s%N)
+            "$E" summary "$SCRATCH/track.wav" > /dev/null
+            echo "summary run $i: $(( ($(date +%s%N) - start) / 1000000 )) ms"
+          done
+          "$E" master "$SCRATCH/track.wav" -o "$SCRATCH/work-dist" --threads 2 > "$SCRATCH/master-dist.log"
+          test -s "$SCRATCH/work-dist/master.wav"
+          if grep -q '"event":"error"' "$SCRATCH/master-dist.log"; then grep '"event":"error"' "$SCRATCH/master-dist.log"; exit 1; fi
+          grep -o '"msg":"master done[^"]*"' "$SCRATCH/master-dist.log"
+
+      - name: Installer (npm run build)
+        working-directory: desktop
+        shell: bash
+        run: |
+          npm run build
+          ls -l src-tauri/target/release/bundle/nsis/
+
+      - name: Silent install, master with the installed engine, launch, uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = Get-ChildItem desktop/src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          "installer: $($setup.Name), $([math]::Round($setup.Length / 1MB, 1)) MB"
+          Start-Process $setup.FullName -ArgumentList "/S" -Wait
+          $exe = Get-ChildItem "$env:LOCALAPPDATA" -Filter eluate.exe -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+                 Where-Object { Test-Path (Join-Path $_.DirectoryName "engine\eluate-engine.exe") } | Select-Object -First 1
+          if (-not $exe) { throw "installed eluate.exe (with engine\eluate-engine.exe beside it) not found under LOCALAPPDATA" }
+          $dir = $exe.DirectoryName
+          "installed to: $dir"
+          foreach ($f in "engine\eluate-engine.exe", "LICENSE.txt", "THIRD_PARTY_NOTICES.txt", "licenses\Archivo-OFL.txt") {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "missing from the install: $f" }
+          }
+
+          $env:NUMBA_CACHE_DIR = "$env:SCRATCH\numba-installed"
+          & (Join-Path $dir "engine\eluate-engine.exe") master "$env:SCRATCH\track.wav" -o "$env:SCRATCH\work-installed" --threads 2 |
+            Out-File "$env:SCRATCH\master-installed.log"
+          if ($LASTEXITCODE -ne 0) { throw "installed engine exited $LASTEXITCODE" }
+          if (-not (Test-Path "$env:SCRATCH\work-installed\master.wav")) { throw "installed engine wrote no master.wav" }
+          "installed engine: master.wav written"
+
+          # The shell must start and stay up (WebView2 is preinstalled on the runner).
+          $app = Start-Process $exe.FullName -PassThru
+          Start-Sleep -Seconds 20
+          if ($app.HasExited) { throw "installed app exited within 20 s (code $($app.ExitCode))" }
+          "installed app running after 20 s"
+          Stop-Process -Id $app.Id -Force
+          Start-Sleep -Seconds 3
+
+          $uninstall = Get-ChildItem $dir -Filter "uninstall*.exe" | Select-Object -First 1
+          if (-not $uninstall) { throw "no uninstaller in $dir" }
+          Start-Process $uninstall.FullName -ArgumentList "/S" -Wait
+          Start-Sleep -Seconds 5
+          if (Test-Path $exe.FullName) { throw "uninstall left $($exe.FullName) behind" }
+          "uninstalled"
+
+      - name: Batch smoke in a debug build (scripts/smoke.mjs)
+        if: github.event_name == 'pull_request' || inputs.smoke
+        working-directory: desktop
+        run: node scripts/smoke.mjs --shots "$env:SCRATCH\shots"
+
+      - name: Upload the installer
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eluate-windows-installer
+          path: desktop/src-tauri/target/release/bundle/nsis/*-setup.exe
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload logs and smoke screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eluate-windows-logs
+          path: |
+            ci-scratch/*.log
+            ci-scratch/shots/
+          retention-days: 14
+          if-no-files-found: ignore
