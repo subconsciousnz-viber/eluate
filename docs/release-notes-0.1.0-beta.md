@@ -1,19 +1,6 @@
 # Eluate 0.1.0-beta
 
-## Unreleased (since 0.1.0-beta)
-
-- **Delivery** (2026-11-10, metering audit): `--streaming` now writes 24-bit PCM at the
-  -1 dBTP ceiling (it was 16-bit with dither at the input's rate); a new `--cd` option
-  resamples the input to 44.1 kHz before the chain and writes 16-bit PCM with TPDF dither
-  at -1 dBTP, so the ceiling holds at the delivery rate. The two are exclusive; `--cd`
-  is not yet available with `--stems`. report.md gains a Delivery section (file format,
-  integrated loudness, each platform's playback gain, the codec-headroom rules) and
-  report.json a `delivery` object with a `delivery` flag that shows amber only for a
-  streaming or CD delivery that breaks a rule. The true peak the app, the batch row and
-  the process log show is now the worst of the 4x, 8x and 32x readings, and the app's
-  level match is the A/B files' own, so the drawn premaster and the audio heard agree.
-  Metering is about 1.5x faster (the K-weighted power and the 8x envelope are computed
-  once), with identical numbers.
+Superseded by [0.2.0](release-notes-0.2.0.md).
 
 Eluate is a free, offline auto-mastering app for Windows. It analyses the whole track before
 it processes anything, then plans every gain change ahead instead of reacting to the signal.
