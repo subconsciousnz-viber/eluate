@@ -7,10 +7,15 @@ processes anything, then plans every gain change ahead instead of reacting to th
 the fixes that came out of them. The findings, measurements and every fix are in
 [`docs/audit-2026-11-10.md`](audit-2026-11-10.md) and the area reports beside it.
 
-**Masters made with 0.2.0 differ from 0.1.0-beta's.** The loudness target is still met; the
-changes below move limiter gain reduction by about 0.1 to 0.3 dB and sub-band thresholds by
-0.6 to 1.3 dB at the same meter reading, and they remove the audio-rate distortion described
-under Sound.
+**Masters made with 0.2.0 differ from 0.1.0-beta's, and some come out quieter.** The changes
+below remove the audio-rate distortion described under Sound. The audit's prototypes moved
+limiter gain reduction by about 0.1 to 0.3 dB and sub-band thresholds by 0.6 to 1.3 dB.
+On the project's own 75 s test fixture (`fixtures.e_signals.short_track(48000,
+bars_per_section=8)`, default controls), the limiter needs more gain reduction for the same
+target (5.3 dB average peak, against 4.1 dB in 0.1.0-beta) and stops at its 3.0 dB budget.
+The 0.2.0 master ends at −6.44 dB RMS (Ozone meter), against −5.18 dB from 0.1.0-beta: 2.3 dB
+short of the −4.1 dB target instead of 1.1 dB. Material that already reached the target within
+the budget is less affected; listen before relying on 0.2.0's levels.
 
 ## Sound
 
