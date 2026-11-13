@@ -12,7 +12,7 @@ from importlib import metadata as _metadata
 # pyproject.toml's [project] version is the single source; the fallback serves a run from a
 # source tree or a frozen bundle without the package metadata, and is kept equal to it
 # (tests/test_environment.py).
-_FALLBACK_VERSION = "0.1.0b0"
+_FALLBACK_VERSION = "0.2.0"
 try:
     __version__ = _metadata.version("eluate")
 except _metadata.PackageNotFoundError:
