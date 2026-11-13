@@ -5,7 +5,7 @@
 Offline auto-mastering engine and desktop app. Whole-track analysis drives
 precomputed gain envelopes and constraint-based processing.
 
-**0.1.0-beta — first public beta.** Windows tested; macOS (Apple Silicon) and Linux builds untested.
+**0.2.0** ([release notes](docs/release-notes-0.2.0.md)). Windows tested; macOS (Apple Silicon) builds and renders, not notarised; Linux untested.
 Source development uses Python 3.12.
 
 ## Install

@@ -2,7 +2,7 @@
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Eluate",
   "mainBinaryName": "eluate",
-  "version": "0.1.0-beta",
+  "version": "0.2.0",
   "identifier": "io.github.subconsciousnz-viber.eluate",
   "build": {
     "frontendDist": "../dist",
